@@ -204,7 +204,7 @@
 #define SYS_PROP_RO_BUILD_DATE_UTC                           "{{SYS_PROP_RO_BUILD_DATE_UTC}}"
 #define SYS_PROP_RO_BUILD_VERSION_SECURITY_PATCH             "{{SYS_PROP_RO_BUILD_VERSION_SECURITY_PATCH}}"
 
-/ Native Interception Key-Value Map Structure
+// Native Interception Key-Value Map Structure
 typedef struct {
     const char *key;
     const char *value;
