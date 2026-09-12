@@ -5,12 +5,13 @@ import os
 import re
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.resolve()
+DEVKIT_DIR = Path(__file__).parent / "agent_src" / "devkit"
 AGENT_SRC = BASE_DIR / "agent_src"
 BUILD_DIR = BASE_DIR / "build"
-
 
 class Coyote:
 
@@ -191,6 +192,73 @@ class Coyote:
         print("[+] Deployment complete.")
 
 
+def update_frida_devkit(arch: str = "arm64"):
+    """Fetches and extracts the latest Frida-Gum DevKit from GitHub Releases."""
+
+    platform_target = f"android-{arch}" if not arch.startswith("android-") else arch
+    print(f"[+] Checking latest Frida release for platform: {platform_target}...")
+    
+    api_url = "https://api.github.com/repos/frida/frida/releases/latest"
+    req = urllib.request.Request(api_url, headers={"User-Agent": "Coyote-Provisioner"})
+    
+    with urllib.request.urlopen(req) as resp:
+        release_data = json.loads(resp.read().decode())
+    
+    tag_name = release_data["tag_name"]
+    print(f"[+] Latest Frida version identified: {tag_name}")
+    
+    target_asset = None
+    prefix = f"frida-gum-devkit-{tag_name}-{platform_target}.tar.xz"
+    
+    for asset in release_data.get("assets", []):
+        if asset["name"] == prefix:
+            target_asset = asset
+            break
+            
+    if not target_asset:
+        raise RuntimeError(f"Could not find matching release asset: {prefix}")
+        
+    archive_url = target_asset["browser_download_url"]
+    archive_path = DEVKIT_DIR / "devkit_latest.tar.xz"
+    DEVKIT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    print(f"[+] Downloading: {target_asset['name']}...")
+    urllib.request.urlretrieve(archive_url, archive_path)
+    
+    print("[+] Extracting headers and static libraries into agent_src/devkit...")
+    with tarfile.open(archive_path, "r:xz") as tar:
+        tar.extractall(path=DEVKIT_DIR)
+        
+    archive_path.unlink()
+    print("[+] Frida-Gum DevKit updated successfully.")
+
+def ensure_devkit(requested_arch: str | None = None):
+    """Verifies DevKit files exist. Downloads them if missing or explicitly requested."""
+
+    header_file = DEVKIT_DIR / "frida-gum.h"
+    lib_file = DEVKIT_DIR / "libfrida-gum.a"
+
+    if requested_arch:
+        update_frida_devkit(requested_arch)
+        return
+
+    if header_file.is_file() and lib_file.is_file():
+        return
+
+    print("\n[!] Frida-Gum DevKit missing from agent_src/devkit/")
+
+    if sys.stdin.isatty():
+        valid_archs = ["arm", "arm64", "x86", "x86_64"]
+        print("    First-time setup detected. DevKit binaries must be downloaded.")
+        selection = input("    Select architecture [arm | arm64 | x86 | x86_64] (default: arm64): ").strip().lower()
+
+        chosen_arch = selection if selection in valid_archs else "arm64"
+        print(f"    Selected target: {chosen_arch}")
+        update_frida_devkit(chosen_arch)
+    else:
+        print("[!] Non-interactive shell detected. Run with --update-devkit <arch> to initialize.")
+        sys.exit(1)
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Coyote - Autonomous Anti-Analysis Environment Provisioner",
@@ -230,6 +298,14 @@ def parse_args():
         help="Compile binary but skip ADB push to target device.",
     )
 
+    parser.add_argument(
+        "--update-devkit",
+        choices=["arm", "arm64", "x86", "x86_64"],
+        nargs="?",
+        const="arm64",
+        help="Fetch latest Frida-Gum DevKit for specified architecture (default: arm64).",
+    )
+
     return parser.parse_args()
 
 
@@ -241,6 +317,8 @@ def main():
     print("═══════════════════════════════════════════════════")
     if args.dry_run:
         print("[!] DRY-RUN MODE ACTIVE: No changes will be executed.")
+
+    ensure_devkit(args.update_devkit)
 
     orchestrator = Coyote(
         profile_path=args.profile,
