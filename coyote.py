@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import tarfile
 import os
 import re
 import subprocess
@@ -12,6 +13,13 @@ BASE_DIR = Path(__file__).parent.resolve()
 DEVKIT_DIR = Path(__file__).parent / "agent_src" / "devkit"
 AGENT_SRC = BASE_DIR / "agent_src"
 BUILD_DIR = BASE_DIR / "build"
+
+ABI_MAP = {
+    "arm64-v8a": {"compiler": "aarch64-linux-android", "devkit": "arm64"},
+    "armeabi-v7a": {"compiler": "armv7a-linux-androideabi", "devkit": "arm"},
+    "x86_64": {"compiler": "x86_64-linux-android", "devkit": "x86_64"},
+    "x86": {"compiler": "i686-linux-android", "devkit": "x86"},
+}
 
 class Coyote:
 
@@ -59,9 +67,13 @@ class Coyote:
         )
         sys_props = self.profile.get("system_prop", {})
         for prop, val in sys_props.items():
+            if prop.startswith("ro."):
+                print(f"    - [SKIP] {prop} (Read-only property; handled by memory hook)")
+                continue
+
             print(f"    - setprop {prop} -> {val}")
             self._exec(
-                ["adb", "shell", "setprop", prop, str(val)],
+                ["adb", "shell", "setprop", prop, f"'{val}'"],
                 desc=f"setprop {prop}",
             )
 
@@ -74,7 +86,7 @@ class Coyote:
         """Injects all nested profile values into config.h.template."""
         print("\n[+] Generating agent_src/config.h header file...")
         template_file = AGENT_SRC / "config.h.template"
-        output_file = AGENT_SRC / "config.h"
+        output_file = BUILD_DIR / "config.h"
 
         if not template_file.is_file():
             print(f"[!] Error: Template '{template_file}' missing.")
@@ -133,9 +145,35 @@ class Coyote:
                 f"  [+] Successfully injected {len(replacements)} profile parameters into {output_file}"
             )
 
+    def _detect_device_abi(self) -> dict:
+        """Queries target device via ADB to dynamically resolve CPU ABI and compiler triple."""
+        try:
+            cmd = ["adb", "shell", "getprop", "ro.product.cpu.abi"]
+            raw_abi = subprocess.check_output(cmd).decode().strip()
+            if raw_abi in ABI_MAP:
+                print(f"[+] Detected connected device ABI: {raw_abi}")
+                return ABI_MAP[raw_abi]
+            print(f"[!] Unknown ABI '{raw_abi}'. Defaulting to arm64-v8a.")
+        except Exception as e:
+            print(f"[!] ADB query failed ({e}). Defaulting compiler to arm64-v8a.")
+        
+        return ABI_MAP["arm64-v8a"]
+
+    def _get_llvm_prebuilt_path(self) -> Path:
+        """Dynamically resolves the NDK LLVM prebuilt directory matching the host OS."""
+        prebuilt_dir = self.ndk_path / "toolchains" / "llvm" / "prebuilt"
+        if not prebuilt_dir.exists():
+            raise FileNotFoundError(f"LLVM prebuilt directory missing: {prebuilt_dir}")
+
+        host_dirs = [d for d in prebuilt_dir.iterdir() if d.is_dir()]
+        if not host_dirs:
+            raise FileNotFoundError(f"No valid host toolchain directory found inside {prebuilt_dir}")
+
+        return host_dirs[0] / "bin"
+
     def compile_agent(self) -> Path:
-        """Invokes Android NDK Clang compiler to produce stealth_agent binary."""
-        print("\n[+] Compiling autonomous stealth agent...")
+        """Invokes Android NDK Clang compiler to birth puppy."""
+        print("\n[+] Releasing the puppy...")
 
         if not self.ndk_path or not self.ndk_path.is_dir():
             print(
@@ -143,28 +181,28 @@ class Coyote:
             )
             sys.exit(1)
 
-        compiler = (
-            self.ndk_path
-            / "toolchains/llvm/prebuilt/linux-x86_64/bin"
-            / f"aarch64-linux-android{self.api_level}-clang"
-        )
-        strip_tool = (
-            self.ndk_path
-            / "toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-        )
+        target_info = self._detect_device_abi()
+        compiler_prefix = target_info["compiler"]
+        bin_dir = self._get_llvm_prebuilt_path()
+        compiler = bin_dir / f"{compiler_prefix}{self.api_level}-clang"
+        strip_tool = bin_dir / "llvm-strip"
 
-        output_binary = BUILD_DIR / "stealth_agent"
+        output_binary = BUILD_DIR / "puppy"
 
         compile_cmd = [
             str(compiler),
             "-O3",
             "-s",
+            "-ffunction-sections",
+            "-fdata-sections",
             f"-I{AGENT_SRC}",
+            f"-I{BUILD_DIR}",
             f"-I{AGENT_SRC / 'devkit'}",
-            str(AGENT_SRC / "agent_main.c"),
+            str(AGENT_SRC / "puppy.c"),
             str(AGENT_SRC / "devkit" / "libfrida-gum.a"),
             "-o",
             str(output_binary),
+            "-Wl,--gc-sections",
             "-ldl",
             "-lm",
             "-llog",
@@ -176,20 +214,20 @@ class Coyote:
         strip_cmd = [str(strip_tool), "--strip-all", str(output_binary)]
         self._exec(strip_cmd, desc="Symbol Stripping")
 
-        print(f"[+] Agent binary target: {output_binary}")
+        print(f"[+] Puppy target: {output_binary}")
         return output_binary
 
     def deploy_and_execute(self, binary_path: Path):
         """Pushes compiled agent to target device via ADB."""
-        remote_path = "/data/local/tmp/stealth_agent"
-        print(f"\n[+] Deploying agent to target ({remote_path})...")
+        remote_path = "/data/local/tmp/puppy"
+        print(f"\n[+] Puppy running to the target ({remote_path})...")
 
         self._exec(
             ["adb", "push", str(binary_path), remote_path], desc="ADB Push"
         )
         self._exec(["adb", "shell", "chmod", "755", remote_path], desc="Chmod Agent")
 
-        print("[+] Deployment complete.")
+        print("[+] Puppy is ready to play!")
 
 
 def update_frida_devkit(arch: str = "arm64"):
@@ -227,7 +265,10 @@ def update_frida_devkit(arch: str = "arm64"):
     
     print("[+] Extracting headers and static libraries into agent_src/devkit...")
     with tarfile.open(archive_path, "r:xz") as tar:
-        tar.extractall(path=DEVKIT_DIR)
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(path=DEVKIT_DIR, filter="data")
+        else:
+            tar.extractall(path=DEVKIT_DIR)
         
     archive_path.unlink()
     print("[+] Frida-Gum DevKit updated successfully.")
@@ -312,9 +353,9 @@ def parse_args():
 def main():
     args = parse_args()
 
-    print("═══════════════════════════════════════════════════")
-    print("  COYOTE: Anti-Evasion Agent & Profile Pipeline    ")
-    print("═══════════════════════════════════════════════════")
+    print("════════════════════════════════════════════════════")
+    print("                       COYOTE                       ")
+    print("════════════════════════════════════════════════════")
     if args.dry_run:
         print("[!] DRY-RUN MODE ACTIVE: No changes will be executed.")
 
