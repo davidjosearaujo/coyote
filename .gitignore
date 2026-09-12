@@ -250,3 +250,6 @@ dkms.conf
 *.out
 *.app
 
+# Frida devkit
+agent_src/devkit/libfrida-gum.a
+agent_src/devkit/frida-gum.h
