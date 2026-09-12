@@ -4,7 +4,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <dlfcn.h>
 #include <sys/system_properties.h>
+#include <android/log.h>
+
+#define LOG_TAG "[Puppy]"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 typedef int (*SystemPropertyGetFunc)(const char *name, char *value);
 static SystemPropertyGetFunc orig_system_property_get = NULL;
@@ -21,24 +29,24 @@ static int my_system_property_get(const char *name, char *value) {
     return orig_system_property_get(name, value);
 }
 
-int main(int argc, char *argv[]) {
-    setvbuf(stdout, NULL, _IONBF, 0);
-
-    char buffer[128] = {0};
-
-    printf("[*] Initializing Puppy Stealth Agent...\n");
+static void* puppy_main_thread(void* arg) {
+    sleep(3);
+    
+    LOGI("Puppy waking up in the background... sniffing out environment.");
     gum_init_embedded();
 
     GumInterceptor *interceptor = gum_interceptor_obtain();
-    gpointer target_address = GSIZE_TO_POINTER(gum_module_find_global_export_by_name("__system_property_get"));
-
-    if (target_address == NULL) {
-        printf("[!] Failed to locate __system_property_get in memory.\n");
-        gum_deinit_embedded();
-        return 1;
+    if (interceptor == NULL) {
+        LOGE("Puppy lost the scent: failed to obtain GumInterceptor.");
+        return NULL;
     }
 
-    printf("[*] Target symbol located at: %p\n", target_address);
+    gpointer target_address = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_get"));
+    if (target_address == NULL) {
+        LOGE("Puppy couldn't find __system_property_get target.");
+        gum_deinit_embedded();
+        return NULL;
+    }
 
     gum_interceptor_begin_transaction(interceptor);
     gum_interceptor_replace(
@@ -50,19 +58,18 @@ int main(int argc, char *argv[]) {
     );
     gum_interceptor_end_transaction(interceptor);
 
-    printf("[+] Interceptor active. Testing system property lookups:\n");
+    LOGI("Woof! System property hooks successfully buried and active.");
+    return NULL;
+}
 
-    my_system_property_get("ro.build.display.id", buffer);
-    printf("  [>] ro.build.display.id -> %s\n", buffer);
-
-    memset(buffer, 0, sizeof(buffer));
-    __system_property_get("ro.build.version.release", buffer);
-    printf("  [>] ro.build.version.release (Original) -> %s\n", buffer);
-
-    gum_interceptor_revert(interceptor, target_address);
-    g_object_unref(interceptor);
-    gum_deinit_embedded();
-
-    printf("[*] Puppy agent execution finished.\n");
-    return 0;
+__attribute__((constructor)) void puppy_init(void) {
+    LOGI("Puppy barking at process entry (PID: %d)...", getpid());
+    
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, puppy_main_thread, NULL) != 0) {
+        LOGE("Puppy failed to leave the kennel!");
+    } else {
+        pthread_detach(thread);
+        LOGI("Puppy slipped off the leash into the background.");
+    }
 }
