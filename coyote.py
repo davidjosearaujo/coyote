@@ -29,9 +29,11 @@ class Coyote:
         ndk_path: str,
         api_level: int = 30,
         dry_run: bool = False,
+        package_name: str = "test.target.app",
     ):
         self.dry_run = dry_run
         self.api_level = api_level
+        self.package_name = package_name
         self.ndk_path = Path(ndk_path) if ndk_path else None
         self.profile = self._load_profile(profile_path)
 
@@ -151,7 +153,6 @@ class Coyote:
             cmd = ["adb", "shell", "getprop", "ro.product.cpu.abi"]
             raw_abi = subprocess.check_output(cmd).decode().strip()
             if raw_abi in ABI_MAP:
-                print(f"[+] Detected connected device ABI: {raw_abi}")
                 return ABI_MAP[raw_abi]
             print(f"[!] Unknown ABI '{raw_abi}'. Defaulting to arm64-v8a.")
         except Exception as e:
@@ -187,10 +188,12 @@ class Coyote:
         compiler = bin_dir / f"{compiler_prefix}{self.api_level}-clang"
         strip_tool = bin_dir / "llvm-strip"
 
-        output_binary = BUILD_DIR / "puppy"
+        output_so = BUILD_DIR / "libpuppy.so"
 
         compile_cmd = [
             str(compiler),
+            "-shared",
+            "-fPIC",
             "-O3",
             "-s",
             "-ffunction-sections",
@@ -201,7 +204,7 @@ class Coyote:
             str(AGENT_SRC / "puppy.c"),
             str(AGENT_SRC / "devkit" / "libfrida-gum.a"),
             "-o",
-            str(output_binary),
+            str(output_so),
             "-Wl,--gc-sections",
             "-ldl",
             "-lm",
@@ -209,26 +212,55 @@ class Coyote:
             "-pthread",
         ]
 
-        self._exec(compile_cmd, desc="NDK Compilation")
+        self._exec(compile_cmd, desc=f"NDK Shared Library Compilation ({target_info['devkit']})")
 
-        strip_cmd = [str(strip_tool), "--strip-all", str(output_binary)]
-        self._exec(strip_cmd, desc="Symbol Stripping")
+        if strip_tool.exists():
+            self._exec([str(strip_tool), str(output_so)], desc="LLVM Strip Shared Library")
 
-        print(f"[+] Puppy target: {output_binary}")
-        return output_binary
+        print(f"[+] Puppy target: {output_so}")
+        return output_so
 
-    def deploy_and_execute(self, binary_path: Path):
-        """Pushes compiled agent to target device via ADB."""
-        remote_path = "/data/local/tmp/puppy"
-        print(f"\n[+] Puppy running to the target ({remote_path})...")
 
-        self._exec(
-            ["adb", "push", str(binary_path), remote_path], desc="ADB Push"
+    def launch_target_app(self, so_path: Path):
+        """Pushes libpuppy.so into target app private data directory and launches package via wrap property."""
+
+        temp_so = "/data/local/tmp/libpuppy.so"
+        app_dir = f"/data/data/{self.package_name}"
+        target_so = f"{app_dir}/libpuppy.so"
+
+        self._exec(["adb", "push", str(so_path), temp_so], desc="ADB Push to Staging")
+
+        print(f"[+] Moving agent into SELinux-compliant path: {target_so}")
+        self._exec(["adb", "shell", f"su 0 cp {temp_so} {target_so}"], desc="Copy to App Dir")
+
+        # Fix Ownership & SELinux Security Context
+        # Resolves app UID/GID dynamically and applies app_data_file SELinux label
+        fix_perms_cmd = (
+            f"su 0 sh -c '"
+            f"APP_UID=$(stat -c %u {app_dir}); "
+            f"chown $APP_UID:$APP_UID {target_so}; "
+            f"chmod 755 {target_so}; "
+            f"chcon u:object_r:app_data_file:s0 {target_so}'"
         )
-        self._exec(["adb", "shell", "chmod", "755", remote_path], desc="Chmod Agent")
+        self._exec(["adb", "shell", fix_perms_cmd], desc="Apply SELinux Context & Ownership")
 
-        print("[+] Puppy is ready to play!")
+        print(f"[+] Injecting Puppy into target package: {self.package_name}")
 
+        wrap_cmd = f"setprop wrap.{self.package_name} 'env LD_PRELOAD={target_so}'"
+        self._exec(["adb", "shell", wrap_cmd], desc=f"Set wrap hook for {self.package_name}")
+
+        self._exec(["adb", "shell", f"am force-stop {self.package_name}"])
+        self._exec(["adb", "shell", f"monkey -p {self.package_name} -c android.intent.category.LAUNCHER 1"])
+
+    def reset_target_app(self):
+        """Removes wrap property, stops target package, and clears app state."""
+        print(f"\n[*] Resetting target package configuration: {self.package_name}")
+        
+        self._exec(["adb", "shell", f"am force-stop {self.package_name}"])
+        self._exec(["adb", "shell", f"setprop wrap.{self.package_name} ''"])
+        self._exec(["adb", "shell", f"pm clear {self.package_name}"])
+        
+        print(f"[+] wrap.{self.package_name} removed and process terminated.")
 
 def update_frida_devkit(arch: str = "arm64"):
     """Fetches and extracts the latest Frida-Gum DevKit from GitHub Releases."""
@@ -318,6 +350,17 @@ def parse_args():
         help="Path to Android NDK directory (defaults to $ANDROID_NDK_HOME).",
     )
     parser.add_argument(
+        "-t",
+        "--target",
+        required=True,
+        help="Target app package name",
+    )
+    parser.add_argument(
+        "--reset-target",
+        action="store_true",
+        help="Reset target app",
+    )
+    parser.add_argument(
         "--api-level",
         type=int,
         default=30,
@@ -338,7 +381,6 @@ def parse_args():
         action="store_true",
         help="Compile binary but skip ADB push to target device.",
     )
-
     parser.add_argument(
         "--update-devkit",
         choices=["arm", "arm64", "x86", "x86_64"],
@@ -366,16 +408,20 @@ def main():
         ndk_path=args.ndk,
         api_level=args.api_level,
         dry_run=args.dry_run,
+        package_name=args.target,
     )
 
     if not args.skip_adb:
         orchestrator.configure_adb_properties()
 
+    if args.reset_target:
+        orchestrator.reset_target_app()
+
     orchestrator.generate_c_header()
-    agent_bin = orchestrator.compile_agent()
+    agent_so = orchestrator.compile_agent()
 
     if not args.skip_deploy:
-        orchestrator.deploy_and_execute(agent_bin)
+        orchestrator.launch_target_app(agent_so)
 
 
 if __name__ == "__main__":
