@@ -10,9 +10,27 @@
 #include <sys/system_properties.h>
 #include <android/log.h>
 
+#include <android/native_window.h>
+
 #define LOG_TAG "[Puppy]"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+typedef int32_t (*ANativeWindowGetWidthFunc)(ANativeWindow *window);
+typedef int32_t (*ANativeWindowGetHeightFunc)(ANativeWindow *window);
+
+static ANativeWindowGetWidthFunc orig_anativewindow_get_width = NULL;
+static ANativeWindowGetHeightFunc orig_anativewindow_get_height = NULL;
+
+static int32_t my_anativewindow_get_width(ANativeWindow *window) {
+    LOGI("Puppy intercepted ANativeWindow_getWidth! Spoofing width.");
+    return SPECS_WIDTH; // Replace with your target width spec
+}
+
+static int32_t my_anativewindow_get_height(ANativeWindow *window) {
+    LOGI("Puppy intercepted ANativeWindow_getHeight! Spoofing height.");
+    return SPECS_HEIGHT; // Replace with your target height spec
+}
 
 typedef int (*SystemPropertyGetFunc)(const char *name, char *value);
 static SystemPropertyGetFunc orig_system_property_get = NULL;
@@ -41,21 +59,44 @@ static void* puppy_main_thread(void* arg) {
         return NULL;
     }
 
-    gpointer target_address = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_get"));
-    if (target_address == NULL) {
-        LOGE("Puppy couldn't find __system_property_get target.");
-        gum_deinit_embedded();
-        return NULL;
+    gpointer target_prop_address = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_get"));
+    
+    void *libnativewindow = dlopen("libnativewindow.so", RTLD_LAZY);
+    gpointer target_width_address = libnativewindow ? dlsym(libnativewindow, "ANativeWindow_getWidth") : NULL;
+    gpointer target_height_address = libnativewindow ? dlsym(libnativewindow, "ANativeWindow_getHeight") : NULL;
+    
+    gum_interceptor_begin_transaction(interceptor);
+
+    if (target_prop_address) {
+        gum_interceptor_replace(
+            interceptor,
+            target_prop_address, 
+            GSIZE_TO_POINTER(my_system_property_get),
+            (gpointer *)&orig_system_property_get,
+            NULL
+        );
     }
 
-    gum_interceptor_begin_transaction(interceptor);
-    gum_interceptor_replace(
-        interceptor,
-        target_address,
-        GSIZE_TO_POINTER(my_system_property_get),
-        (gpointer *)&orig_system_property_get,
-        NULL
-    );
+    if (target_width_address) {
+        gum_interceptor_replace(
+            interceptor,
+            target_width_address, 
+            GSIZE_TO_POINTER(my_anativewindow_get_width),
+            (gpointer *)&orig_anativewindow_get_width,
+            NULL
+        );
+    }
+
+    if (target_height_address) {
+        gum_interceptor_replace(
+            interceptor,
+            target_height_address, 
+            GSIZE_TO_POINTER(my_anativewindow_get_height),
+            (gpointer *)&orig_anativewindow_get_height,
+            NULL
+        );
+    }
+
     gum_interceptor_end_transaction(interceptor);
 
     LOGI("Woof! System property hooks successfully buried and active.");
