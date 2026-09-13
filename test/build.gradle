@@ -1,0 +1,29 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath "com.android.tools.build:gradle:9.4.0"
+    }
+}
+
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.hound'
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "com.hound"
+        minSdk 21
+        targetSdk 33
+        versionCode 1
+        versionName "1.0"
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+}
