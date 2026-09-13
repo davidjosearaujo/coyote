@@ -11,9 +11,9 @@
     "sim_state_num": 5
   },
   "device_profile": {
-    "profile_id": "google-pixel-7-pro",
-    "marketing_name": "Google Pixel 7 Pro",
-    "model": "Pixel 7 Pro",
+    "profile_id": "google-pixel-8-pro",
+    "marketing_name": "Google Pixel 8 Pro",
+    "model": "Pixel 8 Pro",
     "device": "cheetah",
     "board": "cheetah",
     "product": "cheetah",

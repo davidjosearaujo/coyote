@@ -1,0 +1,73 @@
+{
+  "telecom": {
+    "mcc": "213",
+    "mnc": "03",
+    "timezone_id": "Europe/Andorra",
+    "country_iso": "ad",
+    "operator_name": "Andorra Telecom / Mobiland",
+    "language": "ca",
+    "phone_code": "376",
+    "sim_state": "READY",
+    "sim_state_num": 5
+  },
+  "device_profile": {
+    "profile_id": "google-pixel-7-pro",
+    "marketing_name": "Google Pixel 7 Pro",
+    "model": "Pixel 7 Pro",
+    "device": "cheetah",
+    "board": "cheetah",
+    "product": "cheetah",
+    "hardware": "cheetah",
+    "fingerprint": "google/cheetah/cheetah:15/AP4A.250205.002/12923327:user/release-keys",
+    "manufacturer": "Google",
+    "bootloader": "12923327",
+    "brand": "google",
+    "host": "abfarm-release",
+    "display": "AP4A.250205.002.12923327",
+    "display_id": "AP4A.250205.002",
+    "tags": "release-keys",
+    "serial": "7PZGGNTD92N",
+    "type": "user",
+    "user": "android-build",
+    "unknown": "unknown",
+    "arch": "arm64-v8a",
+    "baseband": "12923327",
+    "characteristics": "phone",
+    "flavor": "cheetah-user",
+    "incremental": "12923327",
+    "build_date": "Tue Feb 18 11:17:00 UTC 2025",
+    "build_date_utc": "1739877420",
+    "security_patch": "2025-02-05",
+    "soc_model": "Tensor G2",
+    "slpi_firmware": "",
+    "gl_vendor": "ARM",
+    "gl_renderer": "Mali-G710 MP7",
+    "gl_version": "OpenGL ES 3.2",
+    "keyboard": "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME",
+    "cpu_info": "Processor  : AArch64 Processor rev 0 (aarch64)\n\nprocessor : 0\nBogoMIPS  : 38.40\nFeatures  : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512\nCPU implementer : 0x41\nCPU architecture: 8\nCPU variant : 0x0\nCPU part  : 0xd0b\nCPU revision  : 0\n\nprocessor : 1\nBogoMIPS  : 38.40\nFeatures  : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512\nCPU implementer : 0x41\nCPU architecture: 8\nCPU variant : 0x0\nCPU part  : 0xd0b\nCPU revision  : 0\n\nprocessor : 2\nBogoMIPS  : 38.40\nFeatures  : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512\nCPU implementer : 0x41\nCPU architecture: 8\nCPU variant : 0x0\nCPU part  : 0xd0b\nCPU revision  : 0\n\nprocessor : 3\nBogoMIPS  : 38.40\nFeatures  : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512\nCPU implementer : 0x41\nCPU architecture: 8\nCPU variant : 0x0\nCPU part  : 0xd0b\nCPU revision  : 0\n\nprocessor : 4\nBogoMIPS  : 38.40\nFeatures  : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512\nCPU implementer : 0x41\nCPU architecture: 8\nCPU variant : 0x0\nCPU part  : 0xd0b\nCPU revision  : 0\n\nprocessor : 5\nBogoMIPS  : 38.40\nFeatures  : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512\nCPU implementer : 0x41\nCPU architecture: 8\nCPU variant : 0x0\nCPU part  : 0xd0b\nCPU revision  : 0\n\nprocessor : 6\nBogoMIPS  : 38.40\nFeatures  : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512\nCPU implementer : 0x41\nCPU architecture: 8\nCPU variant : 0x0\nCPU part  : 0xd0b\nCPU revision  : 0\n\nprocessor : 7\nBogoMIPS  : 38.40\nFeatures  : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512\nCPU implementer : 0x41\nCPU architecture: 8\nCPU variant : 0x0\nCPU part  : 0xd0b\nCPU revision  : 0\n\nHardware  : Tensor G2\n"
+  },
+  "specs": {
+    "TOTAL_SPACE": 549755813888,
+    "FREE_SPACE": 344853809373,
+    "WIDTH": 1440,
+    "HEIGHT": 3120,
+    "TOTAL_RAM": 11886625832,
+    "AVAIL_RAM": 4633072000,
+    "RAM_THRESHOLD": 594331291,
+    "SWAP_TOTAL_KB": 4194304
+  },
+  "network": {
+    "net_type": 0,
+    "mobile_data_local_ip": "10.23.45.67",
+    "wifi_local_ip": "192.168.1.211"
+  },
+  "attribution": {
+    "utm_source": "apps.facebook.com",
+    "utm_medium": "paid_social",
+    "facebook_app_id": "",
+    "af_status": "non-Organic",
+    "campaign": "fb4a",
+    "install_referrer": "utm_source=apps.facebook.com&utm_campaign=fb4a&utm_medium=paid_social",
+    "install_package": "com.android.vending"
+  }
+}
