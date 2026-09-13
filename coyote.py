@@ -128,29 +128,29 @@ class Coyote:
                 macro_count += 1
             lines.append("")
 
-        lines.append("// 6. System Properties Interception")
         sys_props = self.profile.get("system_prop", {})
-        prop_overrides = []
-        
-        for raw_key, val in sys_props.items():
-            macro_name = self._sanitize_macro_key(raw_key)
-            prop_overrides.append((raw_key, macro_name))
-            lines.append(f"#define {macro_name:<60} \"{val}\"")
-            macro_count += 1
-            
-        lines.append("\n// Native Interception Key-Value Map Structure")
-        lines.append("typedef struct {")
-        lines.append("    const char *key;")
-        lines.append("    const char *value;")
-        lines.append("} prop_override_t;\n")
+        if len(sys_props) > 0:
+            lines.append("// 6. System Properties Interception")
+            prop_overrides = []
+            for raw_key, val in sys_props.items():
+                macro_name = self._sanitize_macro_key(raw_key)
+                prop_overrides.append((raw_key, macro_name))
+                lines.append(f"#define {macro_name:<60} \"{val}\"")
+                macro_count += 1
+                
+            lines.append("typedef struct {")
+            lines.append("    const char *key;")
+            lines.append("    const char *value;")
+            lines.append("} prop_override_t;\n")
 
-        lines.append("static const prop_override_t SYSTEM_PROP_OVERRIDES[] = {")
-        for raw_key, macro_name in prop_overrides:
-            lines.append(f'    {{"{raw_key}", {macro_name}}},')
-        lines.append("    {NULL, NULL}")
-        lines.append("};\n")
+            lines.append("static const prop_override_t SYSTEM_PROP_OVERRIDES[] = {")
+            for raw_key, macro_name in prop_overrides:
+                lines.append(f'    {{"{raw_key}", {macro_name}}},')
+            lines.append("    {NULL, NULL}")
+            lines.append("};\n")
+
+            lines.append("#define SYSTEM_PROP_OVERRIDES_COUNT (sizeof(SYSTEM_PROP_OVERRIDES) / sizeof(SYSTEM_PROP_OVERRIDES[0]) - 1)\n")
         
-        lines.append("#define SYSTEM_PROP_OVERRIDES_COUNT (sizeof(SYSTEM_PROP_OVERRIDES) / sizeof(SYSTEM_PROP_OVERRIDES[0]) - 1)\n")
         lines.append("#endif // COYOTE_CONFIG_H\n")
 
         content = "\n".join(lines)
