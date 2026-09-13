@@ -85,67 +85,84 @@ class Coyote:
         return f"SYS_PROP_{sanitized}"
 
     def generate_c_header(self):
-        """Injects all nested profile values into config.h.template."""
+        """Dynamically generates config.h from the JSON profile without a template."""
         print("\n[+] Generating agent_src/config.h header file...")
-        template_file = AGENT_SRC / "config.h.template"
         output_file = BUILD_DIR / "config.h"
 
-        if not template_file.is_file():
-            print(f"[!] Error: Template '{template_file}' missing.")
-            sys.exit(1)
+        def format_value(key: str, val) -> str:
+            """Infers the correct C-type formatting for the macro value."""
+            if key == "CPU_INFO":
+                return f'R"raw_cpu({val})raw_cpu"'
+            if isinstance(val, str):
+                return f'"{val}"'
+            if isinstance(val, float):
+                return f"{val}f"
+            if isinstance(val, int):
+                if key in ["TOTAL_SPACE", "FREE_SPACE", "TOTAL_RAM", "AVAIL_RAM", "RAM_THRESHOLD"]:
+                    return f"{val}ULL"
+                return str(val)
+            return str(val)
 
-        with open(template_file, "r") as f:
-            content = f.read()
+        lines = [
+            "#ifndef COYOTE_CONFIG_H",
+            "#define COYOTE_CONFIG_H",
+            ""
+        ]
 
-        replacements = {}
+        sections = [
+            ("1. Telecom Settings", "telecom", "TELECOM_"),
+            ("2. Device Identification & Build Metadata", "device_profile", "DEVICE_"),
+            ("3. Hardware Metrics & Memory Space", "specs", "SPECS_"),
+            ("4. Network Configuration", "network", "NETWORK_"),
+            ("5. Attribution & Install Tracking", "attribution", "ATTRIBUTION_")
+        ]
 
-        # 1. Telecom section
-        telecom = self.profile.get("telecom", {})
-        for k, v in telecom.items():
-            replacements[f"{{{{TELECOM_{k.upper()}}}}}"] = str(v)
+        macro_count = 0
 
-        # 2. Device profile section
-        dev = self.profile.get("device_profile", {})
-        for k, v in dev.items():
-            replacements[f"{{{{DEVICE_{k.upper()}}}}}"] = str(v)
+        for title, profile_key, prefix in sections:
+            lines.append(f"// {title}")
+            for k, v in self.profile.get(profile_key, {}).items():
+                macro_name = f"{prefix}{k.upper()}"
+                val_str = format_value(k.upper(), v)
+                lines.append(f"#define {macro_name:<31} {val_str}")
+                macro_count += 1
+            lines.append("")
 
-        # 3. Hardware specs section
-        specs = self.profile.get("specs", {})
-        for k, v in specs.items():
-            replacements[f"{{{{SPECS_{k.upper()}}}}}"] = str(v)
-
-        # 4. Network section
-        net = self.profile.get("network", {})
-        for k, v in net.items():
-            replacements[f"{{{{NETWORK_{k.upper()}}}}}"] = str(v)
-
-        # 5. Attribution section
-        attr = self.profile.get("attribution", {})
-        for k, v in attr.items():
-            replacements[f"{{{{ATTRIBUTION_{k.upper()}}}}}"] = str(v)
-
-        # 6. System Properties section
+        lines.append("// 6. System Properties Interception")
         sys_props = self.profile.get("system_prop", {})
+        prop_overrides = []
+        
         for raw_key, val in sys_props.items():
-            macro_placeholder = f"{{{{{self._sanitize_macro_key(raw_key)}}}}}"
-            replacements[macro_placeholder] = str(val)
+            macro_name = self._sanitize_macro_key(raw_key)
+            prop_overrides.append((raw_key, macro_name))
+            lines.append(f"#define {macro_name:<60} \"{val}\"")
+            macro_count += 1
+            
+        lines.append("\n// Native Interception Key-Value Map Structure")
+        lines.append("typedef struct {")
+        lines.append("    const char *key;")
+        lines.append("    const char *value;")
+        lines.append("} prop_override_t;\n")
 
-        # Perform placeholder substitutions
-        for placeholder, value in replacements.items():
-            content = content.replace(placeholder, value)
+        lines.append("static const prop_override_t SYSTEM_PROP_OVERRIDES[] = {")
+        for raw_key, macro_name in prop_overrides:
+            lines.append(f'    {{"{raw_key}", {macro_name}}},')
+        lines.append("    {NULL, NULL}")
+        lines.append("};\n")
+        
+        lines.append("#define SYSTEM_PROP_OVERRIDES_COUNT (sizeof(SYSTEM_PROP_OVERRIDES) / sizeof(SYSTEM_PROP_OVERRIDES[0]) - 1)\n")
+        lines.append("#endif // COYOTE_CONFIG_H\n")
+
+        content = "\n".join(lines)
 
         if self.dry_run:
-            print(
-                f"  [DRY-RUN] Replaced {len(replacements)} placeholders in template.\n"
-            )
+            print(f"  [DRY-RUN] Dynamically generated {macro_count} macros.\n")
             print(content)
             print(f"\n  [DRY-RUN] Would write generated config to {output_file}")
         else:
             with open(output_file, "w") as f:
                 f.write(content)
-            print(
-                f"  [+] Successfully injected {len(replacements)} profile parameters into {output_file}"
-            )
+            print(f"  [+] Successfully generated {output_file} with {macro_count} dynamic macros.")
 
     def _detect_device_abi(self) -> dict:
         """Queries target device via ADB to dynamically resolve CPU ABI and compiler triple."""
