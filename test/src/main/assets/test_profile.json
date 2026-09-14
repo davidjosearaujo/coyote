@@ -86,7 +86,7 @@
     "persist.vendor.radio.adb_log_on": "",
     "ro.boottime.adb_root": "",
     "ro.boottime.adbd": "",
-    "ro.product.model": "Pixel 7 Pro",
+    "ro.product.model": "Pixel 8 Pro",
     "ro.product.brand": "google",
     "ro.product.cpu.abilist": "arm64-v8a",
     "ro.debuggable": "0",
