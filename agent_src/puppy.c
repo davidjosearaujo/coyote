@@ -8,6 +8,8 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <math.h>
+#include <spawn.h>
+#include <fcntl.h>
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
@@ -41,6 +43,7 @@
 typedef int (*SystemPropertyGetFunc)(const char *name, char *value);
 typedef void (*PropReadCallback)(void *cookie, const char *name, const char *value, uint32_t serial);
 typedef void (*SystemPropertyReadCallbackFunc)(const prop_info *pi, PropReadCallback callback, void *cookie);
+typedef const prop_info *(*SystemPropertyFindFunc)(const char *name);
 
 typedef int32_t (*ANativeWindowGetWidthFunc)(ANativeWindow *window);
 typedef int32_t (*ANativeWindowGetHeightFunc)(ANativeWindow *window);
@@ -51,12 +54,21 @@ typedef int (*StatvfsFunc)(const char *path, struct statvfs *buf);
 typedef int (*Statvfs64Func)(const char *path, struct statvfs64 *buf);
 typedef int (*SysinfoFunc)(struct sysinfo *info);
 
-typedef int (*ExecveFunc)(const char *pathname, char *const argv[], char *const envp[]);
+typedef int (*PosixSpawnFunc)(pid_t *pid, const char *path,
+                             const posix_spawn_file_actions_t *file_actions,
+                             const posix_spawnattr_t *attrp,
+                             char *const argv[], char *const envp[]);
+
+typedef int (*PosixSpawnpFunc)(pid_t *pid, const char *file,
+                              const posix_spawn_file_actions_t *file_actions,
+                              const posix_spawnattr_t *attrp,
+                              char *const argv[], char *const envp[]);
 
 typedef int (*OpenatFunc)(int dirfd, const char *pathname, int flags, int mode);
 
 static SystemPropertyGetFunc orig_system_property_get = NULL;
 static SystemPropertyReadCallbackFunc orig_system_property_read_callback = NULL;
+static SystemPropertyFindFunc orig_system_property_find = NULL;
 
 static ANativeWindowGetWidthFunc orig_anativewindow_get_width = NULL;
 static ANativeWindowGetHeightFunc orig_anativewindow_get_height = NULL;
@@ -67,7 +79,8 @@ static StatvfsFunc orig_statvfs = NULL;
 static Statvfs64Func orig_statvfs64 = NULL;
 static SysinfoFunc orig_sysinfo = NULL;
 
-static ExecveFunc orig_execve = NULL;
+static PosixSpawnFunc orig_posix_spawn = NULL;
+static PosixSpawnpFunc orig_posix_spawnp = NULL;
 
 static OpenatFunc orig_openat = NULL;
 
@@ -83,15 +96,13 @@ static int hook_system_property_get(const char *name, char *value) {
     }
     return orig_system_property_get(name, value);
 }
-#endif
 
 typedef struct {
     PropReadCallback orig_callback;
     void *orig_cookie;
 } PropReadContext;
 
-#ifdef SYSTEM_PROP_OVERRIDES_COUNT
-static void puppy_prop_read_wrapper(void *cookie, const char *name, const char *value, uint32_t serial) {
+static void prop_read_wrapper(void *cookie, const char *name, const char *value, uint32_t serial) {
     PropReadContext *ctx = (PropReadContext *)cookie;
     if (ctx == NULL) return;
 
@@ -111,48 +122,194 @@ static void puppy_prop_read_wrapper(void *cookie, const char *name, const char *
 }
 
 static void hook_system_property_read_callback(const prop_info *pi, PropReadCallback callback, void *cookie) {
+    uintptr_t pi_addr = (uintptr_t)pi;
+    uintptr_t start_addr = (uintptr_t)&SYSTEM_PROP_OVERRIDES[0];
+    uintptr_t end_addr = start_addr + sizeof(SYSTEM_PROP_OVERRIDES);
+    
+    if (pi_addr >= start_addr && pi_addr < end_addr) {
+        const prop_override_t *entry = (const prop_override_t *)pi;
+        if (callback != NULL && entry->key != NULL && entry->value != NULL) {
+            callback(cookie, entry->key, entry->value, 0);
+        }
+        return;
+    }
+
     if (pi != NULL && callback != NULL) {
         PropReadContext ctx;
         ctx.orig_callback = callback;
         ctx.orig_cookie = cookie;
-        orig_system_property_read_callback(pi, puppy_prop_read_wrapper, &ctx);
+        orig_system_property_read_callback(pi, prop_read_wrapper, &ctx);
         return;
     }
     orig_system_property_read_callback(pi, callback, cookie);
 }
 
-static int hook_execve(const char *pathname, char *const argv[], char *const envp[]) {
-    if (pathname != NULL) {
-        #ifdef SYSTEM_PROP_OVERRIDES_COUNT
-        if (strstr(pathname, "sh") != NULL && argv != NULL) {
-            for (int j = 1; argv[j] != NULL; j++) {
-                if (strcmp(argv[j], "-c") == 0 && argv[j + 1] != NULL) {
-                    char *cmd = argv[j + 1];
-                    if (strstr(cmd, "getprop") != NULL) {
-                        for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
-                            if (strstr(cmd, SYSTEM_PROP_OVERRIDES[i].key) != NULL) {
-                                LOGI("Puppy intercepted shell getprop for: %s. Redirecting via echo.", SYSTEM_PROP_OVERRIDES[i].key);
-                                char *new_argv[4];
-                                new_argv[0] = (char *)"/system/bin/sh";
-                                new_argv[1] = (char *)"-c";
-                                int len = snprintf(NULL, 0, "echo %s", SYSTEM_PROP_OVERRIDES[i].value) + 1;
-                                char *echo_cmd = (char *)malloc(len);
-                                snprintf(echo_cmd, len, "echo %s", SYSTEM_PROP_OVERRIDES[i].value);
-                                new_argv[2] = echo_cmd;
-                                new_argv[3] = NULL;
-                                
-                                int ret = orig_execve("/system/bin/sh", new_argv, envp);
-                                free(echo_cmd);
-                                return ret;
-                            }
-                        }
+static const prop_info *hook_system_property_find(const char *name) {
+    if (name != NULL) {
+        for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
+            if (strcmp(name, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
+                const prop_info *real_pi = orig_system_property_find(name);
+                return real_pi ? real_pi : (const prop_info *)&SYSTEM_PROP_OVERRIDES[i];
+            }
+        }
+    }
+    return orig_system_property_find(name);
+}
+
+static void extract_key_from_string(const char *str, char *out_key, size_t max_len) {
+    out_key[0] = '\0';
+    if (!str) return;
+
+    const char *p = strstr(str, "getprop");
+    if (!p) return;
+
+    p += 7; // skip "getprop"
+    while (*p == ' ' || *p == '\t' || *p == '\'' || *p == '"') {
+        p++;
+    }
+
+    size_t idx = 0;
+    while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\'' && *p != '"' &&
+           *p != ';' && *p != '|' && *p != '&' && *p != '\n' && *p != '\r' && idx < max_len - 1) {
+        out_key[idx++] = *p++;
+    }
+    out_key[idx] = '\0';
+}
+
+static int extract_getprop_key(const char *pathname, char *const argv[], char *out_key, size_t max_len) {
+    out_key[0] = '\0';
+    if ((pathname && strstr(pathname, "getprop") != NULL) ||
+        (argv && argv[0] && strstr(argv[0], "getprop") != NULL)) {
+        if (argv && argv[1] != NULL) {
+            snprintf(out_key, max_len, "%s", argv[1]);
+        }
+        return 1;
+    }
+
+    if ((pathname && strstr(pathname, "sh") != NULL) ||
+        (argv && argv[0] && strstr(argv[0], "sh") != NULL)) {
+        if (argv) {
+            for (int i = 1; argv[i] != NULL; i++) {
+                if (strcmp(argv[i], "-c") == 0 && argv[i + 1] != NULL) {
+                    if (strstr(argv[i + 1], "getprop") != NULL) {
+                        extract_key_from_string(argv[i + 1], out_key, max_len);
+                        return 1;
                     }
                 }
             }
         }
-        #endif
     }
-    return orig_execve(pathname, argv, envp);
+    return 0;
+}
+
+static void apply_posix_spawn_file_actions(const posix_spawn_file_actions_t *fa_ptr) {
+    if (!fa_ptr || !*fa_ptr) return;
+
+    struct BionicAction {
+        int type; // 0=Open, 1=Close, 2=Dup2
+        int fd;
+        int new_fd;
+        char* path;
+        int flags;
+        mode_t mode;
+    };
+    struct BionicFileActions {
+        struct BionicAction* actions;
+        size_t count;
+    };
+
+    struct BionicFileActions* fa = (struct BionicFileActions*)(*fa_ptr);
+    if (fa && fa->actions && fa->count > 0 && fa->count < 100) {
+        for (size_t i = 0; i < fa->count; i++) {
+            struct BionicAction* act = &fa->actions[i];
+            if (act->type == 1) {
+                close(act->fd);
+            } else if (act->type == 2) {
+                dup2(act->fd, act->new_fd);
+            } else if (act->type == 0 && act->path) {
+                int fd = open(act->path, act->flags, act->mode);
+                if (fd >= 0) {
+                    if (fd != act->fd) {
+                        dup2(fd, act->fd);
+                        close(fd);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static int handle_posix_spawn_getprop(pid_t *pid, const char *path,
+                                     const posix_spawn_file_actions_t *file_actions,
+                                     const posix_spawnattr_t *attrp,
+                                     char *const argv[], char *const envp[]) {
+    char key[256] = {0};
+    if (!extract_getprop_key(path, argv, key, sizeof(key))) {
+        return -1;
+    }
+
+    size_t len = strlen(key);
+    if (len > 1 && (key[0] == '\'' || key[0] == '"') && key[len - 1] == key[0]) {
+        memmove(key, key + 1, len - 2);
+        key[len - 2] = '\0';
+    }
+
+    LOGI("Puppy intercepting posix_spawn for getprop key: '%s'", key);
+
+    pid_t child = fork();
+    if (child == 0) {
+        apply_posix_spawn_file_actions(file_actions);
+
+        const char *final_val = NULL;
+        char real_val[PROP_VALUE_MAX] = {0};
+
+        if (key[0] != '\0') {
+#ifdef SYSTEM_PROP_OVERRIDES_COUNT
+            for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
+                if (strcmp(key, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
+                    final_val = SYSTEM_PROP_OVERRIDES[i].value;
+                    break;
+                }
+            }
+#endif
+            if (final_val == NULL) {
+                if (__system_property_get(key, real_val) > 0) {
+                    final_val = real_val;
+                } else {
+                    final_val = "";
+                }
+            }
+        } else {
+            final_val = "";
+        }
+
+        dprintf(STDOUT_FILENO, "%s\n", final_val);
+        _exit(0);
+    } else if (child > 0) {
+        if (pid) *pid = child;
+        return 0;
+    }
+    return -1;
+}
+
+static int hook_posix_spawn(pid_t *pid, const char *path,
+                           const posix_spawn_file_actions_t *file_actions,
+                           const posix_spawnattr_t *attrp,
+                           char *const argv[], char *const envp[]) {
+    if (handle_posix_spawn_getprop(pid, path, file_actions, attrp, argv, envp) == 0) {
+        return 0;
+    }
+    return orig_posix_spawn(pid, path, file_actions, attrp, argv, envp);
+}
+
+static int hook_posix_spawnp(pid_t *pid, const char *file,
+                            const posix_spawn_file_actions_t *file_actions,
+                            const posix_spawnattr_t *attrp,
+                            char *const argv[], char *const envp[]) {
+    if (handle_posix_spawn_getprop(pid, file, file_actions, attrp, argv, envp) == 0) {
+        return 0;
+    }
+    return orig_posix_spawnp(pid, file, file_actions, attrp, argv, envp);
 }
 #endif
 
@@ -416,13 +573,33 @@ static void* puppy_main_thread(void* arg) {
             NULL
         );
     }
-    gpointer target_execve = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "execve"));
-    if (target_execve) {
+    gpointer target_prop_find = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_find"));
+    if (target_prop_find) {
         gum_interceptor_replace(
             interceptor,
-            target_execve, 
-            GSIZE_TO_POINTER(hook_execve),
-            (gpointer *)&orig_execve,
+            target_prop_find, 
+            GSIZE_TO_POINTER(hook_system_property_find),
+            (gpointer *)&orig_system_property_find,
+            NULL
+        );
+    }
+    gpointer target_posix_spawn = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "posix_spawn"));
+    if (target_posix_spawn) {
+        gum_interceptor_replace(
+            interceptor,
+            target_posix_spawn,
+            GSIZE_TO_POINTER(hook_posix_spawn),
+            (gpointer *)&orig_posix_spawn,
+            NULL
+        );
+    }
+    gpointer target_posix_spawnp = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "posix_spawnp"));
+    if (target_posix_spawnp) {
+        gum_interceptor_replace(
+            interceptor,
+            target_posix_spawnp,
+            GSIZE_TO_POINTER(hook_posix_spawnp),
+            (gpointer *)&orig_posix_spawnp,
             NULL
         );
     }
