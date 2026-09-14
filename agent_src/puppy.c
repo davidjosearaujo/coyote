@@ -64,8 +64,6 @@ typedef int (*PosixSpawnpFunc)(pid_t *pid, const char *file,
                               const posix_spawnattr_t *attrp,
                               char *const argv[], char *const envp[]);
 typedef int (*ExecveFunc)(const char *pathname, char *const argv[], char *const envp[]);
-typedef int (*ExecvFunc)(const char *pathname, char *const argv[]);
-typedef int (*ExecvpFunc)(const char *file, char *const argv[]);
 typedef int (*ExecvpeFunc)(const char *file, char *const argv[], char *const envp[]);
 
 typedef int (*OpenatFunc)(int dirfd, const char *pathname, int flags, int mode);
@@ -86,23 +84,11 @@ static SysinfoFunc orig_sysinfo = NULL;
 static PosixSpawnFunc orig_posix_spawn = NULL;
 static PosixSpawnpFunc orig_posix_spawnp = NULL;
 static ExecveFunc orig_execve = NULL;
-static ExecvFunc orig_execv = NULL;
-static ExecvpFunc orig_execvp = NULL;
 static ExecvpeFunc orig_execvpe = NULL;
 
 static OpenatFunc orig_openat = NULL;
 
 static char puppy_so_path[PATH_MAX] = {0};
-
-static void init_puppy_path(void) {
-    Dl_info info;
-    if (dladdr((void*)init_puppy_path, &info) && info.dli_fname) {
-        if (realpath(info.dli_fname, puppy_so_path) == NULL) {
-            snprintf(puppy_so_path, sizeof(puppy_so_path), "%s", info.dli_fname);
-        }
-        LOGI("Puppy library resolved at: %s", puppy_so_path);
-    }
-}
 
 static char **build_preloaded_envp(char *const envp[]) {
     if (puppy_so_path[0] == '\0') return (char **)envp;
@@ -156,13 +142,22 @@ static void free_preloaded_envp(char **new_envp, char *const orig_envp[]) {
 }
 
 #ifdef SYSTEM_PROP_OVERRIDES_COUNT
+static const char* get_mocked_prop_value(const char *key) {
+    if (!key) return NULL;
+    for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
+        if (strcmp(key, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
+            return SYSTEM_PROP_OVERRIDES[i].value;
+        }
+    }
+    return NULL;
+}
+
 static int hook_system_property_get(const char *name, char *value) {
     if (name != NULL && value != NULL) {
-        for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
-            if (strcmp(name, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
-                strcpy(value, SYSTEM_PROP_OVERRIDES[i].value);
-                return (int)strlen(SYSTEM_PROP_OVERRIDES[i].value);
-            }
+        const char *mock_val = get_mocked_prop_value(name);
+        if (mock_val != NULL) {
+            strlcpy(value, mock_val, PROP_VALUE_MAX);
+            return (int)strlen(value);
         }
     }
     return orig_system_property_get(name, value);
@@ -178,16 +173,12 @@ static void prop_read_wrapper(void *cookie, const char *name, const char *value,
     if (ctx == NULL) return;
 
     const char *final_value = value;
-    #ifdef SYSTEM_PROP_OVERRIDES_COUNT
     if (name != NULL) {
-        for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
-            if (strcmp(name, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
-                final_value = SYSTEM_PROP_OVERRIDES[i].value;
-                break;
-            }
+        const char *mock_val = get_mocked_prop_value(name);
+        if (mock_val != NULL) {
+            final_value = mock_val;
         }
     }
-    #endif
 
     ctx->orig_callback(ctx->orig_cookie, name, final_value, serial);
 }
@@ -216,25 +207,18 @@ static void hook_system_property_read_callback(const prop_info *pi, PropReadCall
 }
 
 static const prop_info *hook_system_property_find(const char *name) {
-    if (name != NULL) {
+    if (name != NULL && get_mocked_prop_value(name) != NULL) {
+        const prop_info *real_pi = orig_system_property_find(name);
+        if (real_pi != NULL) {
+            return real_pi;
+        }
         for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
             if (strcmp(name, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
-                const prop_info *real_pi = orig_system_property_find(name);
-                return real_pi ? real_pi : (const prop_info *)&SYSTEM_PROP_OVERRIDES[i];
+                return (const prop_info *)&SYSTEM_PROP_OVERRIDES[i];
             }
         }
     }
     return orig_system_property_find(name);
-}
-
-static const char* get_mocked_prop_value(const char *key) {
-    if (!key) return NULL;
-    for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
-        if (strcmp(key, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
-            return SYSTEM_PROP_OVERRIDES[i].value;
-        }
-    }
-    return NULL;
 }
 
 static int is_getprop_cmd(const char *path, char *const argv[], const char **out_prop_name) {
@@ -243,16 +227,26 @@ static int is_getprop_cmd(const char *path, char *const argv[], const char **out
     const char *bin = strrchr(path, '/');
     bin = bin ? bin + 1 : path;
 
-    // Direct invocation: getprop <key>
     if (strcmp(bin, "getprop") == 0 && argv[1] != NULL) {
-        *out_prop_name = argv[1];
+        char *key = argv[1];
+        char *delim = strpbrk(key, " \"'\t\r\n>|&;");
+        if (delim) *delim = '\0';
+        
+        *out_prop_name = key;
         return 1;
     }
 
     // Shell invocation: sh -c "getprop <key>" or su -c "getprop <key>"
     if ((strcmp(bin, "sh") == 0 || strcmp(bin, "su") == 0) && argv[1] && strcmp(argv[1], "-c") == 0 && argv[2]) {
         if (strncmp(argv[2], "getprop ", 8) == 0) {
-            *out_prop_name = argv[2] + 8;
+            char *key = argv[2] + 8;
+            
+            while (*key == ' ' || *key == '"' || *key == '\'') key++;
+            
+            char *delim = strpbrk(key, " \"'\t\r\n>|&;");
+            if (delim) *delim = '\0';
+            
+            *out_prop_name = key;
             return 1;
         }
     }
@@ -385,16 +379,17 @@ static int32_t hook_anativewindow_get_height(ANativeWindow *window) {
 }
 #endif
 
-static long long get_realistic_jitter(long long base_val, double percentage) {
+static unsigned long long apply_jitter(unsigned long long base_val, double percentage) {
     double fluctuation = ((double)rand() / RAND_MAX) * 2.0 - 1.0; 
-    return base_val + (long long)(base_val * percentage * fluctuation);
+    double jittered = (double)base_val + ((double)base_val * percentage * fluctuation);
+    return (jittered < 0.0) ? 0ULL : (unsigned long long)(jittered + 0.5);
 }
 
 #if defined(SPECS_FREE_SPACE) && defined(SPECS_TOTAL_SPACE)
 static int hook_statfs(const char *path, struct statfs *buf) {
     int ret = orig_statfs(path, buf);
     if (ret == 0 && buf != NULL) {
-        long long jittered_free = get_realistic_jitter(SPECS_FREE_SPACE, 0.0005);
+        long long jittered_free = apply_jitter(SPECS_FREE_SPACE, 0.0005);
         buf->f_blocks = SPECS_TOTAL_SPACE / buf->f_bsize;
         buf->f_bfree = jittered_free / buf->f_bsize;
         buf->f_bavail = buf->f_bfree; 
@@ -405,7 +400,7 @@ static int hook_statfs(const char *path, struct statfs *buf) {
 static int hook_statfs64(const char *path, struct statfs64 *buf) {
     int ret = orig_statfs64(path, buf);
     if (ret == 0 && buf != NULL) {
-        long long jittered_free = get_realistic_jitter(SPECS_FREE_SPACE, 0.0005);
+        long long jittered_free = apply_jitter(SPECS_FREE_SPACE, 0.0005);
         buf->f_blocks = SPECS_TOTAL_SPACE / buf->f_bsize;
         buf->f_bfree = jittered_free / buf->f_bsize;
         buf->f_bavail = buf->f_bfree; 
@@ -416,7 +411,7 @@ static int hook_statfs64(const char *path, struct statfs64 *buf) {
 static int hook_statvfs(const char *path, struct statvfs *buf) {
     int ret = orig_statvfs(path, buf);
     if (ret == 0 && buf != NULL) {
-        long long jittered_free = get_realistic_jitter(SPECS_FREE_SPACE, 0.0005);
+        long long jittered_free = apply_jitter(SPECS_FREE_SPACE, 0.0005);
         buf->f_blocks = SPECS_TOTAL_SPACE / buf->f_frsize;
         buf->f_bfree = jittered_free / buf->f_frsize;
         buf->f_bavail = buf->f_bfree;
@@ -427,7 +422,7 @@ static int hook_statvfs(const char *path, struct statvfs *buf) {
 static int hook_statvfs64(const char *path, struct statvfs64 *buf) {
     int ret = orig_statvfs64(path, buf);
     if (ret == 0 && buf != NULL) {
-        long long jittered_free = get_realistic_jitter(SPECS_FREE_SPACE, 0.0005);
+        long long jittered_free = apply_jitter(SPECS_FREE_SPACE, 0.0005);
         buf->f_blocks = SPECS_TOTAL_SPACE / buf->f_frsize;
         buf->f_bfree = jittered_free / buf->f_frsize;
         buf->f_bavail = buf->f_bfree;
@@ -441,7 +436,7 @@ static int hook_statvfs64(const char *path, struct statvfs64 *buf) {
 static int hook_sysinfo(struct sysinfo *info) {
     int ret = orig_sysinfo(info);
     if (ret == 0 && info != NULL) {
-        long long jittered_avail_ram = get_realistic_jitter(SPECS_AVAIL_RAM, 0.03);
+        long long jittered_avail_ram = apply_jitter(SPECS_AVAIL_RAM, 0.03);
         info->totalram = SPECS_TOTAL_RAM / info->mem_unit;
         info->freeram = jittered_avail_ram / info->mem_unit;
         LOGI("Puppy spoofed sysinfo (RAM)");
@@ -471,7 +466,7 @@ static int create_memfd_with_data(const char *name, const char *data, size_t siz
         return -1;
     }
     ssize_t written = write(fd, data, size);
-    if (written < 0) {
+    if (written != (ssize_t)size) {
         close(fd);
         return -1;
     }
@@ -479,16 +474,7 @@ static int create_memfd_with_data(const char *name, const char *data, size_t siz
     return fd;
 }
 
-#if defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB)
-static unsigned long long apply_jitter(unsigned long long base_value, double variance_percent) {
-    double min = base_value * (1.0 - variance_percent);
-    double max = base_value * (1.0 + variance_percent);
-    double range = max - min;
-    if (range < 0) range = 0;
-    double random_val = min + ((double)rand() / RAND_MAX) * range;
-    return (unsigned long long)(random_val + 0.5);
-}
-#endif
+
 
 static int get_intercepted_fd(const char *pathname) {
     if (pathname == NULL) return -1;
@@ -496,9 +482,7 @@ static int get_intercepted_fd(const char *pathname) {
     #ifdef DEVICE_CPU_INFO
     if (strcmp(pathname, "/proc/cpuinfo") == 0) {
         LOGI("Puppy intercepted open for /proc/cpuinfo");
-        
         return create_memfd_with_data("cpuinfo_fake", DEVICE_CPU_INFO, strlen(DEVICE_CPU_INFO));
-        
     }
     #endif
     
@@ -611,36 +595,13 @@ static void* puppy_main_thread(void* arg) {
 
     // 1. System Property Hooks
     #ifdef SYSTEM_PROP_OVERRIDES_COUNT
-    gpointer target_prop_get = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_get"));
-    if (target_prop_get) {
-        gum_interceptor_replace(
-            interceptor,
-            target_prop_get, 
-            GSIZE_TO_POINTER(hook_system_property_get),
-            (gpointer *)&orig_system_property_get,
-            NULL
-        );
-    }
-    gpointer target_prop_read_cb = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_read_callback"));
-    if (target_prop_read_cb) {
-        gum_interceptor_replace(
-            interceptor,
-            target_prop_read_cb, 
-            GSIZE_TO_POINTER(hook_system_property_read_callback),
-            (gpointer *)&orig_system_property_read_callback,
-            NULL
-        );
-    }
-    gpointer target_prop_find = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_find"));
-    if (target_prop_find) {
-        gum_interceptor_replace(
-            interceptor,
-            target_prop_find, 
-            GSIZE_TO_POINTER(hook_system_property_find),
-            (gpointer *)&orig_system_property_find,
-            NULL
-        );
-    }
+    gpointer target_prop_get        = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_get"));
+    gpointer target_prop_read_cb    = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_read_callback"));
+    gpointer target_prop_find       = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_find"));
+    if (target_prop_get)        gum_interceptor_replace(interceptor, target_prop_get, GSIZE_TO_POINTER(hook_system_property_get), (gpointer *)&orig_system_property_get, NULL);
+    if (target_prop_read_cb)    gum_interceptor_replace(interceptor, target_prop_read_cb, GSIZE_TO_POINTER(hook_system_property_read_callback), (gpointer *)&orig_system_property_read_callback, NULL);
+    if (target_prop_find)       gum_interceptor_replace(interceptor, target_prop_find, GSIZE_TO_POINTER(hook_system_property_find), (gpointer *)&orig_system_property_find, NULL);
+
     gpointer t_posix_spawn  = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "posix_spawn"));
     gpointer t_posix_spawnp = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "posix_spawnp"));
     gpointer t_execve       = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "execve"));
@@ -650,78 +611,44 @@ static void* puppy_main_thread(void* arg) {
     if (t_posix_spawn)  gum_interceptor_replace(interceptor, t_posix_spawn,  GSIZE_TO_POINTER(hook_posix_spawn),  (gpointer *)&orig_posix_spawn,  NULL);
     if (t_posix_spawnp) gum_interceptor_replace(interceptor, t_posix_spawnp, GSIZE_TO_POINTER(hook_posix_spawnp), (gpointer *)&orig_posix_spawnp, NULL);
     if (t_execve)       gum_interceptor_replace(interceptor, t_execve,       GSIZE_TO_POINTER(hook_execve),       (gpointer *)&orig_execve,       NULL);
-    if (t_execv)        gum_interceptor_replace(interceptor, t_execv,        GSIZE_TO_POINTER(hook_execv),        (gpointer *)&orig_execv,        NULL);
-    if (t_execvp)       gum_interceptor_replace(interceptor, t_execvp,       GSIZE_TO_POINTER(hook_execvp),       (gpointer *)&orig_execvp,       NULL);
+    if (t_execv)        gum_interceptor_replace(interceptor, t_execv,        GSIZE_TO_POINTER(hook_execv),        NULL,        NULL);
+    if (t_execvp)       gum_interceptor_replace(interceptor, t_execvp,       GSIZE_TO_POINTER(hook_execvp),       NULL,       NULL);
     if (t_execvpe)      gum_interceptor_replace(interceptor, t_execvpe,      GSIZE_TO_POINTER(hook_execvpe),      (gpointer *)&orig_execvpe,      NULL);
     #endif
 
     #if defined(SPECS_WIDTH) || defined(SPECS_HEIGHT)
     void *libnativewindow = dlopen("libnativewindow.so", RTLD_LAZY);
-    #endif
 
     #ifdef SPECS_WIDTH
     gpointer target_width = libnativewindow ? dlsym(libnativewindow, "ANativeWindow_getWidth") : NULL;
-    if (target_width) {
-        gum_interceptor_replace(
-            interceptor,
-            target_width, 
-            GSIZE_TO_POINTER(hook_anativewindow_get_width),
-            (gpointer *)&orig_anativewindow_get_width,
-            NULL
-        );
-    }
+    if (target_width) gum_interceptor_replace(interceptor, target_width, GSIZE_TO_POINTER(hook_anativewindow_get_width), (gpointer *)&orig_anativewindow_get_width, NULL);
     #endif
 
     #ifdef SPECS_HEIGHT
     gpointer target_height = libnativewindow ? dlsym(libnativewindow, "ANativeWindow_getHeight") : NULL;
-    if (target_height) {
-        gum_interceptor_replace(
-            interceptor,
-            target_height, 
-            GSIZE_TO_POINTER(hook_anativewindow_get_height),
-            (gpointer *)&orig_anativewindow_get_height,
-            NULL
-        );
-    }
+    if (target_height) gum_interceptor_replace(interceptor, target_height, GSIZE_TO_POINTER(hook_anativewindow_get_height), (gpointer *)&orig_anativewindow_get_height, NULL);
+    #endif
     #endif
 
     #if defined(SPECS_FREE_SPACE) && defined(SPECS_TOTAL_SPACE)
-    gpointer target_statfs = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statfs"));
-    gpointer target_statfs64  = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statfs64"));
-    gpointer target_statvfs = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statvfs"));
-    gpointer target_statvfs64 = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statvfs64"));
-    if (target_statfs) {
-        gum_interceptor_replace(interceptor, target_statfs, GSIZE_TO_POINTER(hook_statfs), (gpointer *)&orig_statfs, NULL);
-    }
-    if (target_statfs64) {
-        gum_interceptor_replace(interceptor, target_statfs64, GSIZE_TO_POINTER(hook_statfs64), (gpointer *)&orig_statfs64, NULL);
-    }
-    if (target_statvfs) {
-        gum_interceptor_replace(interceptor, target_statvfs, GSIZE_TO_POINTER(hook_statvfs), (gpointer *)&orig_statvfs, NULL);
-    }
-    if (target_statvfs64) {
-        gum_interceptor_replace(interceptor, target_statvfs64, GSIZE_TO_POINTER(hook_statvfs64), (gpointer *)&orig_statvfs64, NULL);
-    }
+    gpointer target_statfs      = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statfs"));
+    gpointer target_statfs64    = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statfs64"));
+    gpointer target_statvfs     = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statvfs"));
+    gpointer target_statvfs64   = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statvfs64"));
+    if (target_statfs)      gum_interceptor_replace(interceptor, target_statfs, GSIZE_TO_POINTER(hook_statfs), (gpointer *)&orig_statfs, NULL);
+    if (target_statfs64)    gum_interceptor_replace(interceptor, target_statfs64, GSIZE_TO_POINTER(hook_statfs64), (gpointer *)&orig_statfs64, NULL);
+    if (target_statvfs)     gum_interceptor_replace(interceptor, target_statvfs, GSIZE_TO_POINTER(hook_statvfs), (gpointer *)&orig_statvfs, NULL);
+    if (target_statvfs64)   gum_interceptor_replace(interceptor, target_statvfs64, GSIZE_TO_POINTER(hook_statvfs64), (gpointer *)&orig_statvfs64, NULL);
     #endif
 
     #if defined(SPECS_AVAIL_RAM) && defined(SPECS_TOTAL_RAM)
     gpointer target_sysinfo = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "sysinfo"));
-    if (target_sysinfo) {
-        gum_interceptor_replace(interceptor, target_sysinfo, GSIZE_TO_POINTER(hook_sysinfo), (gpointer *)&orig_sysinfo, NULL);
-    }
+    if (target_sysinfo) gum_interceptor_replace(interceptor, target_sysinfo, GSIZE_TO_POINTER(hook_sysinfo), (gpointer *)&orig_sysinfo, NULL);
     #endif
 
     #if defined(DEVICE_CPU_INFO) || (defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB))
     gpointer target_openat = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "openat"));
-    if (target_openat) {
-        gum_interceptor_replace(
-            interceptor,
-            target_openat, 
-            GSIZE_TO_POINTER(hook_openat),
-            (gpointer *)&orig_openat,
-            NULL
-        );
-    }
+    if (target_openat) gum_interceptor_replace(interceptor, target_openat, GSIZE_TO_POINTER(hook_openat), (gpointer *)&orig_openat, NULL);
     #endif
 
     gum_interceptor_end_transaction(interceptor);
@@ -732,8 +659,14 @@ static void* puppy_main_thread(void* arg) {
 
 __attribute__((constructor)) void puppy_init(void) {
     LOGI("Puppy barking at process entry (PID: %d)...", getpid());
-    
-    init_puppy_path();
+
+    Dl_info info;
+    if (dladdr((void *)&puppy_init, &info) != 0 && info.dli_fname != NULL) {
+        snprintf(puppy_so_path, sizeof(puppy_so_path), "%s", info.dli_fname);
+        LOGI("Puppy loaded from path: %s", puppy_so_path);
+    } else {
+        LOGE("Puppy failed to resolve shared object path!");
+    }
 
     pthread_t thread;
     if (pthread_create(&thread, NULL, puppy_main_thread, NULL) != 0) {
