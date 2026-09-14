@@ -10,6 +10,7 @@
 #include <math.h>
 #include <spawn.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
@@ -58,11 +59,14 @@ typedef int (*PosixSpawnFunc)(pid_t *pid, const char *path,
                              const posix_spawn_file_actions_t *file_actions,
                              const posix_spawnattr_t *attrp,
                              char *const argv[], char *const envp[]);
-
 typedef int (*PosixSpawnpFunc)(pid_t *pid, const char *file,
                               const posix_spawn_file_actions_t *file_actions,
                               const posix_spawnattr_t *attrp,
                               char *const argv[], char *const envp[]);
+typedef int (*ExecveFunc)(const char *pathname, char *const argv[], char *const envp[]);
+typedef int (*ExecvFunc)(const char *pathname, char *const argv[]);
+typedef int (*ExecvpFunc)(const char *file, char *const argv[]);
+typedef int (*ExecvpeFunc)(const char *file, char *const argv[], char *const envp[]);
 
 typedef int (*OpenatFunc)(int dirfd, const char *pathname, int flags, int mode);
 
@@ -81,8 +85,75 @@ static SysinfoFunc orig_sysinfo = NULL;
 
 static PosixSpawnFunc orig_posix_spawn = NULL;
 static PosixSpawnpFunc orig_posix_spawnp = NULL;
+static ExecveFunc orig_execve = NULL;
+static ExecvFunc orig_execv = NULL;
+static ExecvpFunc orig_execvp = NULL;
+static ExecvpeFunc orig_execvpe = NULL;
 
 static OpenatFunc orig_openat = NULL;
+
+static char puppy_so_path[PATH_MAX] = {0};
+
+static void init_puppy_path(void) {
+    Dl_info info;
+    if (dladdr((void*)init_puppy_path, &info) && info.dli_fname) {
+        if (realpath(info.dli_fname, puppy_so_path) == NULL) {
+            snprintf(puppy_so_path, sizeof(puppy_so_path), "%s", info.dli_fname);
+        }
+        LOGI("Puppy library resolved at: %s", puppy_so_path);
+    }
+}
+
+static char **build_preloaded_envp(char *const envp[]) {
+    if (puppy_so_path[0] == '\0') return (char **)envp;
+
+    size_t count = 0;
+    int has_ld_preload = 0;
+
+    if (envp) {
+        while (envp[count] != NULL) {
+            if (strncmp(envp[count], "LD_PRELOAD=", 11) == 0) {
+                has_ld_preload = 1;
+            }
+            count++;
+        }
+    }
+
+    char **new_envp = (char **)malloc(sizeof(char *) * (count + 2));
+    if (!new_envp) return (char **)envp;
+
+    size_t idx = 0;
+    if (envp) {
+        for (size_t i = 0; i < count; i++) {
+            if (strncmp(envp[i], "LD_PRELOAD=", 11) == 0) {
+                size_t len = strlen(envp[i]) + strlen(puppy_so_path) + 2;
+                char *buf = (char *)malloc(len);
+                snprintf(buf, len, "%s:%s", envp[i], puppy_so_path);
+                new_envp[idx++] = buf;
+            } else {
+                new_envp[idx++] = strdup(envp[i]);
+            }
+        }
+    }
+
+    if (!has_ld_preload) {
+        size_t len = strlen(puppy_so_path) + 12;
+        char *buf = (char *)malloc(len);
+        snprintf(buf, len, "LD_PRELOAD=%s", puppy_so_path);
+        new_envp[idx++] = buf;
+    }
+
+    new_envp[idx] = NULL;
+    return new_envp;
+}
+
+static void free_preloaded_envp(char **new_envp, char *const orig_envp[]) {
+    if (new_envp == (char **)orig_envp || !new_envp) return;
+    for (size_t i = 0; new_envp[i] != NULL; i++) {
+        free(new_envp[i]);
+    }
+    free(new_envp);
+}
 
 #ifdef SYSTEM_PROP_OVERRIDES_COUNT
 static int hook_system_property_get(const char *name, char *value) {
@@ -125,7 +196,7 @@ static void hook_system_property_read_callback(const prop_info *pi, PropReadCall
     uintptr_t pi_addr = (uintptr_t)pi;
     uintptr_t start_addr = (uintptr_t)&SYSTEM_PROP_OVERRIDES[0];
     uintptr_t end_addr = start_addr + sizeof(SYSTEM_PROP_OVERRIDES);
-    
+
     if (pi_addr >= start_addr && pi_addr < end_addr) {
         const prop_override_t *entry = (const prop_override_t *)pi;
         if (callback != NULL && entry->key != NULL && entry->value != NULL) {
@@ -156,160 +227,147 @@ static const prop_info *hook_system_property_find(const char *name) {
     return orig_system_property_find(name);
 }
 
-static void extract_key_from_string(const char *str, char *out_key, size_t max_len) {
-    out_key[0] = '\0';
-    if (!str) return;
-
-    const char *p = strstr(str, "getprop");
-    if (!p) return;
-
-    p += 7; // skip "getprop"
-    while (*p == ' ' || *p == '\t' || *p == '\'' || *p == '"') {
-        p++;
+static const char* get_mocked_prop_value(const char *key) {
+    if (!key) return NULL;
+    for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
+        if (strcmp(key, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
+            return SYSTEM_PROP_OVERRIDES[i].value;
+        }
     }
-
-    size_t idx = 0;
-    while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\'' && *p != '"' &&
-           *p != ';' && *p != '|' && *p != '&' && *p != '\n' && *p != '\r' && idx < max_len - 1) {
-        out_key[idx++] = *p++;
-    }
-    out_key[idx] = '\0';
+    return NULL;
 }
 
-static int extract_getprop_key(const char *pathname, char *const argv[], char *out_key, size_t max_len) {
-    out_key[0] = '\0';
-    if ((pathname && strstr(pathname, "getprop") != NULL) ||
-        (argv && argv[0] && strstr(argv[0], "getprop") != NULL)) {
-        if (argv && argv[1] != NULL) {
-            snprintf(out_key, max_len, "%s", argv[1]);
-        }
+static int is_getprop_cmd(const char *path, char *const argv[], const char **out_prop_name) {
+    if (!path || !argv || !argv[0]) return 0;
+
+    const char *bin = strrchr(path, '/');
+    bin = bin ? bin + 1 : path;
+
+    // Direct invocation: getprop <key>
+    if (strcmp(bin, "getprop") == 0 && argv[1] != NULL) {
+        *out_prop_name = argv[1];
         return 1;
     }
 
-    if ((pathname && strstr(pathname, "sh") != NULL) ||
-        (argv && argv[0] && strstr(argv[0], "sh") != NULL)) {
-        if (argv) {
-            for (int i = 1; argv[i] != NULL; i++) {
-                if (strcmp(argv[i], "-c") == 0 && argv[i + 1] != NULL) {
-                    if (strstr(argv[i + 1], "getprop") != NULL) {
-                        extract_key_from_string(argv[i + 1], out_key, max_len);
-                        return 1;
-                    }
-                }
-            }
+    // Shell invocation: sh -c "getprop <key>" or su -c "getprop <key>"
+    if ((strcmp(bin, "sh") == 0 || strcmp(bin, "su") == 0) && argv[1] && strcmp(argv[1], "-c") == 0 && argv[2]) {
+        if (strncmp(argv[2], "getprop ", 8) == 0) {
+            *out_prop_name = argv[2] + 8;
+            return 1;
         }
     }
+
     return 0;
-}
-
-static void apply_posix_spawn_file_actions(const posix_spawn_file_actions_t *fa_ptr) {
-    if (!fa_ptr || !*fa_ptr) return;
-
-    struct BionicAction {
-        int type; // 0=Open, 1=Close, 2=Dup2
-        int fd;
-        int new_fd;
-        char* path;
-        int flags;
-        mode_t mode;
-    };
-    struct BionicFileActions {
-        struct BionicAction* actions;
-        size_t count;
-    };
-
-    struct BionicFileActions* fa = (struct BionicFileActions*)(*fa_ptr);
-    if (fa && fa->actions && fa->count > 0 && fa->count < 100) {
-        for (size_t i = 0; i < fa->count; i++) {
-            struct BionicAction* act = &fa->actions[i];
-            if (act->type == 1) {
-                close(act->fd);
-            } else if (act->type == 2) {
-                dup2(act->fd, act->new_fd);
-            } else if (act->type == 0 && act->path) {
-                int fd = open(act->path, act->flags, act->mode);
-                if (fd >= 0) {
-                    if (fd != act->fd) {
-                        dup2(fd, act->fd);
-                        close(fd);
-                    }
-                }
-            }
-        }
-    }
-}
-
-static int handle_posix_spawn_getprop(pid_t *pid, const char *path,
-                                     const posix_spawn_file_actions_t *file_actions,
-                                     const posix_spawnattr_t *attrp,
-                                     char *const argv[], char *const envp[]) {
-    char key[256] = {0};
-    if (!extract_getprop_key(path, argv, key, sizeof(key))) {
-        return -1;
-    }
-
-    size_t len = strlen(key);
-    if (len > 1 && (key[0] == '\'' || key[0] == '"') && key[len - 1] == key[0]) {
-        memmove(key, key + 1, len - 2);
-        key[len - 2] = '\0';
-    }
-
-    LOGI("Puppy intercepting posix_spawn for getprop key: '%s'", key);
-
-    pid_t child = fork();
-    if (child == 0) {
-        apply_posix_spawn_file_actions(file_actions);
-
-        const char *final_val = NULL;
-        char real_val[PROP_VALUE_MAX] = {0};
-
-        if (key[0] != '\0') {
-#ifdef SYSTEM_PROP_OVERRIDES_COUNT
-            for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
-                if (strcmp(key, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
-                    final_val = SYSTEM_PROP_OVERRIDES[i].value;
-                    break;
-                }
-            }
-#endif
-            if (final_val == NULL) {
-                if (__system_property_get(key, real_val) > 0) {
-                    final_val = real_val;
-                } else {
-                    final_val = "";
-                }
-            }
-        } else {
-            final_val = "";
-        }
-
-        dprintf(STDOUT_FILENO, "%s\n", final_val);
-        _exit(0);
-    } else if (child > 0) {
-        if (pid) *pid = child;
-        return 0;
-    }
-    return -1;
 }
 
 static int hook_posix_spawn(pid_t *pid, const char *path,
                            const posix_spawn_file_actions_t *file_actions,
                            const posix_spawnattr_t *attrp,
                            char *const argv[], char *const envp[]) {
-    if (handle_posix_spawn_getprop(pid, path, file_actions, attrp, argv, envp) == 0) {
-        return 0;
+    const char *prop_name = NULL;
+    if (is_getprop_cmd(path, argv, &prop_name)) {
+        const char *mock_val = get_mocked_prop_value(prop_name);
+        if (mock_val) {
+            char cmd_buf[512];
+            snprintf(cmd_buf, sizeof(cmd_buf), "echo '%s'", mock_val);
+            char *fake_argv[] = {"/system/bin/sh", "-c", cmd_buf, NULL};
+            return orig_posix_spawn(pid, "/system/bin/sh", file_actions, attrp, fake_argv, envp);
+        }
     }
-    return orig_posix_spawn(pid, path, file_actions, attrp, argv, envp);
+
+    char **new_envp = build_preloaded_envp(envp);
+    int res = orig_posix_spawn(pid, path, file_actions, attrp, argv, new_envp);
+    free_preloaded_envp(new_envp, envp);
+    return res;
 }
 
 static int hook_posix_spawnp(pid_t *pid, const char *file,
                             const posix_spawn_file_actions_t *file_actions,
                             const posix_spawnattr_t *attrp,
                             char *const argv[], char *const envp[]) {
-    if (handle_posix_spawn_getprop(pid, file, file_actions, attrp, argv, envp) == 0) {
-        return 0;
+    const char *prop_name = NULL;
+    if (is_getprop_cmd(file, argv, &prop_name)) {
+        const char *mock_val = get_mocked_prop_value(prop_name);
+        if (mock_val) {
+            char cmd_buf[512];
+            snprintf(cmd_buf, sizeof(cmd_buf), "echo '%s'", mock_val);
+            char *fake_argv[] = {"sh", "-c", cmd_buf, NULL};
+            return orig_posix_spawnp(pid, "sh", file_actions, attrp, fake_argv, envp);
+        }
     }
-    return orig_posix_spawnp(pid, file, file_actions, attrp, argv, envp);
+
+    char **new_envp = build_preloaded_envp(envp);
+    int res = orig_posix_spawnp(pid, file, file_actions, attrp, argv, new_envp);
+    free_preloaded_envp(new_envp, envp);
+    return res;
+}
+
+static int hook_execve(const char *pathname, char *const argv[], char *const envp[]) {
+    const char *prop_name = NULL;
+    if (is_getprop_cmd(pathname, argv, &prop_name)) {
+        const char *mock_val = get_mocked_prop_value(prop_name);
+        if (mock_val) {
+            printf("%s\n", mock_val);
+            fflush(stdout);
+            _exit(0);
+        }
+    }
+
+    char **new_envp = build_preloaded_envp(envp);
+    int res = orig_execve(pathname, argv, new_envp);
+    free_preloaded_envp(new_envp, envp);
+    return res;
+}
+
+static int hook_execv(const char *pathname, char *const argv[]) {
+    const char *prop_name = NULL;
+    if (is_getprop_cmd(pathname, argv, &prop_name)) {
+        const char *mock_val = get_mocked_prop_value(prop_name);
+        if (mock_val) {
+            printf("%s\n", mock_val);
+            fflush(stdout);
+            _exit(0);
+        }
+    }
+
+    char **new_envp = build_preloaded_envp(NULL);
+    int res = orig_execve(pathname, argv, new_envp);
+    free_preloaded_envp(new_envp, NULL);
+    return res;
+}
+
+static int hook_execvp(const char *file, char *const argv[]) {
+    const char *prop_name = NULL;
+    if (is_getprop_cmd(file, argv, &prop_name)) {
+        const char *mock_val = get_mocked_prop_value(prop_name);
+        if (mock_val) {
+            printf("%s\n", mock_val);
+            fflush(stdout);
+            _exit(0);
+        }
+    }
+
+    char **new_envp = build_preloaded_envp(NULL);
+    int res = orig_execvpe(file, argv, new_envp);
+    free_preloaded_envp(new_envp, NULL);
+    return res;
+}
+
+static int hook_execvpe(const char *file, char *const argv[], char *const envp[]) {
+    const char *prop_name = NULL;
+    if (is_getprop_cmd(file, argv, &prop_name)) {
+        const char *mock_val = get_mocked_prop_value(prop_name);
+        if (mock_val) {
+            printf("%s\n", mock_val);
+            fflush(stdout);
+            _exit(0);
+        }
+    }
+
+    char **new_envp = build_preloaded_envp(envp);
+    int res = orig_execvpe(file, argv, new_envp);
+    free_preloaded_envp(new_envp, envp);
+    return res;
 }
 #endif
 
@@ -583,29 +641,20 @@ static void* puppy_main_thread(void* arg) {
             NULL
         );
     }
-    gpointer target_posix_spawn = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "posix_spawn"));
-    if (target_posix_spawn) {
-        gum_interceptor_replace(
-            interceptor,
-            target_posix_spawn,
-            GSIZE_TO_POINTER(hook_posix_spawn),
-            (gpointer *)&orig_posix_spawn,
-            NULL
-        );
-    }
-    gpointer target_posix_spawnp = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "posix_spawnp"));
-    if (target_posix_spawnp) {
-        gum_interceptor_replace(
-            interceptor,
-            target_posix_spawnp,
-            GSIZE_TO_POINTER(hook_posix_spawnp),
-            (gpointer *)&orig_posix_spawnp,
-            NULL
-        );
-    }
+    gpointer t_posix_spawn  = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "posix_spawn"));
+    gpointer t_posix_spawnp = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "posix_spawnp"));
+    gpointer t_execve       = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "execve"));
+    gpointer t_execv        = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "execv"));
+    gpointer t_execvp       = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "execvp"));
+    gpointer t_execvpe      = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "execvpe"));
+    if (t_posix_spawn)  gum_interceptor_replace(interceptor, t_posix_spawn,  GSIZE_TO_POINTER(hook_posix_spawn),  (gpointer *)&orig_posix_spawn,  NULL);
+    if (t_posix_spawnp) gum_interceptor_replace(interceptor, t_posix_spawnp, GSIZE_TO_POINTER(hook_posix_spawnp), (gpointer *)&orig_posix_spawnp, NULL);
+    if (t_execve)       gum_interceptor_replace(interceptor, t_execve,       GSIZE_TO_POINTER(hook_execve),       (gpointer *)&orig_execve,       NULL);
+    if (t_execv)        gum_interceptor_replace(interceptor, t_execv,        GSIZE_TO_POINTER(hook_execv),        (gpointer *)&orig_execv,        NULL);
+    if (t_execvp)       gum_interceptor_replace(interceptor, t_execvp,       GSIZE_TO_POINTER(hook_execvp),       (gpointer *)&orig_execvp,       NULL);
+    if (t_execvpe)      gum_interceptor_replace(interceptor, t_execvpe,      GSIZE_TO_POINTER(hook_execvpe),      (gpointer *)&orig_execvpe,      NULL);
     #endif
 
-    // 2. Display Metrics Hook
     #if defined(SPECS_WIDTH) || defined(SPECS_HEIGHT)
     void *libnativewindow = dlopen("libnativewindow.so", RTLD_LAZY);
     #endif
@@ -636,7 +685,6 @@ static void* puppy_main_thread(void* arg) {
     }
     #endif
 
-    // 3. Storage & Memory Hooks
     #if defined(SPECS_FREE_SPACE) && defined(SPECS_TOTAL_SPACE)
     gpointer target_statfs = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statfs"));
     gpointer target_statfs64  = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statfs64"));
@@ -663,7 +711,6 @@ static void* puppy_main_thread(void* arg) {
     }
     #endif
 
-    // 5. File Open Hook (openat) for meminfo, cpuinfo, selinux
     #if defined(DEVICE_CPU_INFO) || (defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB))
     gpointer target_openat = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "openat"));
     if (target_openat) {
@@ -686,6 +733,8 @@ static void* puppy_main_thread(void* arg) {
 __attribute__((constructor)) void puppy_init(void) {
     LOGI("Puppy barking at process entry (PID: %d)...", getpid());
     
+    init_puppy_path();
+
     pthread_t thread;
     if (pthread_create(&thread, NULL, puppy_main_thread, NULL) != 0) {
         LOGE("Puppy failed to leave the kennel!");
