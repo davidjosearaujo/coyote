@@ -179,7 +179,29 @@ public class MainActivity extends Activity {
                 shellHeader.setText("Vector: Shell Runtime  •  " + shellPassed + " / " + shellTotal + " Passed");
                 addPassedDropdown(container, shellPassedContainer, shellPassed);
 
-                // Vector 3: Build Class Mapping
+                // Vector 3: Shell Command Execution (Non-getprop Baseline)
+                TextView shellBaselineHeader = addSectionHeader(container, "Vector: Shell Command Baseline");
+                int shellBaselineTotal = 0, shellBaselinePassed = 0;
+                LinearLayout shellBaselinePassedContainer = new LinearLayout(this);
+                shellBaselinePassedContainer.setOrientation(LinearLayout.VERTICAL);
+                shellBaselinePassedContainer.setVisibility(View.GONE);
+
+                // Test 1: Echo command
+                String echoResult = executeShellCommand("echo Hello");
+                boolean passEcho = echoResult.equals("Hello");
+                addPropRow(passEcho ? shellBaselinePassedContainer : container, "echo Hello", "Hello", echoResult, passEcho);
+                shellBaselineTotal++; if (passEcho) shellBaselinePassed++;
+
+                // Test 2: Additional baseline test (e.g., whoami)
+                String whoamiResult = executeShellCommand("whoami");
+                boolean passWhoami = !whoamiResult.isEmpty() && !whoamiResult.contains("[Error");
+                addPropRow(passWhoami ? shellBaselinePassedContainer : container, "whoami", "(non-empty)", whoamiResult, passWhoami);
+                shellBaselineTotal++; if (passWhoami) shellBaselinePassed++;
+
+                shellBaselineHeader.setText("Vector: Shell Baseline  •  " + shellBaselinePassed + " / " + shellBaselineTotal + " Passed");
+                addPassedDropdown(container, shellBaselinePassedContainer, shellBaselinePassed);
+
+                // Vector 4: Build Class Mapping
                 TextView buildHeader = addSectionHeader(container, "Vector: android.os.Build Mapping");
                 int buildTotal = 0, buildPassed = 0;
                 LinearLayout buildPassedContainer = new LinearLayout(this);
@@ -258,6 +280,18 @@ public class MainActivity extends Activity {
             return line != null ? line.trim() : "";
         } catch (Exception e) {
             return "[Error executing shell]";
+        }
+    }
+
+    private String executeShellCommand(String command) {
+        try {
+            Process process = Runtime.getRuntime().exec(command);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            String line = reader.readLine();
+            reader.close();
+            return line != null ? line.trim() : "";
+        } catch (Exception e) {
+            return "[Error executing shell: " + e.getMessage() + "]";
         }
     }
 
