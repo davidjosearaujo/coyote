@@ -242,7 +242,6 @@ class Coyote:
         """Pushes libpuppy.so and libc++_shared.so into target app private data directory and launches package via wrap property."""
 
         target_info = detect_device_abi()
-        print(f"[+] Found NDK runtime: {libcxx_path}")
 
         temp_so = "/data/local/tmp/libpuppy.so"
         app_dir = f"/data/data/{self.package_name}"
