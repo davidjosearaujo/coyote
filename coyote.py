@@ -212,21 +212,24 @@ class Coyote:
             str(compiler),
             "-shared",
             "-fPIC",
-            "-O3",
-            "-s",
+            "-Wall",
+            "-Os",
+            "-pipe",
+            "-g3",
             "-ffunction-sections",
             "-fdata-sections",
             f"-I{AGENT_SRC}",
             f"-I{BUILD_DIR}",
             f"-I{AGENT_SRC / 'devkit'}",
-            str(AGENT_SRC / "puppy.c"),
-            str(AGENT_SRC / "devkit" / "libfrida-gum.a"),
+            str(AGENT_SRC / "puppy_gumjs.c"),
+            str(AGENT_SRC / "devkit" / "libfrida-gumjs.a"),
             "-o",
             str(output_so),
             "-Wl,--gc-sections",
             "-ldl",
             "-lm",
             "-llog",
+            "-lresolv",
             "-pthread",
         ]
 
@@ -282,7 +285,7 @@ class Coyote:
         print(f"[+] wrap.{self.package_name} removed and process terminated.")
 
 def update_frida_devkit(arch: str | None = None):
-    """Fetches and extracts the latest Frida-Gum DevKit for specified architecture (auto-detects via ADB if omitted)."""
+    """Fetches and extracts the latest Frida-GumJS DevKit for specified architecture (auto-detects via ADB if omitted)."""
 
     if not arch or arch == "auto":
         device_info = detect_device_abi()
@@ -302,7 +305,7 @@ def update_frida_devkit(arch: str | None = None):
     print(f"[+] Latest Frida version identified: {tag_name}")
     
     target_asset = None
-    prefix = f"frida-gum-devkit-{tag_name}-{platform_target}.tar.xz"
+    prefix = f"frida-gumjs-devkit-{tag_name}-{platform_target}.tar.xz"
     
     for asset in release_data.get("assets", []):
         if asset["name"] == prefix:
@@ -327,13 +330,13 @@ def update_frida_devkit(arch: str | None = None):
             tar.extractall(path=DEVKIT_DIR)
         
     archive_path.unlink()
-    print("[+] Frida-Gum DevKit updated successfully.")
+    print("[+] Frida-GumJS DevKit updated successfully.")
 
 def ensure_devkit(requested_arch: str | None = None):
     """Verifies DevKit files exist. Downloads them if missing or explicitly requested."""
 
-    header_file = DEVKIT_DIR / "frida-gum.h"
-    lib_file = DEVKIT_DIR / "libfrida-gum.a"
+    header_file = DEVKIT_DIR / "frida-gumjs.h"
+    lib_file = DEVKIT_DIR / "libfrida-gumjs.a"
 
     if requested_arch:
         update_frida_devkit(requested_arch)
@@ -342,7 +345,7 @@ def ensure_devkit(requested_arch: str | None = None):
     if header_file.is_file() and lib_file.is_file():
         return
 
-    print("\n[!] Frida-Gum DevKit missing from agent_src/devkit/")
+    print("\n[!] Frida-GumJS DevKit missing from agent_src/devkit/")
 
     print("[+] Attempting to auto-detect target device ABI via ADB...")
     try:
@@ -418,7 +421,7 @@ def parse_args():
         choices=["auto", "arm", "arm64", "x86", "x86_64"],
         nargs="?",
         const="auto",
-        help="Fetch latest Frida-Gum DevKit for specified architecture (auto-detects via ADB if omitted).",
+        help="Fetch latest Frida-GumJS DevKit for specified architecture (auto-detects via ADB if omitted).",
     )
 
     return parser.parse_args()
@@ -455,6 +458,7 @@ def main():
 
     if args.profile:
         orchestrator.generate_c_header()
+        ensure_devkit()
         agent_so = orchestrator.compile_agent()
 
         if not args.skip_deploy:

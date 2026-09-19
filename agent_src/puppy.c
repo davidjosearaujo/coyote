@@ -1,4 +1,9 @@
-#include "frida-gum.h"
+/*
+ * Compile with:
+ * clang -Wall -Os -pipe -g3 puppy_gumjs.c -o libpuppy.so -shared -fPIC -L. -lfrida-gumjs -lresolv -Wl,-dead_strip
+ */
+
+#include "frida-gumjs.h"
 #include "config.h"
 
 #include <stdio.h>
@@ -7,672 +12,233 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <dlfcn.h>
-#include <math.h>
-#include <spawn.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <sys/vfs.h>
-#include <sys/statvfs.h>
-#include <sys/sysinfo.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
-#include <sys/system_properties.h>
-
-#ifndef __NR_memfd_create
-#if defined(__arm__)
-#define __NR_memfd_create 385
-#elif defined(__aarch64__)
-#define __NR_memfd_create 279
-#elif defined(__i386__)
-#define __NR_memfd_create 356
-#elif defined(__x86_64__)
-#define __NR_memfd_create 319
-#endif
-#endif
-
-#ifndef MFD_CLOEXEC
-#define MFD_CLOEXEC 0x0001U
-#endif
-
 #include <android/log.h>
-#include <android/native_window.h>
 
-#define LOG_TAG "[Puppy]"
+#define LOG_TAG "[PuppyJS]"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-typedef int (*SystemPropertyGetFunc)(const char *name, char *value);
-typedef void (*PropReadCallback)(void *cookie, const char *name, const char *value, uint32_t serial);
-typedef void (*SystemPropertyReadCallbackFunc)(const prop_info *pi, PropReadCallback callback, void *cookie);
-typedef const prop_info *(*SystemPropertyFindFunc)(const char *name);
+static GumScript *puppy_script = NULL;
 
-typedef int32_t (*ANativeWindowGetWidthFunc)(ANativeWindow *window);
-typedef int32_t (*ANativeWindowGetHeightFunc)(ANativeWindow *window);
+static void on_message(GumScript *script, const gchar *message, GBytes *data, gpointer user_data) {
+    JsonParser *parser = json_parser_new();
+    json_parser_load_from_data(parser, message, -1, NULL);
+    JsonObject *root = json_node_get_object(json_parser_get_root(parser));
 
-typedef int (*StatfsFunc)(const char *path, struct statfs *buf);
-typedef int (*Statfs64Func)(const char *path, struct statfs64 *buf);
-typedef int (*StatvfsFunc)(const char *path, struct statvfs *buf);
-typedef int (*Statvfs64Func)(const char *path, struct statvfs64 *buf);
-typedef int (*SysinfoFunc)(struct sysinfo *info);
-
-typedef int (*PosixSpawnFunc)(pid_t *pid, const char *path,
-                             const posix_spawn_file_actions_t *file_actions,
-                             const posix_spawnattr_t *attrp,
-                             char *const argv[], char *const envp[]);
-typedef int (*PosixSpawnpFunc)(pid_t *pid, const char *file,
-                              const posix_spawn_file_actions_t *file_actions,
-                              const posix_spawnattr_t *attrp,
-                              char *const argv[], char *const envp[]);
-typedef int (*ExecveFunc)(const char *pathname, char *const argv[], char *const envp[]);
-typedef int (*ExecvpeFunc)(const char *file, char *const argv[], char *const envp[]);
-
-typedef int (*OpenatFunc)(int dirfd, const char *pathname, int flags, int mode);
-
-static SystemPropertyGetFunc orig_system_property_get = NULL;
-static SystemPropertyReadCallbackFunc orig_system_property_read_callback = NULL;
-static SystemPropertyFindFunc orig_system_property_find = NULL;
-
-static ANativeWindowGetWidthFunc orig_anativewindow_get_width = NULL;
-static ANativeWindowGetHeightFunc orig_anativewindow_get_height = NULL;
-
-static StatfsFunc orig_statfs = NULL;
-static Statfs64Func orig_statfs64 = NULL;
-static StatvfsFunc orig_statvfs = NULL;
-static Statvfs64Func orig_statvfs64 = NULL;
-static SysinfoFunc orig_sysinfo = NULL;
-
-static PosixSpawnFunc orig_posix_spawn = NULL;
-static PosixSpawnpFunc orig_posix_spawnp = NULL;
-static ExecveFunc orig_execve = NULL;
-static ExecvpeFunc orig_execvpe = NULL;
-
-static OpenatFunc orig_openat = NULL;
-
-static char puppy_so_path[PATH_MAX] = {0};
-
-static char **build_preloaded_envp(char *const envp[]) {
-    if (puppy_so_path[0] == '\0') return (char **)envp;
-
-    size_t count = 0;
-    int has_ld_preload = 0;
-
-    if (envp) {
-        while (envp[count] != NULL) {
-            if (strncmp(envp[count], "LD_PRELOAD=", 11) == 0) {
-                has_ld_preload = 1;
-            }
-            count++;
-        }
+    const gchar *type = json_object_get_string_member(root, "type");
+    if (strcmp(type, "log") == 0) {
+        const gchar *log_message = json_object_get_string_member(root, "payload");
+        LOGI("%s", log_message);
+    } else {
+        LOGI("Message: %s", message);
     }
-
-    char **new_envp = (char **)malloc(sizeof(char *) * (count + 2));
-    if (!new_envp) return (char **)envp;
-
-    size_t idx = 0;
-    if (envp) {
-        for (size_t i = 0; i < count; i++) {
-            if (strncmp(envp[i], "LD_PRELOAD=", 11) == 0) {
-                size_t len = strlen(envp[i]) + strlen(puppy_so_path) + 2;
-                char *buf = (char *)malloc(len);
-                snprintf(buf, len, "%s:%s", envp[i], puppy_so_path);
-                new_envp[idx++] = buf;
-            } else {
-                new_envp[idx++] = strdup(envp[i]);
-            }
-        }
-    }
-
-    if (!has_ld_preload) {
-        size_t len = strlen(puppy_so_path) + 12;
-        char *buf = (char *)malloc(len);
-        snprintf(buf, len, "LD_PRELOAD=%s", puppy_so_path);
-        new_envp[idx++] = buf;
-    }
-
-    new_envp[idx] = NULL;
-    return new_envp;
+    g_object_unref(parser);
 }
 
-static void free_preloaded_envp(char **new_envp, char *const orig_envp[]) {
-    if (new_envp == (char **)orig_envp || !new_envp) return;
-    for (size_t i = 0; new_envp[i] != NULL; i++) {
-        free(new_envp[i]);
-    }
-    free(new_envp);
-}
-
-#ifdef SYSTEM_PROP_OVERRIDES_COUNT
-static const char* get_mocked_prop_value(const char *key) {
-    if (!key) return NULL;
-    for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
-        if (strcmp(key, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
-            return SYSTEM_PROP_OVERRIDES[i].value;
-        }
-    }
-    return NULL;
-}
-
-static int hook_system_property_get(const char *name, char *value) {
-    if (name != NULL && value != NULL) {
-        const char *mock_val = get_mocked_prop_value(name);
-        if (mock_val != NULL) {
-            strlcpy(value, mock_val, PROP_VALUE_MAX);
-            return (int)strlen(value);
-        }
-    }
-    return orig_system_property_get(name, value);
-}
-
-typedef struct {
-    PropReadCallback orig_callback;
-    void *orig_cookie;
-} PropReadContext;
-
-static void prop_read_wrapper(void *cookie, const char *name, const char *value, uint32_t serial) {
-    PropReadContext *ctx = (PropReadContext *)cookie;
-    if (ctx == NULL) return;
-
-    const char *final_value = value;
-    if (name != NULL) {
-        const char *mock_val = get_mocked_prop_value(name);
-        if (mock_val != NULL) {
-            final_value = mock_val;
-        }
-    }
-
-    ctx->orig_callback(ctx->orig_cookie, name, final_value, serial);
-}
-
-static void hook_system_property_read_callback(const prop_info *pi, PropReadCallback callback, void *cookie) {
-    uintptr_t pi_addr = (uintptr_t)pi;
-    uintptr_t start_addr = (uintptr_t)&SYSTEM_PROP_OVERRIDES[0];
-    uintptr_t end_addr = start_addr + sizeof(SYSTEM_PROP_OVERRIDES);
-
-    if (pi_addr >= start_addr && pi_addr < end_addr) {
-        const prop_override_t *entry = (const prop_override_t *)pi;
-        if (callback != NULL && entry->key != NULL && entry->value != NULL) {
-            callback(cookie, entry->key, entry->value, 0);
-        }
-        return;
-    }
-
-    if (pi != NULL && callback != NULL) {
-        PropReadContext ctx;
-        ctx.orig_callback = callback;
-        ctx.orig_cookie = cookie;
-        orig_system_property_read_callback(pi, prop_read_wrapper, &ctx);
-        return;
-    }
-    orig_system_property_read_callback(pi, callback, cookie);
-}
-
-static const prop_info *hook_system_property_find(const char *name) {
-    if (name != NULL && get_mocked_prop_value(name) != NULL) {
-        const prop_info *real_pi = orig_system_property_find(name);
-        if (real_pi != NULL) {
-            return real_pi;
-        }
-        for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
-            if (strcmp(name, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
-                return (const prop_info *)&SYSTEM_PROP_OVERRIDES[i];
-            }
-        }
-    }
-    return orig_system_property_find(name);
-}
-
-static int is_getprop_cmd(const char *path, char *const argv[], const char **out_prop_name) {
-    if (!path || !argv || !argv[0]) return 0;
-
-    const char *bin = strrchr(path, '/');
-    bin = bin ? bin + 1 : path;
-
-    if (strcmp(bin, "getprop") == 0 && argv[1] != NULL) {
-        char *key = argv[1];
-        char *delim = strpbrk(key, " \"'\t\r\n>|&;");
-        if (delim) *delim = '\0';
-        
-        *out_prop_name = key;
-        return 1;
-    }
-
-    // Shell invocation: sh -c "getprop <key>" or su -c "getprop <key>"
-    if ((strcmp(bin, "sh") == 0 || strcmp(bin, "su") == 0) && argv[1] && strcmp(argv[1], "-c") == 0 && argv[2]) {
-        if (strncmp(argv[2], "getprop ", 8) == 0) {
-            char *key = argv[2] + 8;
-            
-            while (*key == ' ' || *key == '"' || *key == '\'') key++;
-            
-            char *delim = strpbrk(key, " \"'\t\r\n>|&;");
-            if (delim) *delim = '\0';
-            
-            *out_prop_name = key;
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
-static int hook_posix_spawn(pid_t *pid, const char *path,
-                           const posix_spawn_file_actions_t *file_actions,
-                           const posix_spawnattr_t *attrp,
-                           char *const argv[], char *const envp[]) {
-    const char *prop_name = NULL;
-    if (is_getprop_cmd(path, argv, &prop_name)) {
-        const char *mock_val = get_mocked_prop_value(prop_name);
-        if (mock_val) {
-            char cmd_buf[512];
-            snprintf(cmd_buf, sizeof(cmd_buf), "echo '%s'", mock_val);
-            char *fake_argv[] = {"/system/bin/sh", "-c", cmd_buf, NULL};
-            return orig_posix_spawn(pid, "/system/bin/sh", file_actions, attrp, fake_argv, envp);
-        }
-    }
-
-    char **new_envp = build_preloaded_envp(envp);
-    int res = orig_posix_spawn(pid, path, file_actions, attrp, argv, new_envp);
-    free_preloaded_envp(new_envp, envp);
-    return res;
-}
-
-static int hook_posix_spawnp(pid_t *pid, const char *file,
-                            const posix_spawn_file_actions_t *file_actions,
-                            const posix_spawnattr_t *attrp,
-                            char *const argv[], char *const envp[]) {
-    const char *prop_name = NULL;
-    if (is_getprop_cmd(file, argv, &prop_name)) {
-        const char *mock_val = get_mocked_prop_value(prop_name);
-        if (mock_val) {
-            char cmd_buf[512];
-            snprintf(cmd_buf, sizeof(cmd_buf), "echo '%s'", mock_val);
-            char *fake_argv[] = {"sh", "-c", cmd_buf, NULL};
-            return orig_posix_spawnp(pid, "sh", file_actions, attrp, fake_argv, envp);
-        }
-    }
-
-    char **new_envp = build_preloaded_envp(envp);
-    int res = orig_posix_spawnp(pid, file, file_actions, attrp, argv, new_envp);
-    free_preloaded_envp(new_envp, envp);
-    return res;
-}
-
-static int hook_execve(const char *pathname, char *const argv[], char *const envp[]) {
-    const char *prop_name = NULL;
-    if (is_getprop_cmd(pathname, argv, &prop_name)) {
-        const char *mock_val = get_mocked_prop_value(prop_name);
-        if (mock_val) {
-            printf("%s\n", mock_val);
-            fflush(stdout);
-            _exit(0);
-        }
-    }
-
-    char **new_envp = build_preloaded_envp(envp);
-    int res = orig_execve(pathname, argv, new_envp);
-    free_preloaded_envp(new_envp, envp);
-    return res;
-}
-
-static int hook_execv(const char *pathname, char *const argv[]) {
-    const char *prop_name = NULL;
-    if (is_getprop_cmd(pathname, argv, &prop_name)) {
-        const char *mock_val = get_mocked_prop_value(prop_name);
-        if (mock_val) {
-            printf("%s\n", mock_val);
-            fflush(stdout);
-            _exit(0);
-        }
-    }
-
-    char **new_envp = build_preloaded_envp(NULL);
-    int res = orig_execve(pathname, argv, new_envp);
-    free_preloaded_envp(new_envp, NULL);
-    return res;
-}
-
-static int hook_execvp(const char *file, char *const argv[]) {
-    const char *prop_name = NULL;
-    if (is_getprop_cmd(file, argv, &prop_name)) {
-        const char *mock_val = get_mocked_prop_value(prop_name);
-        if (mock_val) {
-            printf("%s\n", mock_val);
-            fflush(stdout);
-            _exit(0);
-        }
-    }
-
-    char **new_envp = build_preloaded_envp(NULL);
-    int res = orig_execvpe(file, argv, new_envp);
-    free_preloaded_envp(new_envp, NULL);
-    return res;
-}
-
-static int hook_execvpe(const char *file, char *const argv[], char *const envp[]) {
-    const char *prop_name = NULL;
-    if (is_getprop_cmd(file, argv, &prop_name)) {
-        const char *mock_val = get_mocked_prop_value(prop_name);
-        if (mock_val) {
-            printf("%s\n", mock_val);
-            fflush(stdout);
-            _exit(0);
-        }
-    }
-
-    char **new_envp = build_preloaded_envp(envp);
-    int res = orig_execvpe(file, argv, new_envp);
-    free_preloaded_envp(new_envp, envp);
-    return res;
-}
-#endif
-
-#ifdef SPECS_WIDTH
-static int32_t hook_anativewindow_get_width(ANativeWindow *window) {
-    LOGI("Puppy intercepted ANativeWindow_getWidth! Spoofing width.");
-    return SPECS_WIDTH;
-}
-#endif
-
-#ifdef SPECS_HEIGHT
-static int32_t hook_anativewindow_get_height(ANativeWindow *window) {
-    LOGI("Puppy intercepted ANativeWindow_getHeight! Spoofing height.");
-    return SPECS_HEIGHT;
-}
-#endif
-
-static unsigned long long apply_jitter(unsigned long long base_val, double percentage) {
-    double fluctuation = ((double)rand() / RAND_MAX) * 2.0 - 1.0; 
-    double jittered = (double)base_val + ((double)base_val * percentage * fluctuation);
-    return (jittered < 0.0) ? 0ULL : (unsigned long long)(jittered + 0.5);
-}
-
-#if defined(SPECS_FREE_SPACE) && defined(SPECS_TOTAL_SPACE)
-static int hook_statfs(const char *path, struct statfs *buf) {
-    int ret = orig_statfs(path, buf);
-    if (ret == 0 && buf != NULL) {
-        long long jittered_free = apply_jitter(SPECS_FREE_SPACE, 0.0005);
-        buf->f_blocks = SPECS_TOTAL_SPACE / buf->f_bsize;
-        buf->f_bfree = jittered_free / buf->f_bsize;
-        buf->f_bavail = buf->f_bfree; 
-        LOGI("Puppy spoofed statfs for path: %s", path);
-    }
-    return ret;
-}
-static int hook_statfs64(const char *path, struct statfs64 *buf) {
-    int ret = orig_statfs64(path, buf);
-    if (ret == 0 && buf != NULL) {
-        long long jittered_free = apply_jitter(SPECS_FREE_SPACE, 0.0005);
-        buf->f_blocks = SPECS_TOTAL_SPACE / buf->f_bsize;
-        buf->f_bfree = jittered_free / buf->f_bsize;
-        buf->f_bavail = buf->f_bfree; 
-        LOGI("Puppy spoofed statfs64 for path: %s", path);
-    }
-    return ret;
-}
-static int hook_statvfs(const char *path, struct statvfs *buf) {
-    int ret = orig_statvfs(path, buf);
-    if (ret == 0 && buf != NULL) {
-        long long jittered_free = apply_jitter(SPECS_FREE_SPACE, 0.0005);
-        buf->f_blocks = SPECS_TOTAL_SPACE / buf->f_frsize;
-        buf->f_bfree = jittered_free / buf->f_frsize;
-        buf->f_bavail = buf->f_bfree;
-        LOGI("Puppy spoofed statvfs for path: %s", path);
-    }
-    return ret;
-}
-static int hook_statvfs64(const char *path, struct statvfs64 *buf) {
-    int ret = orig_statvfs64(path, buf);
-    if (ret == 0 && buf != NULL) {
-        long long jittered_free = apply_jitter(SPECS_FREE_SPACE, 0.0005);
-        buf->f_blocks = SPECS_TOTAL_SPACE / buf->f_frsize;
-        buf->f_bfree = jittered_free / buf->f_frsize;
-        buf->f_bavail = buf->f_bfree;
-        LOGI("Puppy spoofed statvfs64 for path: %s", path);
-    }
-    return ret;
-}
-#endif
-
-#if defined(SPECS_AVAIL_RAM) && defined(SPECS_TOTAL_RAM)
-static int hook_sysinfo(struct sysinfo *info) {
-    int ret = orig_sysinfo(info);
-    if (ret == 0 && info != NULL) {
-        long long jittered_avail_ram = apply_jitter(SPECS_AVAIL_RAM, 0.03);
-        info->totalram = SPECS_TOTAL_RAM / info->mem_unit;
-        info->freeram = jittered_avail_ram / info->mem_unit;
-        LOGI("Puppy spoofed sysinfo (RAM)");
-    }
-    return ret;
-}
-#endif
-
-#if defined(DEVICE_CPU_INFO) || (defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB))
-static int get_intercepted_fd(const char *pathname);
-
-static int hook_openat(int dirfd, const char *pathname, int flags, int mode) {
-    int fake_fd = get_intercepted_fd(pathname);
-    if (fake_fd >= 0) {
-        return fake_fd;
-    }
-    return orig_openat(dirfd, pathname, flags, mode);
-}
-
-static int create_memfd_with_data(const char *name, const char *data, size_t size) {
-    int fd = (int) syscall(__NR_memfd_create, name, MFD_CLOEXEC);
-    if (fd < 0) {
-        return -1;
-    }
-    if (ftruncate(fd, (off_t)size) < 0) {
-        close(fd);
-        return -1;
-    }
-    ssize_t written = write(fd, data, size);
-    if (written != (ssize_t)size) {
-        close(fd);
-        return -1;
-    }
-    lseek(fd, 0, SEEK_SET);
-    return fd;
-}
-
-
-
-static int get_intercepted_fd(const char *pathname) {
-    if (pathname == NULL) return -1;
-
-    #ifdef DEVICE_CPU_INFO
-    if (strcmp(pathname, "/proc/cpuinfo") == 0) {
-        LOGI("Puppy intercepted open for /proc/cpuinfo");
-        return create_memfd_with_data("cpuinfo_fake", DEVICE_CPU_INFO, strlen(DEVICE_CPU_INFO));
-    }
-    #endif
+static void *puppy_main_thread(void *arg) {
+    LOGI("PuppyJS waking up in the background...");
     
-    if (strcmp(pathname, "/sys/fs/selinux/enforce") == 0) {
-        LOGI("Puppy intercepted open for /sys/fs/selinux/enforce");
-        const char *val = "1\n";
-        return create_memfd_with_data("selinux_fake", val, strlen(val));
-    }
-    
-    #if defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB)
-    if (strcmp(pathname, "/proc/meminfo") == 0) {
-        LOGI("Puppy intercepted open for /proc/meminfo");
-        
-        unsigned long long _MEM_TOTAL_KB = SPECS_TOTAL_RAM / 1024;
-        unsigned long long _SWAP_TOTAL_KB = SPECS_SWAP_TOTAL_KB;
-        unsigned long long _VMALLOC_TOTAL = 262143999ULL;
-        
-        unsigned long long base_avail = SPECS_AVAIL_RAM / 1024;
-        unsigned long long _MEM_AVAIL_KB = apply_jitter(base_avail, 0.02);
-        unsigned long long _MEM_FREE_KB = apply_jitter((unsigned long long)(_MEM_AVAIL_KB * 0.35), 0.05);
-        unsigned long long _CACHED_KB = apply_jitter((unsigned long long)(_MEM_AVAIL_KB * 0.60), 0.03);
-        
-        unsigned long long _ACTIVE = apply_jitter(3256780, 0.04);
-        unsigned long long _INACTIVE = apply_jitter(2564120, 0.04);
-        unsigned long long _ANON_PAGES = apply_jitter(2846100, 0.02);
-        unsigned long long _MAPPED = apply_jitter(856000, 0.03);
-        unsigned long long _SLAB = apply_jitter(785600, 0.01);
-        unsigned long long _DIRTY = (unsigned long long)(rand() % 800);
-
-        char meminfo_buf[2048];
-        int len = snprintf(meminfo_buf, sizeof(meminfo_buf),
-            "MemTotal:        %llu kB\n"
-            "MemFree:         %llu kB\n"
-            "MemAvailable:    %llu kB\n"
-            "Buffers:           32768 kB\n"
-            "Cached:          %llu kB\n"
-            "SwapCached:        55020 kB\n"
-            "Active:          %llu kB\n"
-            "Inactive:        %llu kB\n"
-            "Active(anon):    %llu kB\n"
-            "Inactive(anon):  %llu kB\n"
-            "Active(file):    %llu kB\n"
-            "Inactive(file):  %llu kB\n"
-            "Unevictable:      186400 kB\n"
-            "Mlocked:          186400 kB\n"
-            "SwapTotal:       %llu kB\n"
-            "SwapFree:        %llu kB\n"
-            "Zswap:           %llu kB\n"
-            "Zswapped:        %llu kB\n"
-            "Dirty:               %llu kB\n"
-            "Writeback:             0 kB\n"
-            "AnonPages:       %llu kB\n"
-            "Mapped:          %llu kB\n"
-            "Shmem:             52500 kB\n"
-            "KReclaimable:     754200 kB\n"
-            "Slab:             %llu kB\n"
-            "SReclaimable:     %llu kB\n"
-            "SUnreclaim:       %llu kB\n"
-            "KernelStack:       %llu kB\n"
-            "PageTables:       %llu kB\n"
-            "SecPageTables:         0 kB\n"
-            "NFS_Unstable:          0 kB\n"
-            "Bounce:                0 kB\n"
-            "WritebackTmp:          0 kB\n"
-            "CommitLimit:    16260632 kB\n"
-            "Committed_AS:   95421000 kB\n"
-            "VmallocTotal:   %llu kB\n"
-            "VmallocUsed:      %llu kB\n"
-            "VmallocChunk:          0 kB\n"
-            "Percpu:            17200 kB\n"
-            "HardwareCorrupted:     0 kB\n"
-            "AnonHugePages:    640672 kB\n"
-            "ShmemHugePages:        0 kB\n"
-            "ShmemPmdMapped:        0 kB\n"
-            "FileHugePages:         0 kB\n"
-            "FilePmdMapped:         0 kB\n"
-            "CmaTotal:         512000 kB\n"
-            "CmaFree:               0 kB\n",
-            _MEM_TOTAL_KB, _MEM_FREE_KB, _MEM_AVAIL_KB, _CACHED_KB,
-            _ACTIVE, _INACTIVE,
-            apply_jitter(2890100, 0.04), apply_jitter(745600, 0.04),
-            apply_jitter(1166680, 0.04), apply_jitter(2718520, 0.04),
-            _SWAP_TOTAL_KB, apply_jitter(6085412, 0.05),
-            apply_jitter(1450000, 0.02), apply_jitter(1254300, 0.02),
-            _DIRTY, _ANON_PAGES, _MAPPED, _SLAB,
-            apply_jitter(554200, 0.01), apply_jitter(331400, 0.01),
-            apply_jitter(75400, 0.05), apply_jitter(285200, 0.02),
-            _VMALLOC_TOTAL, apply_jitter(385400, 0.01)
-        );
-        
-        return create_memfd_with_data("meminfo_fake", meminfo_buf, len);
-    }
-    #endif
-
-    return -1;
-}
-#endif
-
-static void* puppy_main_thread(void* arg) {
-    LOGI("Puppy waking up in the background... sniffing out environment.");
+    // Initialize GumJS embedded environment
     gum_init_embedded();
 
-    GumInterceptor *interceptor = gum_interceptor_obtain();
-    if (interceptor == NULL) {
-        LOGE("Puppy lost the scent: failed to obtain GumInterceptor.");
-        return NULL;
-    }
+    GumScriptBackend *backend = gum_script_backend_obtain_duk();
+    GCancellable *cancellable = NULL;
+    GError *error = NULL;
 
-    gum_interceptor_begin_transaction(interceptor);
+    // Dynamically build the JavaScript payload using values from config.h
+    GString *js = g_string_new("");
 
-    // 1. System Property Hooks
-    #ifdef SYSTEM_PROP_OVERRIDES_COUNT
-    gpointer target_prop_get        = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_get"));
-    gpointer target_prop_read_cb    = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_read_callback"));
-    gpointer target_prop_find       = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "__system_property_find"));
-    if (target_prop_get)        gum_interceptor_replace(interceptor, target_prop_get, GSIZE_TO_POINTER(hook_system_property_get), (gpointer *)&orig_system_property_get, NULL);
-    if (target_prop_read_cb)    gum_interceptor_replace(interceptor, target_prop_read_cb, GSIZE_TO_POINTER(hook_system_property_read_callback), (gpointer *)&orig_system_property_read_callback, NULL);
-    if (target_prop_find)       gum_interceptor_replace(interceptor, target_prop_find, GSIZE_TO_POINTER(hook_system_property_find), (gpointer *)&orig_system_property_find, NULL);
-
-    gpointer t_posix_spawn  = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "posix_spawn"));
-    gpointer t_posix_spawnp = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "posix_spawnp"));
-    gpointer t_execve       = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "execve"));
-    gpointer t_execv        = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "execv"));
-    gpointer t_execvp       = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "execvp"));
-    gpointer t_execvpe      = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "execvpe"));
-    if (t_posix_spawn)  gum_interceptor_replace(interceptor, t_posix_spawn,  GSIZE_TO_POINTER(hook_posix_spawn),  (gpointer *)&orig_posix_spawn,  NULL);
-    if (t_posix_spawnp) gum_interceptor_replace(interceptor, t_posix_spawnp, GSIZE_TO_POINTER(hook_posix_spawnp), (gpointer *)&orig_posix_spawnp, NULL);
-    if (t_execve)       gum_interceptor_replace(interceptor, t_execve,       GSIZE_TO_POINTER(hook_execve),       (gpointer *)&orig_execve,       NULL);
-    if (t_execv)        gum_interceptor_replace(interceptor, t_execv,        GSIZE_TO_POINTER(hook_execv),        NULL,        NULL);
-    if (t_execvp)       gum_interceptor_replace(interceptor, t_execvp,       GSIZE_TO_POINTER(hook_execvp),       NULL,       NULL);
-    if (t_execvpe)      gum_interceptor_replace(interceptor, t_execvpe,      GSIZE_TO_POINTER(hook_execvpe),      (gpointer *)&orig_execvpe,      NULL);
-    #endif
-
-    #if defined(SPECS_WIDTH) || defined(SPECS_HEIGHT)
-    void *libnativewindow = dlopen("libnativewindow.so", RTLD_LAZY);
-
+    // 1. Inject Config Macros
     #ifdef SPECS_WIDTH
-    gpointer target_width = libnativewindow ? dlsym(libnativewindow, "ANativeWindow_getWidth") : NULL;
-    if (target_width) gum_interceptor_replace(interceptor, target_width, GSIZE_TO_POINTER(hook_anativewindow_get_width), (gpointer *)&orig_anativewindow_get_width, NULL);
+    g_string_append_printf(js, "const SPECS_WIDTH = %d;\n", SPECS_WIDTH);
     #endif
 
     #ifdef SPECS_HEIGHT
-    gpointer target_height = libnativewindow ? dlsym(libnativewindow, "ANativeWindow_getHeight") : NULL;
-    if (target_height) gum_interceptor_replace(interceptor, target_height, GSIZE_TO_POINTER(hook_anativewindow_get_height), (gpointer *)&orig_anativewindow_get_height, NULL);
-    #endif
+        g_string_append_printf(js, "const SPECS_HEIGHT = %d;\n", SPECS_HEIGHT);
     #endif
 
-    #if defined(SPECS_FREE_SPACE) && defined(SPECS_TOTAL_SPACE)
-    gpointer target_statfs      = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statfs"));
-    gpointer target_statfs64    = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statfs64"));
-    gpointer target_statvfs     = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statvfs"));
-    gpointer target_statvfs64   = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "statvfs64"));
-    if (target_statfs)      gum_interceptor_replace(interceptor, target_statfs, GSIZE_TO_POINTER(hook_statfs), (gpointer *)&orig_statfs, NULL);
-    if (target_statfs64)    gum_interceptor_replace(interceptor, target_statfs64, GSIZE_TO_POINTER(hook_statfs64), (gpointer *)&orig_statfs64, NULL);
-    if (target_statvfs)     gum_interceptor_replace(interceptor, target_statvfs, GSIZE_TO_POINTER(hook_statvfs), (gpointer *)&orig_statvfs, NULL);
-    if (target_statvfs64)   gum_interceptor_replace(interceptor, target_statvfs64, GSIZE_TO_POINTER(hook_statvfs64), (gpointer *)&orig_statvfs64, NULL);
+    #ifdef SPECS_TOTAL_SPACE
+        g_string_append_printf(js, "const SPECS_TOTAL_SPACE = %llu;\n", SPECS_TOTAL_SPACE);
     #endif
 
-    #if defined(SPECS_AVAIL_RAM) && defined(SPECS_TOTAL_RAM)
-    gpointer target_sysinfo = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "sysinfo"));
-    if (target_sysinfo) gum_interceptor_replace(interceptor, target_sysinfo, GSIZE_TO_POINTER(hook_sysinfo), (gpointer *)&orig_sysinfo, NULL);
+    #ifdef SPECS_FREE_SPACE
+        g_string_append_printf(js, "const SPECS_FREE_SPACE = %llu;\n", SPECS_FREE_SPACE);
     #endif
 
+    #ifdef SPECS_TOTAL_RAM
+        g_string_append_printf(js, "const SPECS_TOTAL_RAM = %llu;\n", SPECS_TOTAL_RAM);
+    #endif
+
+    #ifdef SPECS_AVAIL_RAM
+        g_string_append_printf(js, "const SPECS_AVAIL_RAM = %llu;\n", SPECS_AVAIL_RAM);
+    #endif
+
+    #ifdef SPECS_SWAP_TOTAL_KB
+        g_string_append_printf(js, "const SPECS_SWAP_TOTAL_KB = %d;\n", SPECS_SWAP_TOTAL_KB);
+    #endif
+
+    #ifdef DEVICE_CPU_INFO
+        g_string_append(js, "const DEVICE_CPU_INFO = `");
+        g_string_append(js, DEVICE_CPU_INFO);
+        g_string_append(js, "`;\n");
+    #endif
+
+    // 2. Inject System Properties Dictionary
+    g_string_append(js, "const mockProps = {\n");
+    for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
+        g_string_append_printf(js, "  '%s': '%s',\n", SYSTEM_PROP_OVERRIDES[i].key, SYSTEM_PROP_OVERRIDES[i].value);
+    }
+    g_string_append(js, "};\n");
+
+    // 3. Inject Frida Hooking Logic
+    g_string_append(js,
+        "function applyJitter(base, pct) {\n"
+        "  const fluctuation = (Math.random() * 2.0) - 1.0;\n"
+        "  const jittered = base + (base * pct * fluctuation);\n"
+        "  return Math.max(0, Math.round(jittered));\n"
+        "}\n\n"
+
+        "// --- System Properties ---\n"
+        "const sysPropGet = Module.findExportByName(null, '__system_property_get');\n"
+        "if (sysPropGet) {\n"
+        "  Interceptor.attach(sysPropGet, {\n"
+        "    onEnter: function(args) {\n"
+        "      this.name = args[0].readUtf8String();\n"
+        "      this.valPtr = args[1];\n"
+        "    },\n"
+        "    onLeave: function(retval) {\n"
+        "      if (mockProps[this.name] !== undefined) {\n"
+        "        this.valPtr.writeUtf8String(mockProps[this.name]);\n"
+        "        retval.replace(mockProps[this.name].length);\n"
+        "      }\n"
+        "    }\n"
+        "  });\n"
+        "}\n\n"
+    );
+
+    #if defined(SPECS_WIDTH) || defined(SPECS_HEIGHT)
+    g_string_append(js, "// --- Native Window ---\n");
+    #ifdef SPECS_WIDTH
+    g_string_append(js,
+        "const getWidth = Module.findExportByName('libnativewindow.so', 'ANativeWindow_getWidth');\n"
+        "if (getWidth) {\n"
+        "  Interceptor.replace(getWidth, new NativeCallback(() => SPECS_WIDTH, 'int32', ['pointer']));\n"
+        "}\n"
+    );
+    #endif
+    #ifdef SPECS_HEIGHT
+    g_string_append(js,
+        "const getHeight = Module.findExportByName('libnativewindow.so', 'ANativeWindow_getHeight');\n"
+        "if (getHeight) {\n"
+        "  Interceptor.replace(getHeight, new NativeCallback(() => SPECS_HEIGHT, 'int32', ['pointer']));\n"
+        "}\n"
+    );
+    #endif
+    #endif
+    
     #if defined(DEVICE_CPU_INFO) || (defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB))
-    gpointer target_openat = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "openat"));
-    if (target_openat) gum_interceptor_replace(interceptor, target_openat, GSIZE_TO_POINTER(hook_openat), (gpointer *)&orig_openat, NULL);
+    g_string_append(js, 
+        "// --- Memory & Storage Faking (Syscall wrapper for memfd) ---\n"
+        "const syscall = new NativeFunction(Module.findExportByName(null, 'syscall'), 'int', ['int', 'pointer', 'int']);\n"
+        "const write = new NativeFunction(Module.findExportByName(null, 'write'), 'ssize_t', ['int', 'pointer', 'size_t']);\n"
+        "const lseek = new NativeFunction(Module.findExportByName(null, 'lseek'), 'off_t', ['int', 'off_t', 'int']);\n"
+        "const NR_memfd_create = Process.arch === 'arm64' ? 279 : (Process.arch === 'arm' ? 385 : 319);\n\n"
+
+        "function createMemfd(name, content) {\n"
+        "  const namePtr = Memory.allocUtf8String(name);\n"
+        "  const fd = syscall(NR_memfd_create, namePtr, 1);\n"
+        "  if (fd >= 0) {\n"
+        "    const contentPtr = Memory.allocUtf8String(content);\n"
+        "    write(fd, contentPtr, content.length);\n"
+        "    lseek(fd, 0, 0);\n"
+        "  }\n"
+        "  return fd;\n"
+        "}\n\n"
+
+        "const openat = Module.findExportByName(null, 'openat');\n"
+        "if (openat) {\n"
+        "  Interceptor.attach(openat, {\n"
+        "    onEnter: function(args) {\n"
+        "      this.path = args[1].readUtf8String();\n"
+        "      this.isTarget = false;\n"
+    );
+    #ifdef DEVICE_CPU_INFO
+    g_string_append(js,
+        "      if (this.path === '/proc/cpuinfo') {\n"
+        "        this.isTarget = true;\n"
+        "        this.fakeContent = DEVICE_CPU_INFO;\n"
+        "        this.fakeName = 'cpuinfo_fake';\n"
+        "      } else "
+    );
+    #endif
+    #if defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB)
+    g_string_append(js,
+        "      if (this.path === '/proc/meminfo') {\n"
+        "        this.isTarget = true;\n"
+        "        this.fakeName = 'meminfo_fake';\n"
+        "        let avail = applyJitter(SPECS_AVAIL_RAM / 1024, 0.02);\n"
+        "        let free = applyJitter(avail * 0.35, 0.05);\n"
+        "        this.fakeContent = `MemTotal:        ${Math.floor(SPECS_TOTAL_RAM / 1024)} kB\\nMemFree:         ${free} kB\\nMemAvailable:    ${avail} kB\\nSwapTotal:       ${SPECS_SWAP_TOTAL_KB} kB\\n`;\n"
+        "      } else "
+    );
+    #endif
+    // Catch-all selinux bypass and close the hook logic safely
+    g_string_append(js,
+        "      if (this.path === '/sys/fs/selinux/enforce') {\n"
+        "        this.isTarget = true;\n"
+        "        this.fakeContent = '1\\n';\n"
+        "        this.fakeName = 'selinux_fake';\n"
+        "      }\n"
+        "    },\n"
+        "    onLeave: function(retval) {\n"
+        "      if (this.isTarget) {\n"
+        "        const fakeFd = createMemfd(this.fakeName, this.fakeContent);\n"
+        "        if (fakeFd >= 0) retval.replace(fakeFd);\n"
+        "        console.log('PuppyJS intercepted openat for: ' + this.path);\n"
+        "      }\n"
+        "    }\n"
+        "  });\n"
+        "}\n"
+    );
     #endif
 
-    gum_interceptor_end_transaction(interceptor);
+    // Compile and run script
+    puppy_script = gum_script_backend_create_sync(backend, "puppy", js->str, cancellable, &error);
+    g_string_free(js, TRUE);
 
-    LOGI("Woof! System property hooks successfully buried and active.");
+    if (error != NULL) {
+        LOGE("PuppyJS lost the scent: %s", error->message);
+        g_error_free(error);
+        return NULL;
+    }
+
+    gum_script_set_message_handler(puppy_script, on_message, NULL, NULL);
+    gum_script_load_sync(puppy_script, cancellable);
+
+    LOGI("Woof! System property hooks successfully buried and active via GumJS.");
+
+    // Keep the thread alive to process GumJS background events
+    GMainContext *context = g_main_context_get_thread_default();
+    while (TRUE) {
+        if (g_main_context_pending(context)) {
+            g_main_context_iteration(context, TRUE);
+        } else {
+            usleep(100000); // 100ms sleep
+        }
+    }
+
     return NULL;
 }
 
 __attribute__((constructor)) void puppy_init(void) {
-    LOGI("Puppy barking at process entry (PID: %d)...", getpid());
-
-    Dl_info info;
-    if (dladdr((void *)&puppy_init, &info) != 0 && info.dli_fname != NULL) {
-        snprintf(puppy_so_path, sizeof(puppy_so_path), "%s", info.dli_fname);
-        LOGI("Puppy loaded from path: %s", puppy_so_path);
-    } else {
-        LOGE("Puppy failed to resolve shared object path!");
-    }
+    LOGI("PuppyJS barking at process entry (PID: %d)...", getpid());
 
     pthread_t thread;
     if (pthread_create(&thread, NULL, puppy_main_thread, NULL) != 0) {
-        LOGE("Puppy failed to leave the kennel!");
+        LOGE("PuppyJS failed to leave the kennel!");
     } else {
         pthread_detach(thread);
-        LOGI("Puppy slipped off the leash into the background.");
+        LOGI("PuppyJS slipped off the leash into the background.");
     }
 }
