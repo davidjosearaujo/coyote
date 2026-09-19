@@ -221,7 +221,9 @@ class Coyote:
             f"-I{AGENT_SRC}",
             f"-I{BUILD_DIR}",
             f"-I{AGENT_SRC / 'devkit'}",
-            str(AGENT_SRC / "puppy_gumjs.c"),
+            str(AGENT_SRC / "coyote.c"),
+            str(AGENT_SRC / "puppyc.c"),
+            str(AGENT_SRC / "puppyjs.c"),
             str(AGENT_SRC / "devkit" / "libfrida-gumjs.a"),
             "-o",
             str(output_so),
@@ -229,8 +231,9 @@ class Coyote:
             "-ldl",
             "-lm",
             "-llog",
-            "-lresolv",
             "-pthread",
+            "-lc++_static",
+            "-lc++abi",
         ]
 
         self._exec(compile_cmd, desc=f"NDK Shared Library Compilation ({target_info['devkit']})")
@@ -368,6 +371,7 @@ def ensure_devkit(requested_arch: str | None = None):
     else:
         print("[!] Non-interactive shell detected. Run with --update-devkit <arch> to initialize.")
         sys.exit(1)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
