@@ -21,12 +21,25 @@ ABI_MAP = {
     "x86": {"compiler": "i686-linux-android", "devkit": "x86"},
 }
 
+def detect_device_abi() -> dict:
+    """Queries target device via ADB to dynamically resolve CPU ABI and compiler triple."""
+    try:
+        cmd = ["adb", "shell", "getprop", "ro.product.cpu.abi"]
+        raw_abi = subprocess.check_output(cmd).decode().strip()
+        if raw_abi in ABI_MAP:
+            return ABI_MAP[raw_abi]
+        print(f"[!] Unknown ABI '{raw_abi}'. Defaulting to arm64-v8a.")
+    except Exception as e:
+        print(f"[!] ADB query failed ({e}). Defaulting compiler to arm64-v8a.")
+    
+    return ABI_MAP["arm64-v8a"]
+
 class Coyote:
 
     def __init__(
         self,
-        profile_path: str,
-        ndk_path: str,
+        profile_path: str | None = None,
+        ndk_path: str | None = None,
         api_level: int = 30,
         dry_run: bool = False,
         package_name: str = "test.target.app",
@@ -35,9 +48,10 @@ class Coyote:
         self.api_level = api_level
         self.package_name = package_name
         self.ndk_path = Path(ndk_path) if ndk_path else None
-        self.profile = self._load_profile(profile_path)
+        
+        self.profile = self._load_profile(profile_path) if profile_path else {}
 
-        if not dry_run:
+        if not dry_run and profile_path:
             BUILD_DIR.mkdir(exist_ok=True)
 
     def _load_profile(self, path: str) -> dict:
@@ -164,19 +178,6 @@ class Coyote:
                 f.write(content)
             print(f"  [+] Successfully generated {output_file} with {macro_count} dynamic macros.")
 
-    def _detect_device_abi(self) -> dict:
-        """Queries target device via ADB to dynamically resolve CPU ABI and compiler triple."""
-        try:
-            cmd = ["adb", "shell", "getprop", "ro.product.cpu.abi"]
-            raw_abi = subprocess.check_output(cmd).decode().strip()
-            if raw_abi in ABI_MAP:
-                return ABI_MAP[raw_abi]
-            print(f"[!] Unknown ABI '{raw_abi}'. Defaulting to arm64-v8a.")
-        except Exception as e:
-            print(f"[!] ADB query failed ({e}). Defaulting compiler to arm64-v8a.")
-        
-        return ABI_MAP["arm64-v8a"]
-
     def _get_llvm_prebuilt_path(self) -> Path:
         """Dynamically resolves the NDK LLVM prebuilt directory matching the host OS."""
         prebuilt_dir = self.ndk_path / "toolchains" / "llvm" / "prebuilt"
@@ -199,7 +200,7 @@ class Coyote:
             )
             sys.exit(1)
 
-        target_info = self._detect_device_abi()
+        target_info = detect_device_abi()
         compiler_prefix = target_info["compiler"]
         bin_dir = self._get_llvm_prebuilt_path()
         compiler = bin_dir / f"{compiler_prefix}{self.api_level}-clang"
@@ -237,9 +238,11 @@ class Coyote:
         print(f"[+] Puppy target: {output_so}")
         return output_so
 
-
     def launch_target_app(self, so_path: Path):
-        """Pushes libpuppy.so into target app private data directory and launches package via wrap property."""
+        """Pushes libpuppy.so and libc++_shared.so into target app private data directory and launches package via wrap property."""
+
+        target_info = detect_device_abi()
+        print(f"[+] Found NDK runtime: {libcxx_path}")
 
         temp_so = "/data/local/tmp/libpuppy.so"
         app_dir = f"/data/data/{self.package_name}"
@@ -279,8 +282,13 @@ class Coyote:
         
         print(f"[+] wrap.{self.package_name} removed and process terminated.")
 
-def update_frida_devkit(arch: str = "arm64"):
-    """Fetches and extracts the latest Frida-Gum DevKit from GitHub Releases."""
+def update_frida_devkit(arch: str | None = None):
+    """Fetches and extracts the latest Frida-Gum DevKit for specified architecture (auto-detects via ADB if omitted)."""
+
+    if not arch or arch == "auto":
+        device_info = detect_device_abi()
+        arch = device_info["devkit"]
+        print(f"[+] Auto-detected devkit architecture via ADB: {arch}")
 
     platform_target = f"android-{arch}" if not arch.startswith("android-") else arch
     print(f"[+] Checking latest Frida release for platform: {platform_target}...")
@@ -337,6 +345,16 @@ def ensure_devkit(requested_arch: str | None = None):
 
     print("\n[!] Frida-Gum DevKit missing from agent_src/devkit/")
 
+    print("[+] Attempting to auto-detect target device ABI via ADB...")
+    try:
+        device_info = detect_device_abi()
+        chosen_arch = device_info["devkit"]
+        print(f"[+] Auto-detected architecture from device: {chosen_arch}")
+        update_frida_devkit(chosen_arch)
+        return
+    except Exception as e:
+        print(f"[!] Could not auto-detect via ADB ({e}).")
+
     if sys.stdin.isatty():
         valid_archs = ["arm", "arm64", "x86", "x86_64"]
         print("    First-time setup detected. DevKit binaries must be downloaded.")
@@ -358,7 +376,6 @@ def parse_args():
     parser.add_argument(
         "-p",
         "--profile",
-        required=True,
         help="Path to JSON profile configuration file.",
     )
     parser.add_argument(
@@ -369,7 +386,6 @@ def parse_args():
     parser.add_argument(
         "-t",
         "--target",
-        required=True,
         help="Target app package name",
     )
     parser.add_argument(
@@ -400,10 +416,10 @@ def parse_args():
     )
     parser.add_argument(
         "--update-devkit",
-        choices=["arm", "arm64", "x86", "x86_64"],
+        choices=["auto", "arm", "arm64", "x86", "x86_64"],
         nargs="?",
-        const="arm64",
-        help="Fetch latest Frida-Gum DevKit for specified architecture (default: arm64).",
+        const="auto",
+        help="Fetch latest Frida-Gum DevKit for specified architecture (auto-detects via ADB if omitted).",
     )
 
     return parser.parse_args()
@@ -418,7 +434,9 @@ def main():
     if args.dry_run:
         print("[!] DRY-RUN MODE ACTIVE: No changes will be executed.")
 
-    ensure_devkit(args.update_devkit)
+    if args.update_devkit is not None:
+        ensure_devkit(args.update_devkit)
+        return
 
     orchestrator = Coyote(
         profile_path=args.profile,
@@ -428,18 +446,20 @@ def main():
         package_name=args.target,
     )
 
-    if not args.skip_adb:
-        orchestrator.configure_adb_properties()
-
     if args.reset_target:
         orchestrator.reset_target_app()
+        if not args.profile:
+            return
 
-    orchestrator.generate_c_header()
-    agent_so = orchestrator.compile_agent()
+    if not args.skip_adb and args.profile:
+        orchestrator.configure_adb_properties()
 
-    if not args.skip_deploy:
-        orchestrator.launch_target_app(agent_so)
+    if args.profile:
+        orchestrator.generate_c_header()
+        agent_so = orchestrator.compile_agent()
 
+        if not args.skip_deploy:
+            orchestrator.launch_target_app(agent_so)
 
 if __name__ == "__main__":
     main()
