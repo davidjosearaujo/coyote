@@ -10,7 +10,7 @@ Run the following commands from inside this `test/` directory:
 
 ```bash
 # Build debug APK
-./gradlew assembleDebug
+gradle assembleDebug
 
 # Install on target emulator
 adb install build/outputs/apk/debug/borderpatrol-debug.apk
