@@ -455,6 +455,7 @@ def main():
 
     if args.profile:
         orchestrator.generate_c_header()
+        ensure_devkit()
         agent_so = orchestrator.compile_agent()
 
         if not args.skip_deploy:
