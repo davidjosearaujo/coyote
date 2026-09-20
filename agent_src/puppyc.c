@@ -59,14 +59,20 @@ typedef int (*PosixSpawnFunc)(pid_t *pid, const char *path,
                              const posix_spawn_file_actions_t *file_actions,
                              const posix_spawnattr_t *attrp,
                              char *const argv[], char *const envp[]);
-typedef int (*PosixSpawnpFunc)(pid_t *pid, const char *file,
+typedef int (*PosixSpawnpFunc)(pid_t *pid, const char *path,
                               const posix_spawn_file_actions_t *file_actions,
                               const posix_spawnattr_t *attrp,
                               char *const argv[], char *const envp[]);
-typedef int (*ExecveFunc)(const char *pathname, char *const argv[], char *const envp[]);
-typedef int (*ExecvpeFunc)(const char *file, char *const argv[], char *const envp[]);
+typedef int (*ExecveFunc)(const char *path, char *const argv[], char *const envp[]);
+typedef int (*ExecvpeFunc)(const char *path, char *const argv[], char *const envp[]);
 
-typedef int (*OpenatFunc)(int dirfd, const char *pathname, int flags, int mode);
+typedef int (*OpenatFunc)(int dirfd, const char *path, int flags, int mode);
+
+typedef const char *(*GlGetStringFunc)(unsigned int name);
+
+typedef void (*PFN_vkVoidFunction)(void);
+typedef PFN_vkVoidFunction (*VkGetInstanceProcAddrFunc)(void* instance, const char* pName);
+typedef void (*VkGetPhysicalDevicePropertiesFunc)(void* physicalDevice, void* pProperties);
 
 static SystemPropertyGetFunc orig_system_property_get = NULL;
 static SystemPropertyReadCallbackFunc orig_system_property_read_callback = NULL;
@@ -79,7 +85,6 @@ static StatfsFunc orig_statfs = NULL;
 static Statfs64Func orig_statfs64 = NULL;
 static StatvfsFunc orig_statvfs = NULL;
 static Statvfs64Func orig_statvfs64 = NULL;
-static SysinfoFunc orig_sysinfo = NULL;
 
 static PosixSpawnFunc orig_posix_spawn = NULL;
 static PosixSpawnpFunc orig_posix_spawnp = NULL;
@@ -87,6 +92,14 @@ static ExecveFunc orig_execve = NULL;
 static ExecvpeFunc orig_execvpe = NULL;
 
 static OpenatFunc orig_openat = NULL;
+
+static GlGetStringFunc orig_glGetString = NULL;
+#define GL_VENDOR   0x1F00
+#define GL_RENDERER 0x1F01
+#define GL_VERSION  0x1F02
+
+static VkGetInstanceProcAddrFunc orig_vkGetInstanceProcAddr = NULL;
+static VkGetPhysicalDevicePropertiesFunc real_vkGetPhysicalDeviceProperties = NULL;
 
 static char puppy_so_path[PATH_MAX] = {0};
 
@@ -221,6 +234,26 @@ static const prop_info *hook_system_property_find(const char *name) {
     return orig_system_property_find(name);
 }
 
+static int is_root_check_cmd(const char *path, char *const argv[]) {
+    const char *bad_commands[] = {"su", "magisk", "frida", "xposed", "root", "busybox", NULL};
+    
+    if (path) {
+        for (int i = 0; bad_commands[i] != NULL; i++) {
+            if (strstr(path, bad_commands[i]) != NULL) return 1;
+        }
+    }
+    
+    if (argv) {
+        for (int i = 0; argv[i] != NULL; i++) {
+            for (int j = 0; bad_commands[j] != NULL; j++) {
+                if (strstr(argv[i], bad_commands[j]) != NULL) return 1;
+            }
+        }
+    }
+    
+    return 0;
+}
+
 static int is_getprop_cmd(const char *path, char *const argv[], const char **out_prop_name) {
     if (!path || !argv || !argv[0]) return 0;
 
@@ -258,6 +291,11 @@ static int hook_posix_spawn(pid_t *pid, const char *path,
                            const posix_spawn_file_actions_t *file_actions,
                            const posix_spawnattr_t *attrp,
                            char *const argv[], char *const envp[]) {
+    if (is_root_check_cmd(path, argv)) {
+        LOGI("PuppyC blocked root check (posix_spawn): %s", path);
+        char *fake_argv[] = {"/system/bin/echo", NULL};
+        return orig_posix_spawn(pid, "/system/bin/echo", file_actions, attrp, fake_argv, envp);
+    }
     const char *prop_name = NULL;
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
@@ -275,12 +313,17 @@ static int hook_posix_spawn(pid_t *pid, const char *path,
     return res;
 }
 
-static int hook_posix_spawnp(pid_t *pid, const char *file,
+static int hook_posix_spawnp(pid_t *pid, const char *path,
                             const posix_spawn_file_actions_t *file_actions,
                             const posix_spawnattr_t *attrp,
                             char *const argv[], char *const envp[]) {
+    if (is_root_check_cmd(path, argv)) {
+        LOGI("PuppyC blocked root check (posix_spawn): %s", path);
+        char *fake_argv[] = {"echo", NULL};
+        return orig_posix_spawnp(pid, "echo", file_actions, attrp, fake_argv, envp);
+    }
     const char *prop_name = NULL;
-    if (is_getprop_cmd(file, argv, &prop_name)) {
+    if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
             char cmd_buf[512];
@@ -291,14 +334,19 @@ static int hook_posix_spawnp(pid_t *pid, const char *file,
     }
 
     char **new_envp = build_preloaded_envp(envp);
-    int res = orig_posix_spawnp(pid, file, file_actions, attrp, argv, new_envp);
+    int res = orig_posix_spawnp(pid, path, file_actions, attrp, argv, new_envp);
     free_preloaded_envp(new_envp, envp);
     return res;
 }
 
-static int hook_execve(const char *pathname, char *const argv[], char *const envp[]) {
+static int hook_execve(const char *path, char *const argv[], char *const envp[]) {
+    if (is_root_check_cmd(path, argv)) {
+        LOGI("PuppyC blocked root check (execve): %s", path);
+        char *fake_argv[] = {"/system/bin/echo", NULL};
+        return orig_execve("/system/bin/echo", fake_argv, envp);
+    }
     const char *prop_name = NULL;
-    if (is_getprop_cmd(pathname, argv, &prop_name)) {
+    if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
             printf("%s\n", mock_val);
@@ -308,14 +356,23 @@ static int hook_execve(const char *pathname, char *const argv[], char *const env
     }
 
     char **new_envp = build_preloaded_envp(envp);
-    int res = orig_execve(pathname, argv, new_envp);
+    int res = orig_execve(path, argv, new_envp);
     free_preloaded_envp(new_envp, envp);
     return res;
 }
 
-static int hook_execv(const char *pathname, char *const argv[]) {
+static int hook_execv(const char *path, char *const argv[]) {
+    if (is_root_check_cmd(path, argv)) {
+        LOGI("PuppyC blocked root check (execv): %s", path);
+        char *fake_argv[] = {"/system/bin/echo", NULL};
+        char **new_envp = build_preloaded_envp(NULL);
+        // Upgraded to execve to support passing the modified envp
+        int res = orig_execve("/system/bin/echo", fake_argv, new_envp);
+        free_preloaded_envp(new_envp, NULL);
+        return res;
+    }
     const char *prop_name = NULL;
-    if (is_getprop_cmd(pathname, argv, &prop_name)) {
+    if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
             printf("%s\n", mock_val);
@@ -325,14 +382,23 @@ static int hook_execv(const char *pathname, char *const argv[]) {
     }
 
     char **new_envp = build_preloaded_envp(NULL);
-    int res = orig_execve(pathname, argv, new_envp);
+    int res = orig_execve(path, argv, new_envp);
     free_preloaded_envp(new_envp, NULL);
     return res;
 }
 
-static int hook_execvp(const char *file, char *const argv[]) {
+static int hook_execvp(const char *path, char *const argv[]) {
+    if (is_root_check_cmd(path, argv)) {
+        LOGI("PuppyC blocked root check (execvp): %s", path);
+        char *fake_argv[] = {"echo", NULL};
+        char **new_envp = build_preloaded_envp(NULL);
+        // Upgraded to execvpe to support passing the modified envp
+        int res = orig_execvpe("echo", fake_argv, new_envp);
+        free_preloaded_envp(new_envp, NULL);
+        return res;
+    }
     const char *prop_name = NULL;
-    if (is_getprop_cmd(file, argv, &prop_name)) {
+    if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
             printf("%s\n", mock_val);
@@ -342,14 +408,22 @@ static int hook_execvp(const char *file, char *const argv[]) {
     }
 
     char **new_envp = build_preloaded_envp(NULL);
-    int res = orig_execvpe(file, argv, new_envp);
+    int res = orig_execvpe(path, argv, new_envp);
     free_preloaded_envp(new_envp, NULL);
     return res;
 }
 
-static int hook_execvpe(const char *file, char *const argv[], char *const envp[]) {
+static int hook_execvpe(const char *path, char *const argv[], char *const envp[]) {
+    if (is_root_check_cmd(path, argv)) {
+        LOGI("PuppyC blocked root check (execvp): %s", path);
+        char *fake_argv[] = {"echo", NULL};
+        char **new_envp = build_preloaded_envp(NULL);
+        int res = orig_execvpe("echo", fake_argv, new_envp);
+        free_preloaded_envp(new_envp, NULL);
+        return res;
+    }
     const char *prop_name = NULL;
-    if (is_getprop_cmd(file, argv, &prop_name)) {
+    if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
             printf("%s\n", mock_val);
@@ -359,7 +433,7 @@ static int hook_execvpe(const char *file, char *const argv[], char *const envp[]
     }
 
     char **new_envp = build_preloaded_envp(envp);
-    int res = orig_execvpe(file, argv, new_envp);
+    int res = orig_execvpe(path, argv, new_envp);
     free_preloaded_envp(new_envp, envp);
     return res;
 }
@@ -433,14 +507,14 @@ static int hook_statvfs64(const char *path, struct statvfs64 *buf) {
 #endif
 
 #if defined(DEVICE_CPU_INFO) || (defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB))
-static int get_intercepted_fd(const char *pathname);
+static int get_intercepted_fd(const char *path);
 
-static int hook_openat(int dirfd, const char *pathname, int flags, int mode) {
-    int fake_fd = get_intercepted_fd(pathname);
+static int hook_openat(int dirfd, const char *path, int flags, int mode) {
+    int fake_fd = get_intercepted_fd(path);
     if (fake_fd >= 0) {
         return fake_fd;
     }
-    return orig_openat(dirfd, pathname, flags, mode);
+    return orig_openat(dirfd, path, flags, mode);
 }
 
 static int create_memfd_with_data(const char *name, const char *data, size_t size) {
@@ -461,24 +535,24 @@ static int create_memfd_with_data(const char *name, const char *data, size_t siz
     return fd;
 }
 
-static int get_intercepted_fd(const char *pathname) {
-    if (pathname == NULL) return -1;
+static int get_intercepted_fd(const char *path) {
+    if (path == NULL) return -1;
 
     #ifdef DEVICE_CPU_INFO
-    if (strcmp(pathname, "/proc/cpuinfo") == 0) {
+    if (strcmp(path, "/proc/cpuinfo") == 0) {
         LOGI("PuppyC intercepted open for /proc/cpuinfo");
         return create_memfd_with_data("cpuinfo_fake", DEVICE_CPU_INFO, strlen(DEVICE_CPU_INFO));
     }
     #endif
     
-    if (strcmp(pathname, "/sys/fs/selinux/enforce") == 0) {
+    if (strcmp(path, "/sys/fs/selinux/enforce") == 0) {
         LOGI("PuppyC intercepted open for /sys/fs/selinux/enforce");
         const char *val = "1\n";
         return create_memfd_with_data("selinux_fake", val, strlen(val));
     }
     
     #if defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB)
-    if (strcmp(pathname, "/proc/meminfo") == 0) {
+    if (strcmp(path, "/proc/meminfo") == 0) {
         LOGI("PuppyC intercepted open for /proc/meminfo");
         
         unsigned long long _MEM_TOTAL_KB = SPECS_TOTAL_RAM / 1024;
@@ -566,6 +640,69 @@ static int get_intercepted_fd(const char *pathname) {
 }
 #endif
 
+#if defined(DEVICE_GL_VENDOR) || defined(DEVICE_GL_RENDERER) || defined(DEVICE_GL_VERSION)
+static const char *hook_glGetString(unsigned int name) {
+    #ifdef DEVICE_GL_VENDOR
+    if (name == GL_VENDOR) {
+        LOGI("PuppyC spoofed GL_VENDOR");
+        return DEVICE_GL_VENDOR;
+    }
+    #endif
+
+    #ifdef DEVICE_GL_RENDERER
+    if (name == GL_RENDERER) {
+        LOGI("PuppyC spoofed GL_RENDERER");
+        return DEVICE_GL_RENDERER;
+    }
+    #endif
+
+    #ifdef DEVICE_GL_VERSION
+    if (name == GL_VERSION) {
+        LOGI("PuppyC spoofed GL_VERSION");
+        return DEVICE_GL_VERSION;
+    }
+    #endif
+
+    if (orig_glGetString != NULL) {
+        return orig_glGetString(name);
+    }
+    return "";
+}
+#endif
+
+#ifdef DEVICE_GL_RENDERER
+static void hook_vkGetPhysicalDeviceProperties(void* physicalDevice, void* pProperties) {
+    if (real_vkGetPhysicalDeviceProperties) {
+        real_vkGetPhysicalDeviceProperties(physicalDevice, pProperties);
+        
+        if (pProperties) {
+            // Offset 8: vendorID (0x5143 = Qualcomm)
+            uint32_t *vendorID = (uint32_t *)((char *)pProperties + 8);
+            *vendorID = 0x5143; 
+            
+            // Offset 20: deviceName (char[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE])
+            char *deviceName = (char *)pProperties + 20;
+            strncpy(deviceName, DEVICE_GL_RENDERER, 255);
+            deviceName[255] = '\0';
+        }
+    }
+}
+
+static PFN_vkVoidFunction hook_vkGetInstanceProcAddr(void* instance, const char* pName) {
+    PFN_vkVoidFunction real_func = orig_vkGetInstanceProcAddr(instance, pName);
+    
+    if (pName != NULL && strcmp(pName, "vkGetPhysicalDeviceProperties") == 0) {
+        if (real_func != NULL) {
+            // Save the real function pointer and return ours instead
+            real_vkGetPhysicalDeviceProperties = (VkGetPhysicalDevicePropertiesFunc)real_func;
+            return (PFN_vkVoidFunction)hook_vkGetPhysicalDeviceProperties;
+        }
+    }
+    
+    return real_func;
+}
+#endif
+
 void apply_native_gum_hooks() {
     LOGI("PuppyC waking up in the background... sniffing out environment.");
     GumInterceptor *interceptor = gum_interceptor_obtain();
@@ -626,6 +763,27 @@ void apply_native_gum_hooks() {
     #if defined(DEVICE_CPU_INFO) || (defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB))
     gpointer target_openat = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "openat"));
     if (target_openat) gum_interceptor_replace(interceptor, target_openat, GSIZE_TO_POINTER(hook_openat), (gpointer *)&orig_openat, NULL);
+    #endif
+
+    #if defined(DEVICE_GL_VENDOR) || defined(DEVICE_GL_RENDERER) || defined(DEVICE_GL_VERSION)
+    void *libgles = dlopen("libGLESv2.so", RTLD_LAZY);
+    gpointer target_glGetString = libgles ? dlsym(libgles, "glGetString") : NULL;
+    
+    if (!target_glGetString) target_glGetString = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "glGetString"));
+    if (target_glGetString) gum_interceptor_replace(interceptor, target_glGetString, GSIZE_TO_POINTER(hook_glGetString), (gpointer *)&orig_glGetString, NULL);
+    #endif
+
+    #ifdef DEVICE_GL_RENDERER
+    void *libvulkan = dlopen("libvulkan.so", RTLD_LAZY);
+    if (libvulkan) {
+        gpointer target_vk = dlsym(libvulkan, "vkGetInstanceProcAddr");
+        if (target_vk) {
+            gum_interceptor_replace(interceptor, target_vk, GSIZE_TO_POINTER(hook_vkGetInstanceProcAddr), (gpointer *)&orig_vkGetInstanceProcAddr, NULL);
+            LOGI("PuppyC applied Vulkan hooks!");
+        } else {
+            LOGI("PuppyC: vkGetInstanceProcAddr not found in libvulkan.so.");
+        }
+    }
     #endif
 
     gum_interceptor_end_transaction(interceptor);

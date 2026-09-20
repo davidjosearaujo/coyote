@@ -159,70 +159,7 @@ void apply_gumjs_hooks() {
     );
 
     // ============================================
-    // BLOCK: Total Storage Space Hooks
-    // ============================================
-    #ifdef SPECS_TOTAL_SPACE
-    g_string_append(js,
-        "  try {\n"
-        "    IoFile.getTotalSpace.implementation = function () {\n"
-        "      return SPECS_TOTAL_SPACE;\n"
-        "    };\n"
-        "    StatFs.getTotalBytes.implementation = function () {\n"
-        "      return SPECS_TOTAL_SPACE;\n"
-        "    };\n"
-        "    StatFs.getBlockCount.implementation = function() {\n"
-        "      return Math.floor(SPECS_TOTAL_SPACE / this.getBlockSize());\n"
-        "    };\n"
-        "    StatFs.getBlockCountLong.implementation = function() {\n"
-        "      return Math.floor(SPECS_TOTAL_SPACE / this.getBlockSizeLong());\n"
-        "    };\n"
-        "  } catch (e) {\n"
-        "    console.log('[-] Error hooking total storage space: ' + e);\n"
-        "  }\n"
-        "\n"
-    );
-    #endif
-
-    // ============================================
-    // BLOCK 4: Storage Space Hooks (Free)
-    // ============================================
-    #ifdef SPECS_FREE_SPACE
-    g_string_append(js,
-        "  try {\n"
-        "    IoFile.getFreeSpace.implementation = function () {\n"
-        "      return getRealisticJitter(SPECS_FREE_SPACE, 0.0005);\n"
-        "    };\n"
-        "    StatFs.getAvailableBytes.implementation = function () {\n"
-        "      return getRealisticJitter(SPECS_FREE_SPACE, 0.0005);\n"
-        "    };\n"
-        "    StatFs.getFreeBytes.implementation = function () {\n"
-        "      return getRealisticJitter(SPECS_FREE_SPACE, 0.0005);\n"
-        "    };\n"
-        "    StatFs.getAvailableBlocks.implementation = function () {\n"
-        "      const jitteredFreeSpace = getRealisticJitter(SPECS_FREE_SPACE, 0.0005);\n"
-        "      return Math.floor(jitteredFreeSpace / this.getBlockSize());\n"
-        "    };\n"
-        "    StatFs.getAvailableBlocksLong.implementation = function () {\n"
-        "      const jitteredFreeSpace = getRealisticJitter(SPECS_FREE_SPACE, 0.0005);\n"
-        "      return Math.floor(jitteredFreeSpace / this.getBlockSizeLong());\n"
-        "    };\n"
-        "    StatFs.getFreeBlocks.implementation = function () {\n"
-        "      const jitteredFreeSpace = getRealisticJitter(SPECS_FREE_SPACE, 0.0005);\n"
-        "      return Math.floor(jitteredFreeSpace / this.getBlockSize());\n"
-        "    };\n"
-        "    StatFs.getFreeBlocksLong.implementation = function () {\n"
-        "      const jitteredFreeSpace = getRealisticJitter(SPECS_FREE_SPACE, 0.0005);\n"
-        "      return Math.floor(jitteredFreeSpace / this.getBlockSizeLong());\n"
-        "    };\n"
-        "  } catch (e) {\n"
-        "    console.log('[-] Error hooking free storage space: ' + e);\n"
-        "  }\n"
-        "\n"
-    );
-    #endif
-
-    // ============================================
-    // BLOCK 5: RAM Memory Hooks
+    // BLOCK 3: RAM Memory Hooks
     // ============================================
     #if defined(SPECS_TOTAL_RAM) || defined(SPECS_RAM_THRESHOLD) || defined(SPECS_AVAIL_RAM)
     g_string_append(js,
@@ -257,7 +194,7 @@ void apply_gumjs_hooks() {
     #endif
 
     // ============================================
-    // BLOCK 6: Battery Cloaking Hooks
+    // BLOCK 4: Battery Cloaking Hooks
     // ============================================
     #ifdef SPECS_BATTERY_LEVEL
     g_string_append(js,
@@ -324,7 +261,7 @@ void apply_gumjs_hooks() {
     #endif
 
     // ============================================
-    // BLOCK 7: Time Cloaking Hooks
+    // BLOCK 5: Time Cloaking Hooks
     // ============================================
     #ifdef SYS_PROP_PERSIST_SYS_TIMEZONE
     g_string_append(js,
@@ -355,91 +292,7 @@ void apply_gumjs_hooks() {
     #endif
 
     // ============================================
-    // BLOCK 8: OpenGL Cloaking Hooks
-    // ============================================
-    #if defined(DEVICE_GL_VENDOR) || defined(DEVICE_GL_RENDERER) || defined(DEVICE_GL_VERSION)
-    g_string_append(js,
-        "  try {\n"
-        "    const glMap = {};\n"
-    );
-
-    #ifdef DEVICE_GL_VENDOR
-    g_string_append_printf(js, "    glMap[0x1F00] = '%s';\n", DEVICE_GL_VENDOR);
-    #endif
-
-    #ifdef DEVICE_GL_RENDERER
-    g_string_append_printf(js, "    glMap[0x1F01] = '%s';\n", DEVICE_GL_RENDERER);
-    #endif
-
-    #ifdef DEVICE_GL_VERSION
-    g_string_append_printf(js, "    glMap[0x1F02] = '%s';\n", DEVICE_GL_VERSION);
-    #endif
-
-    g_string_append(js,
-        "    const glClasses = ['android.opengl.GLES20', 'android.opengl.GLES30', 'com.google.android.gles_jni.GLImpl'];\n"
-        "\n"
-        "    glClasses.forEach(function(clsName) {\n"
-        "      try {\n"
-        "        const cls = Java.use(clsName);\n"
-        "        if (cls && cls.glGetString) {\n"
-        "          cls.glGetString.implementation = function(name) {\n"
-        "            return glMap[name] !== undefined ? glMap[name] : this.glGetString(name);\n"
-        "          };\n"
-        "        }\n"
-        "      } catch (e) {}\n"
-        "    });\n"
-        "  } catch (e) {\n"
-        "    console.log('[-] Error hooking OpenGL: ' + e);\n"
-        "  }\n"
-        "\n"
-    );
-    #endif
-
-    // ============================================
-    // BLOCK 9: Vulkan Cloaking Hooks
-    // ============================================
-    #ifdef DEVICE_GL_RENDERER
-    g_string_append(js,
-        "  try {\n"
-    );
-
-    g_string_append_printf(js, "    const fakeRenderer = '%s';\n", DEVICE_GL_RENDERER);
-
-    g_string_append(js,
-        "    const libvulkan = Process.getModuleByName('libvulkan.so');\n"
-        "    if (!libvulkan) {\n"
-        "      console.log('[-] libvulkan.so not loaded (OpenGL only)');\n"
-        "    } else {\n"
-        "      let isPropertiesHooked = false;\n"
-        "      Interceptor.attach(libvulkan.getExportByName('vkGetInstanceProcAddr'), {\n"
-        "        onEnter: function(args) {\n"
-        "          this.funcName = args[1].readCString();\n"
-        "        },\n"
-        "        onLeave: function(retval) {\n"
-        "          if (this.funcName === 'vkGetPhysicalDeviceProperties' && !retval.isNull() && !isPropertiesHooked) {\n"
-        "            isPropertiesHooked = true;\n"
-        "            Interceptor.attach(retval, {\n"
-        "              onEnter: function(args) {\n"
-        "                this.pProperties = args[1];\n"
-        "              },\n"
-        "              onLeave: function(retval) {\n"
-        "                this.pProperties.add(20).writeUtf8String(fakeRenderer);\n"
-        "                this.pProperties.add(0x8).writeU32(0x5143);\n"
-        "              }\n"
-        "            });\n"
-        "          }\n"
-        "        }\n"
-        "      });\n"
-        "    }\n"
-        "  } catch (e) {\n"
-        "    console.log('[-] Error hooking Vulkan: ' + e);\n"
-        "  }\n"
-        "\n"
-    );
-    #endif
-
-    // ============================================
-    // BLOCK 10: Install Referrer Bypass Hooks
+    // BLOCK 6: Install Referrer Bypass Hooks
     // ============================================
     #ifdef ATTRIBUTION_INSTALL_REFERRER
     g_string_append(js,
@@ -492,7 +345,7 @@ void apply_gumjs_hooks() {
     #endif
 
     // ============================================
-    // BLOCK 11: USB Action Bypass Hooks
+    // BLOCK 7: USB Action Bypass Hooks
     // ============================================
     g_string_append(js,
         "  try {\n"
@@ -523,89 +376,7 @@ void apply_gumjs_hooks() {
     );
 
     // ============================================
-    // BLOCK 12: Root Check Bypass Hooks
-    // ============================================
-    g_string_append(js,
-        "  try {\n"
-        "    const Runtime = Java.use('java.lang.Runtime');\n"
-        "    const ProcessBuilder = Java.use('java.lang.ProcessBuilder');\n"
-        "    const badCommands = ['su', 'magisk', 'frida', 'xposed', 'root', 'busybox'];\n"
-        "    const fakeCommand = '/system/bin/echo';\n"
-        "\n"
-        "    const sanitizeCmd = function(cmd) {\n"
-        "      if (!cmd) return cmd;\n"
-        "      for (let i = 0; i < badCommands.length; i++) {\n"
-        "        if (cmd.indexOf(badCommands[i]) !== -1) {\n"
-        "          return fakeCommand;\n"
-        "        }\n"
-        "      }\n"
-        "      return cmd;\n"
-        "    };\n"
-        "\n"
-        "    const getListStr = function(list) {\n"
-        "      if (!list) return '';\n"
-        "      let str = '';\n"
-        "      for (let i = 0; i < list.size(); i++) {\n"
-        "        let item = list.get(i);\n"
-        "        if (item) str += item.toString() + ' ';\n"
-        "      }\n"
-        "      return str.trim();\n"
-        "    };\n"
-        "\n"
-        "    Runtime.exec.overloads.forEach(function(overload) {\n"
-        "      overload.implementation = function() {\n"
-        "        let args = [].slice.call(arguments);\n"
-        "        let cmd = args[0];\n"
-        "        if (typeof cmd === 'string') {\n"
-        "          args[0] = sanitizeCmd(cmd);\n"
-        "        } else if (cmd && typeof cmd === 'object' && 'length' in cmd) {\n"
-        "          for (let i = 0; i < cmd.length; i++) {\n"
-        "            cmd[i] = sanitizeCmd(cmd[i]);\n"
-        "          }\n"
-        "        }\n"
-        "        return this.exec.apply(this, args);\n"
-        "      };\n"
-        "    });\n"
-        "\n"
-        "    ProcessBuilder.command.overload('java.util.List').implementation = function(list) {\n"
-        "      if (list && list.size() > 0) {\n"
-        "        for (let i = 0; i < list.size(); i++) {\n"
-        "          let cmd = list.get(i).toString();\n"
-        "          let sanitized = sanitizeCmd(cmd);\n"
-        "          if (cmd !== sanitized) list.set(i, sanitized);\n"
-        "        }\n"
-        "      }\n"
-        "      return this.command.call(this, list);\n"
-        "    };\n"
-        "\n"
-        "    ProcessBuilder.command.overload('[Ljava.lang.String;').implementation = function(arr) {\n"
-        "      if (arr && arr.length > 0) {\n"
-        "        for (let i = 0; i < arr.length; i++) {\n"
-        "          arr[i] = sanitizeCmd(arr[i]);\n"
-        "        }\n"
-        "      }\n"
-        "      return this.command.call(this, arr);\n"
-        "    };\n"
-        "\n"
-        "    ProcessBuilder.start.implementation = function() {\n"
-        "      let cmdList = this.command();\n"
-        "      if (cmdList && cmdList.size() > 0) {\n"
-        "        for (let i = 0; i < cmdList.size(); i++) {\n"
-        "          let cmd = cmdList.get(i).toString();\n"
-        "          let sanitized = sanitizeCmd(cmd);\n"
-        "          if (cmd !== sanitized) cmdList.set(i, sanitized);\n"
-        "        }\n"
-        "      }\n"
-        "      return this.start.call(this);\n"
-        "    };\n"
-        "  } catch (e) {\n"
-        "    console.log('[-] Error hooking root checks: ' + e);\n"
-        "  }\n"
-        "\n"
-    );
-
-    // ============================================
-    // BLOCK 13: FLAG_SECURE Bypass Hooks
+    // BLOCK 8: FLAG_SECURE Bypass Hooks
     // ============================================
     #ifdef BYPASS_FLAG_SECURE
     g_string_append(js,
@@ -631,7 +402,7 @@ void apply_gumjs_hooks() {
     #endif
 
     // ============================================
-    // BLOCK 14: Telephony Carrier Cloaking Hooks
+    // BLOCK 9: Telephony Carrier Cloaking Hooks
     // ============================================
     #if defined(TELECOM_MCC) || defined(TELECOM_MNC) || defined(TELECOM_OPERATOR_NAME) || \
         defined(TELECOM_COUNTRY_ISO) || defined(TELECOM_LANGUAGE) || defined(TELECOM_PHONE_CODE) || \
@@ -804,7 +575,7 @@ void apply_gumjs_hooks() {
     #endif
 
     // ============================================
-    // BLOCK 15: Development & Debug Settings Bypass
+    // BLOCK 10: Development & Debug Settings Bypass
     // ============================================
     g_string_append(js,
         "  try {\n"
@@ -905,7 +676,7 @@ void apply_gumjs_hooks() {
     );
 
     // ============================================
-    // BLOCK 16: Locale & Timezone Cloaking Hooks
+    // BLOCK 11: Locale & Timezone Cloaking Hooks
     // ============================================
     #if defined(SYS_PROP_PERSIST_SYS_LANGUAGE) || defined(SYS_PROP_PERSIST_SYS_LOCALE) || defined(SYS_PROP_PERSIST_SYS_TIMEZONE)
     g_string_append(js, "  try {\n");
@@ -960,7 +731,7 @@ void apply_gumjs_hooks() {
     #endif
 
     // ============================================
-    // BLOCK 17: Network Info Spoofing Hooks
+    // BLOCK 12: Network Info Spoofing Hooks
     // ============================================
     #ifdef NETWORK_NET_TYPE
     g_string_append(js,
@@ -985,7 +756,7 @@ void apply_gumjs_hooks() {
     #endif
 
     // ============================================
-    // BLOCK 18: Network & VPN Bypass Hooks
+    // BLOCK 13: Network & VPN Bypass Hooks
     // ============================================
     #if defined(NETWORK_NET_TYPE) || defined(NETWORK_MOBILE_DATA_LOCAL_IP) || defined(NETWORK_WIFI_LOCAL_IP)
     g_string_append(js,
