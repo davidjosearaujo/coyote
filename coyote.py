@@ -125,10 +125,11 @@ class Coyote:
 
         sections = [
             ("1. Telecom Settings", "telecom", "TELECOM_"),
-            ("2. Device Identification & Build Metadata", "device_profile", "DEVICE_"),
-            ("3. Hardware Metrics & Memory Space", "specs", "SPECS_"),
-            ("4. Network Configuration", "network", "NETWORK_"),
-            ("5. Attribution & Install Tracking", "attribution", "ATTRIBUTION_")
+            ("2. Bypass Settings", "bypass", "BYPASS_"),
+            ("3. Device Identification & Build Metadata", "device_profile", "DEVICE_"),
+            ("4. Hardware Metrics & Memory Space", "specs", "SPECS_"),
+            ("5. Network Configuration", "network", "NETWORK_"),
+            ("6. Attribution & Install Tracking", "attribution", "ATTRIBUTION_")
         ]
 
         macro_count = 0

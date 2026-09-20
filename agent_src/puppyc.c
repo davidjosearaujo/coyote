@@ -432,19 +432,6 @@ static int hook_statvfs64(const char *path, struct statvfs64 *buf) {
 }
 #endif
 
-#if defined(SPECS_AVAIL_RAM) && defined(SPECS_TOTAL_RAM)
-static int hook_sysinfo(struct sysinfo *info) {
-    int ret = orig_sysinfo(info);
-    if (ret == 0 && info != NULL) {
-        long long jittered_avail_ram = apply_jitter(SPECS_AVAIL_RAM, 0.03);
-        info->totalram = SPECS_TOTAL_RAM / info->mem_unit;
-        info->freeram = jittered_avail_ram / info->mem_unit;
-        LOGI("PuppyC spoofed sysinfo (RAM)");
-    }
-    return ret;
-}
-#endif
-
 #if defined(DEVICE_CPU_INFO) || (defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB))
 static int get_intercepted_fd(const char *pathname);
 
@@ -473,8 +460,6 @@ static int create_memfd_with_data(const char *name, const char *data, size_t siz
     lseek(fd, 0, SEEK_SET);
     return fd;
 }
-
-
 
 static int get_intercepted_fd(const char *pathname) {
     if (pathname == NULL) return -1;
@@ -636,11 +621,6 @@ void apply_native_gum_hooks() {
     if (target_statfs64)    gum_interceptor_replace(interceptor, target_statfs64, GSIZE_TO_POINTER(hook_statfs64), (gpointer *)&orig_statfs64, NULL);
     if (target_statvfs)     gum_interceptor_replace(interceptor, target_statvfs, GSIZE_TO_POINTER(hook_statvfs), (gpointer *)&orig_statvfs, NULL);
     if (target_statvfs64)   gum_interceptor_replace(interceptor, target_statvfs64, GSIZE_TO_POINTER(hook_statvfs64), (gpointer *)&orig_statvfs64, NULL);
-    #endif
-
-    #if defined(SPECS_AVAIL_RAM) && defined(SPECS_TOTAL_RAM)
-    gpointer target_sysinfo = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "sysinfo"));
-    if (target_sysinfo) gum_interceptor_replace(interceptor, target_sysinfo, GSIZE_TO_POINTER(hook_sysinfo), (gpointer *)&orig_sysinfo, NULL);
     #endif
 
     #if defined(DEVICE_CPU_INFO) || (defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB))
