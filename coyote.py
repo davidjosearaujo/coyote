@@ -5,6 +5,7 @@ import tarfile
 import os
 import re
 import subprocess
+import platform
 import sys
 import urllib.request
 from pathlib import Path
@@ -22,17 +23,26 @@ ABI_MAP = {
 }
 
 def detect_device_abi() -> dict:
-    """Queries target device via ADB to dynamically resolve CPU ABI and compiler triple."""
+    """Queries target device via ADB, defaulting to the host's architecture if unavailable."""
     try:
         cmd = ["adb", "shell", "getprop", "ro.product.cpu.abi"]
-        raw_abi = subprocess.check_output(cmd).decode().strip()
+        raw_abi = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
         if raw_abi in ABI_MAP:
             return ABI_MAP[raw_abi]
-        print(f"[!] Unknown ABI '{raw_abi}'. Defaulting to arm64-v8a.")
-    except Exception as e:
-        print(f"[!] ADB query failed ({e}). Defaulting compiler to arm64-v8a.")
+        print(f"[!] Unknown ABI '{raw_abi}'. Defaulting to host architecture.")
+    except Exception:
+        print("[!] ADB query failed. Defaulting compiler to host architecture.")
     
-    return ABI_MAP["arm64-v8a"]
+    machine = platform.machine().lower()
+    if machine in ["x86_64", "amd64"]:
+        return ABI_MAP["x86_64"]
+    elif machine in ["aarch64", "arm64"]:
+        return ABI_MAP["arm64-v8a"]
+    elif machine in ["i386", "i686", "x86"]:
+        return ABI_MAP["x86"]
+    
+    # Safe fallback
+    return ABI_MAP["x86_64"]
 
 class Coyote:
 
@@ -207,7 +217,7 @@ class Coyote:
         compiler = bin_dir / f"{compiler_prefix}{self.api_level}-clang"
         strip_tool = bin_dir / "llvm-strip"
 
-        output_so = BUILD_DIR / "libpuppy.so"
+        output_so = BUILD_DIR / "libcoyote.so"
 
         compile_cmd = [
             str(compiler),
@@ -246,13 +256,13 @@ class Coyote:
         return output_so
 
     def launch_target_app(self, so_path: Path):
-        """Pushes libpuppy.so and libc++_shared.so into target app private data directory and launches package via wrap property."""
+        """Pushes libcoyote.so and libc++_shared.so into target app private data directory and launches package via wrap property."""
 
         target_info = detect_device_abi()
 
-        temp_so = "/data/local/tmp/libpuppy.so"
+        temp_so = "/data/local/tmp/libcoyote.so"
         app_dir = f"/data/data/{self.package_name}"
-        target_so = f"{app_dir}/libpuppy.so"
+        target_so = f"{app_dir}/libcoyote.so"
 
         self._exec(["adb", "push", str(so_path), temp_so], desc="ADB Push to Staging")
 
@@ -434,6 +444,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.skip_deploy:
+        args.skip_adb = True
 
     print("════════════════════════════════════════════════════")
     print("                       COYOTE                       ")
