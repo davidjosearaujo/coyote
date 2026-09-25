@@ -1,6 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Network & Proxy Checks -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Telephony Manager Checks (MCC, MNC, SIM status) -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+
+    <!-- Package Manager Inspection (Android 11+ / API 30+) -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
     <application android:label="Border Patrol">
         <activity android:name=".MainActivity"
                   android:exported="true">
