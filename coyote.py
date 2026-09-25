@@ -189,6 +189,55 @@ class Coyote:
                 f.write(content)
             print(f"  [+] Successfully generated {output_file} with {macro_count} dynamic macros.")
 
+    def compile_js(self):
+        """Bundles agent.js using frida-compile and converts it to a C header using pure Python 3."""
+        print("\n[+] Compiling JavaScript agent with frida-compile...")
+        js_src_dir = AGENT_SRC / "js"
+        src_js = js_src_dir / "agent.js"
+        bundled_js = BUILD_DIR / "agent.js"
+        agent_h = BUILD_DIR / "agent.h"
+
+        if not src_js.exists():
+            print(f"[!] Error: JavaScript source file not found at {src_js}")
+            sys.exit(1)
+
+        # 1. Run frida-compile
+        compile_js_cmd = ["npx", "frida-compile", "-c", str(src_js), "-o", str(bundled_js)]
+        self._exec(compile_js_cmd, desc="frida-compile bundling")
+
+        # 2. Convert bundled JS to C header using pure Python 3
+        print("[+] Converting bundled JS to C header via Python...")
+        if self.dry_run:
+            print(f"  [DRY-RUN] Would read {bundled_js} and generate C header at {agent_h}")
+        else:
+            with open(bundled_js, "r", encoding="utf-8") as f_in:
+                js_content = f_in.read()
+
+            # Fail-safe: Strip frida-compile CLI summary header if it leaked into the output file
+            if "📦" in js_content and "✄" in js_content:
+                # Split at the scissors and take everything after it, stripping trailing/leading whitespace
+                js_content = js_content.split("✄")[-1].lstrip()
+
+            content = js_content.encode("utf-8")
+
+            hex_lines = []
+            for i in range(0, len(content), 12):
+                chunk = content[i:i+12]
+                hex_str = ", ".join(f"0x{b:02x}" for b in chunk)
+                hex_lines.append(f"  {hex_str},")
+
+            header_content = (
+                f"unsigned int agent_js_len = {len(content)};\n"
+                f"unsigned char agent_js[] = {{\n"
+                + "\n".join(hex_lines)
+                + f"\n}};\n"
+            )
+            
+            with open(agent_h, "w") as f_out:
+                f_out.write(header_content)
+
+        print(f"[+] Successfully generated {agent_h}")
+
     def _get_llvm_prebuilt_path(self) -> Path:
         """Dynamically resolves the NDK LLVM prebuilt directory matching the host OS."""
         prebuilt_dir = self.ndk_path / "toolchains" / "llvm" / "prebuilt"
@@ -258,8 +307,6 @@ class Coyote:
     def launch_target_app(self, so_path: Path):
         """Pushes libcoyote.so and libc++_shared.so into target app private data directory and launches package via wrap property."""
 
-        target_info = detect_device_abi()
-
         temp_so = "/data/local/tmp/libcoyote.so"
         app_dir = f"/data/data/{self.package_name}"
         target_so = f"{app_dir}/libcoyote.so"
@@ -269,8 +316,6 @@ class Coyote:
         print(f"[+] Moving agent into SELinux-compliant path: {target_so}")
         self._exec(["adb", "shell", f"su 0 cp {temp_so} {target_so}"], desc="Copy to App Dir")
 
-        # Fix Ownership & SELinux Security Context
-        # Resolves app UID/GID dynamically and applies app_data_file SELinux label
         fix_perms_cmd = (
             f"su 0 sh -c '"
             f"APP_UID=$(stat -c %u {app_dir}); "
@@ -383,7 +428,6 @@ def ensure_devkit(requested_arch: str | None = None):
         print("[!] Non-interactive shell detected. Run with --update-devkit <arch> to initialize.")
         sys.exit(1)
 
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Coyote - Autonomous Anti-Analysis Environment Provisioner",
@@ -441,7 +485,6 @@ def parse_args():
 
     return parser.parse_args()
 
-
 def main():
     args = parse_args()
 
@@ -477,6 +520,7 @@ def main():
     if args.profile:
         orchestrator.generate_c_header()
         ensure_devkit()
+        orchestrator.compile_js()
         agent_so = orchestrator.compile_agent()
 
         if not args.skip_deploy:

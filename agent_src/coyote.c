@@ -1,7 +1,13 @@
 #include "frida-gumjs.h"
-#include <pthread.h>
+
+#include <stdio.h>          // LOGI macro (indirectly)
+#include <stdlib.h>         // could be removed but harmless
+#include <string.h>
 #include <unistd.h>
-#include <android/log.h>
+#include <pthread.h>
+#include <dlfcn.h>
+#include <limits.h>
+#include <android/log.h> 
 
 #define LOG_TAG "[Coyote]"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)

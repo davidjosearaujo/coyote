@@ -1,22 +1,23 @@
-#include "frida-gum.h"
+#include "frida-gumjs.h"
 #include "config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <dlfcn.h>
-#include <math.h>
 #include <spawn.h>
 #include <fcntl.h>
 #include <limits.h>
+
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
-#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
+
+#include <android/log.h>
+#include <android/native_window.h>
 
 #ifndef __NR_memfd_create
 #if defined(__arm__)
@@ -33,9 +34,6 @@
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
 #endif
-
-#include <android/log.h>
-#include <android/native_window.h>
 
 #define LOG_TAG "[PuppyC]"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -779,9 +777,9 @@ void apply_native_gum_hooks() {
         gpointer target_vk = dlsym(libvulkan, "vkGetInstanceProcAddr");
         if (target_vk) {
             gum_interceptor_replace(interceptor, target_vk, GSIZE_TO_POINTER(hook_vkGetInstanceProcAddr), (gpointer *)&orig_vkGetInstanceProcAddr, NULL);
-            LOGI("PuppyC applied Vulkan hooks!");
+            LOGI("Applied Vulkan hooks!");
         } else {
-            LOGI("PuppyC: vkGetInstanceProcAddr not found in libvulkan.so.");
+            LOGI("vkGetInstanceProcAddr not found in libvulkan.so.");
         }
     }
     #endif
