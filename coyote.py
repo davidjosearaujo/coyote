@@ -190,41 +190,37 @@ class Coyote:
             print(f"  [+] Successfully generated {output_file} with {macro_count} dynamic macros.")
 
     def compile_js(self):
-        """Bundles agent.js using frida-compile and converts it to a C header using pure Python 3."""
-        print("\n[+] Compiling JavaScript agent with frida-compile...")
-        js_src_dir = AGENT_SRC / "js"
-        src_js = js_src_dir / "agent.js"
-        bundled_js = BUILD_DIR / "agent.js"
-        agent_h = BUILD_DIR / "agent.h"
+            """Bundles agent.js using frida-compile and converts it to a C header."""
+            print("\n[+] Compiling JavaScript agent with frida-compile...")
+            src_js = AGENT_SRC / "js" / "agent.js"
+            bundled_js = BUILD_DIR / "_agent.js"
+            agent_h = BUILD_DIR / "agent.h"
 
-        if not src_js.exists():
-            print(f"[!] Error: JavaScript source file not found at {src_js}")
-            sys.exit(1)
+            if not src_js.exists():
+                print(f"[!] Error: JavaScript source file not found at {src_js}")
+                sys.exit(1)
 
-        # 1. Run frida-compile
-        compile_js_cmd = ["npx", "frida-compile", "-c", str(src_js), "-o", str(bundled_js)]
-        self._exec(compile_js_cmd, desc="frida-compile bundling")
+            BUILD_DIR.mkdir(exist_ok=True)
 
-        # 2. Convert bundled JS to C header using pure Python 3
-        print("[+] Converting bundled JS to C header via Python...")
-        if self.dry_run:
-            print(f"  [DRY-RUN] Would read {bundled_js} and generate C header at {agent_h}")
-        else:
+            build_cmd = ["frida-compile", "-c", "--no-source-maps", str(src_js), "-o", str(bundled_js),]
+            result = subprocess.run(build_cmd, cwd=str(BASE_DIR), capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"[!] frida-compile failed:\n{result.stderr.strip()}")
+                sys.exit(1)
+            print(f"  [+] frida-compile succeeded")
+
             with open(bundled_js, "r", encoding="utf-8") as f_in:
                 js_content = f_in.read()
 
-            # Fail-safe: Strip frida-compile CLI summary header if it leaked into the output file
-            if "📦" in js_content and "✄" in js_content:
-                # Split at the scissors and take everything after it, stripping trailing/leading whitespace
+            if "✄" in js_content:
                 js_content = js_content.split("✄")[-1].lstrip()
 
             content = js_content.encode("utf-8")
 
-            hex_lines = []
-            for i in range(0, len(content), 12):
-                chunk = content[i:i+12]
-                hex_str = ", ".join(f"0x{b:02x}" for b in chunk)
-                hex_lines.append(f"  {hex_str},")
+            hex_lines = [
+                f"  {', '.join(f'0x{b:02x}' for b in content[i:i+12])},"
+                for i in range(0, len(content), 12)
+            ]
 
             header_content = (
                 f"unsigned int agent_js_len = {len(content)};\n"
@@ -232,11 +228,11 @@ class Coyote:
                 + "\n".join(hex_lines)
                 + f"\n}};\n"
             )
-            
+
             with open(agent_h, "w") as f_out:
                 f_out.write(header_content)
 
-        print(f"[+] Successfully generated {agent_h}")
+            print(f"[+] Successfully generated {agent_h} ({len(content)} bytes)")
 
     def _get_llvm_prebuilt_path(self) -> Path:
         """Dynamically resolves the NDK LLVM prebuilt directory matching the host OS."""
