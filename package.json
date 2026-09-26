@@ -8,7 +8,7 @@
     "build": "frida-compile -c --no-source-maps agent_src/js/agent.js -o build/_agent.js"
   },
   "dependencies": {
-    "frida-java-bridge": "^7.0.0"
+    "frida-java-bridge": "^7.0.13"
   },
   "devDependencies": {
     "frida-compile": "^19.0.5"
