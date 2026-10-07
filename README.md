@@ -1,2 +1,518 @@
-# coyote
+# Coyote
 
+**A stealthy, in-process device-spoofing agent for Android malware analysis.**
+
+Coyote makes a real analysis device or emulator look like an arbitrary "clean"
+physical phone to the app under test. It compiles a native shared library
+(`libcoyote.so`) that is loaded into the target process and rewrites the answers
+to the APIs apps use for environment/emulator detection — display metrics, RAM,
+storage, battery, SIM/carrier, system properties, build fingerprint, network
+state, installer source, and more — so that evasive apps which refuse to run on
+an emulator will run, and can be observed.
+
+Unlike a typical Frida setup, Coyote does **not** require `frida-server` running
+on the device. There is no extra daemon process and no Frida binaries left on the
+device. The agent lives entirely inside the target process, which keeps its
+footprint minimal and hard to attribute.
+
+> ⚠️ **Scope / intent.** Coyote is a defensive tool for authorized malware
+> analysis and security research on devices you own or are authorized to test.
+> See [Legal & Ethical Use](#legal--ethical-use).
+
+---
+
+## Table of contents
+
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+  - [Injection: `wrap` + `LD_PRELOAD`](#injection-wrap--ld_preload)
+  - [The two spoofing layers](#the-two-spoofing-layers)
+  - [In-process spawn-gating](#in-process-spawn-gating)
+  - [The build pipeline](#the-build-pipeline)
+- [Requirements](#requirements)
+- [Setup](#setup)
+- [Usage](#usage)
+  - [Command-line options](#command-line-options)
+  - [Common workflows](#common-workflows)
+- [Writing device profiles](#writing-device-profiles)
+  - [Profile structure](#profile-structure)
+  - [Section reference](#section-reference)
+  - [Value typing rules](#value-typing-rules)
+  - [`system_prop`: raw property overrides](#system_prop-raw-property-overrides)
+- [What gets spoofed, and where](#what-gets-spoofed-and-where)
+- [Troubleshooting](#troubleshooting)
+- [Project layout](#project-layout)
+- [Limitations](#limitations)
+- [Legal & ethical use](#legal--ethical-use)
+
+---
+
+## What it does
+
+Evasive Android malware often probes its environment and silently aborts (or
+changes behavior) when it believes it is running in an emulator, a sandbox, or
+an instrumented device. It looks for tell-tale signs: emulator display sizes,
+suspiciously round RAM/storage values, no SIM, `ro.kernel.qemu=1`, `getprop`
+values that scream "Android Studio AVD", a missing Play Store installer, USB
+debugging flags, and so on.
+
+Coyote intercepts those probes inside the target process and returns values from
+a **device profile** you supply — a JSON description of the phone you want the
+app to believe it is running on (e.g. a Google Pixel 8 Pro on Andorra Telecom).
+The app's detection checks pass, and it proceeds to run so you can analyze it.
+
+The result is a single `libcoyote.so` tailored to one profile and one target
+package, injected without a persistent agent on the device.
+
+---
+
+## How it works
+
+### Injection: `wrap` + `LD_PRELOAD`
+
+Coyote does not patch the APK and does not run a server. It uses Android's
+`wrap.<package>` system property, which tells Zygote to launch the app's process
+through a wrapper command:
+
+```
+setprop wrap.<package> 'env LD_PRELOAD=/data/data/<package>/libcoyote.so'
+```
+
+When the app is next launched, Zygote starts it with `libcoyote.so` preloaded.
+The library's constructor runs before the app's own code, on every process
+Zygote forks for that package. This requires **root** (to place the `.so` inside
+the app's private data directory with the correct SELinux context, and to set
+the `wrap` property).
+
+`libcoyote.so` is copied to `/data/data/<package>/libcoyote.so`, `chown`ed to the
+app's UID, `chmod 755`, and labeled `u:object_r:app_data_file:s0` so the app is
+allowed to map it under SELinux.
+
+### The two spoofing layers
+
+Coyote spoofs at two levels because detection happens at two levels. Everything
+is driven by the compiled-in profile (`build/config.h`).
+
+**1. Native layer — `agent_src/puppyc.c` (libgum / C).**
+Installs inline hooks (via Frida's GumJS devkit, used as a plain C library — no
+scripts, no server) on libc/NDK functions that are reached very early, directly
+from native code:
+
+- **System properties** — `__system_property_get`, `__system_property_find`,
+  `__system_property_read_callback`. Returns profile values for keys listed in
+  `system_prop` (this is how `ro.*` read-only props are spoofed, since they can't
+  be `setprop`'d).
+- **Process execution** — `execve`, `execv`, `execvp`, `execvpe`, `posix_spawn`,
+  `posix_spawnp`. Neutralizes root/su probes and serves spoofed `getprop <key>`
+  output.
+- **Storage** — `statfs`/`statfs64`/`statvfs`/`statvfs64` (total/free space).
+- **Display / GPU** — `ANativeWindow_getWidth`/`getHeight`, `glGetString`,
+  `vkGetInstanceProcAddr`.
+- **Filesystem** — `openat` (hides emulator-specific pseudo-files).
+
+The native layer is applied from the library constructor, so it is active before
+the app's first instruction.
+
+**2. Managed layer — `agent_src/js/agent.js` (Frida GumJS / Java).**
+A JavaScript agent, compiled into the library and executed by an embedded GumJS
+runtime, uses `frida-java-bridge` to hook Android framework (Java/ART) methods
+that native hooks can't reach cleanly:
+
+- Display metrics (`Display`/`Resources.getDisplayMetrics`)
+- RAM (`ActivityManager.getMemoryInfo`)
+- Battery (`BatteryManager`, battery `Intent`/`Bundle` extras)
+- Time/zone & locale (`Calendar`, `TimeZone`, `Locale`, `LocaleList`)
+- Install referrer (`ReferrerDetails`, `Bundle`)
+- USB state bypass (`Intent` extras)
+- `FLAG_SECURE` stripping (`Window`)
+- Telephony/carrier (`TelephonyManager`, resource `Configuration`)
+- Dev/debug settings (`Settings.Global`/`Secure`/`System`, `Debug`, `VMDebug`)
+- Network & VPN (`NetworkInfo`, `ConnectivityManager`, `NetworkCapabilities`,
+  `NetworkInterface`)
+- Proxy (`Proxy.getDefaultHost`)
+- SSL pinning bypass (OkHttp, TrustKit, Conscrypt, Appcelerator — when present)
+- User-Agent (`System.getProperty`, `WebView`, `HttpURLConnection`)
+- Package manager (installer source, app hiding, fake installed apps, forced
+  `hasSystemFeature`, install time)
+- Keyguard (`KeyguardManager`)
+- `android.os.Build` static fields (e.g. `Build.SERIAL`, which is hard-coded to
+  `"unknown"` on modern Android and can only be fixed as a field)
+- `getprop` via `ProcessBuilder`/`Runtime.exec` (rewritten to echo spoofed values)
+
+### In-process spawn-gating
+
+The hard problem: Java-layer hooks can only be installed once ART is up, but
+detection often runs in the very first `Activity.onCreate`. A background thread
+racing the app's startup loses that race (and instrumenting ART mid-bootstrap
+from another thread deadlocks).
+
+Coyote solves this **in-process**, without `frida-server`'s spawn gating:
+
+1. As soon as the Java VM is usable, it arms **one** hook on
+   `android.app.Instrumentation.callActivityOnCreate` — the framework method that
+   runs, on the main thread, immediately before every activity's `onCreate`.
+2. When that fires for the first activity, Coyote installs all the Java hooks
+   **from the main thread**, before `onCreate` executes. Because the
+   instrumentation happens on the main thread itself, there is no cross-thread
+   ART suspension and no deadlock.
+3. `onCreate` then reads already-spoofed values.
+
+The net effect is spawn-gating-quality timing (all hooks live before the app's
+first checks) with zero added device footprint.
+
+### The build pipeline
+
+Running `coyote.py` with a profile performs, in order:
+
+1. **`configure_adb_properties`** — `setprop`s the writable (`non-ro.*`) keys from
+   `system_prop` over ADB. `ro.*` keys are skipped here and handled by the native
+   property hook instead.
+2. **`generate_c_header`** — turns the JSON profile into `build/config.h`
+   (`#define`s + a `SYSTEM_PROP_OVERRIDES[]` table).
+3. **`ensure_devkit`** — makes sure the Frida GumJS devkit for the target ABI is
+   present in `agent_src/devkit/` (auto-downloads the latest release if missing).
+4. **`compile_js`** — bundles `agent_src/js/agent.js` with `frida-compile`, then
+   embeds it as a C byte array in `build/agent.h`.
+5. **`compile_agent`** — compiles `coyote.c` + `puppyc.c` + `puppyjs.c` against
+   the devkit static lib with the NDK Clang toolchain into `build/libcoyote.so`,
+   then strips it.
+6. **`launch_target_app`** — pushes the `.so`, fixes ownership/SELinux, sets the
+   `wrap` property, force-stops the package, and relaunches it.
+
+The three C sources: `coyote.c` is the entry point (constructor → background
+thread → `gum_init_embedded` → native hooks → GumJS runtime); `puppyc.c` holds
+the native hooks; `puppyjs.c` builds the JS context (injecting the `config.h`
+macros as JS globals) and runs the embedded agent.
+
+---
+
+## Requirements
+
+- **A rooted Android device or emulator** (needs `su` for the SELinux-correct
+  copy and the `wrap` property). The AVD "Google APIs" images with root, or a
+  rooted test device, both work.
+- **`adb`** on your `PATH`, with the device connected and authorized.
+- **Android NDK** — pointed to by `$ANDROID_NDK_HOME` or `--ndk`.
+- **Python 3.10+** (uses `str | None` typing).
+- **Node.js + npm** — for `frida-compile` (declared in `package.json`).
+- Internet access on first run (to fetch the Frida GumJS devkit), unless the
+  devkit is already in `agent_src/devkit/`.
+
+---
+
+## Setup
+
+```bash
+# 1. Clone and enter the repo
+git clone <your-fork-url> coyote && cd coyote
+
+# 2. Install the JS build dependencies (frida-compile, frida-java-bridge)
+npm install
+
+# 3. Point to your NDK (or pass --ndk each run)
+export ANDROID_NDK_HOME=/path/to/android-ndk
+
+# 4. (Optional) pre-fetch the Frida GumJS devkit for your device ABI.
+#    Auto-detected from the connected device if you omit the arch.
+python coyote.py --update-devkit            # auto-detect via ADB
+python coyote.py --update-devkit arm64      # or force one: arm | arm64 | x86 | x86_64
+```
+
+The devkit (`frida-gumjs.h` + `libfrida-gumjs.a`, ~180 MB) is large and
+git-ignored; `--update-devkit` downloads the matching release from GitHub and
+extracts it into `agent_src/devkit/`.
+
+---
+
+## Usage
+
+The general form is:
+
+```bash
+python coyote.py -p <profile.json> -t <target.package.name>
+```
+
+This builds a `libcoyote.so` tailored to `<profile.json>`, injects it into
+`<target.package.name>`, and launches the app.
+
+### Command-line options
+
+| Option | Description |
+| --- | --- |
+| `-p`, `--profile <path>` | JSON device profile to compile in. Required to build/deploy. |
+| `-t`, `--target <pkg>` | Target app package name (e.g. `com.example.app`). |
+| `--ndk <path>` | Android NDK directory. Defaults to `$ANDROID_NDK_HOME`. |
+| `--api-level <n>` | Target Android API level for NDK compilation (default `30`). |
+| `--update-devkit [arch]` | Fetch the latest Frida GumJS devkit (`auto`/`arm`/`arm64`/`x86`/`x86_64`), then exit. |
+| `--reset-target` | Remove the `wrap` property, force-stop, and `pm clear` the target, undoing injection. |
+| `--dry-run` | Print the generated `config.h` and all commands without compiling or changing the device. |
+| `--skip-adb` | Build the library but don't push writable `setprop`s to the device. |
+| `--skip-deploy` | Compile only; don't push or launch (implies `--skip-adb`). |
+
+### Common workflows
+
+**Build, inject, and run against a target:**
+
+```bash
+python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app
+```
+
+**Preview exactly what would happen (no device changes, no compile):**
+
+```bash
+python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --dry-run
+```
+
+**Compile the `.so` without touching the device (e.g. CI / offline build):**
+
+```bash
+python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --skip-deploy
+# artifact: build/libcoyote.so
+```
+
+**Remove Coyote from a target and reset its state:**
+
+```bash
+python coyote.py -t com.suspicious.app --reset-target
+```
+
+After a run, inspect behavior with `logcat`. The agent logs under these tags:
+
+```bash
+adb logcat -s "[Coyote]" "[PuppyC]" "[PuppyJS]"
+```
+
+You should see the native hooks apply, then `gate armed …`, `gate fired …`, and
+`All hook blocks installed` before the app's UI appears.
+
+---
+
+## Writing device profiles
+
+A profile is a single JSON file describing the phone you want to impersonate.
+Each top-level section maps to a group of spoofed values. See
+`profiles/pixel7_us_tmobile.json` for a complete working example; the
+`test/.../test_profile.json` used by the bundled test app is another.
+
+Every key you include is turned into a compile-time macro and consumed by the
+hooks. **Keys you omit are simply not spoofed** — the real device value shows
+through. Start from an existing profile and change what you need.
+
+### Profile structure
+
+```jsonc
+{
+  "telecom":        { ... },   // SIM / carrier / network identity
+  "bypass":         { ... },   // feature toggles (e.g. FLAG_SECURE)
+  "device_profile": { ... },   // Build.* identity & hardware metadata
+  "specs":          { ... },   // display, memory, storage, battery
+  "network":        { ... },   // connectivity type & local IPs
+  "attribution":    { ... },   // install referrer / attribution
+  "system_prop":    { ... }    // raw Android system properties (getprop)
+}
+```
+
+### Section reference
+
+Each section is emitted with a macro prefix; the table shows representative keys
+drawn from the example profiles.
+
+**`telecom` → `TELECOM_*`** — SIM and carrier identity.
+
+| Key | Example | Meaning |
+| --- | --- | --- |
+| `mcc` / `mnc` | `"213"` / `"03"` | Mobile country/network codes |
+| `operator_name` | `"Andorra Telecom / Mobiland"` | SIM/network operator name |
+| `country_iso` | `"ad"` | SIM country ISO |
+| `language` | `"ca"` | Carrier language |
+| `phone_code` | `"376"` | Dialing prefix used for a fake MSISDN |
+| `sim_state_num` | `5` | `TelephonyManager` SIM state (5 = READY) |
+| `imei_prefix` | `"35"` | Prefix for a generated IMEI |
+| `network_type` | `"LTE"` | Radio network type |
+| `timezone_id` | `"Europe/Andorra"` | IANA timezone |
+
+**`bypass` → `BYPASS_*`** — boolean feature toggles.
+
+| Key | Example | Meaning |
+| --- | --- | --- |
+| `flag_secure` | `1` | Strip `FLAG_SECURE` so screenshots/recording work |
+
+**`device_profile` → `DEVICE_*`** — `android.os.Build` identity and hardware
+metadata: `model`, `manufacturer`, `brand`, `device`, `board`, `product`,
+`hardware`, `fingerprint`, `bootloader`, `serial`, `display`/`display_id`,
+`security_patch`, `soc_model`, `gl_vendor`/`gl_renderer`/`gl_version`,
+`keyboard`, `cpu_info`, and more. These feed the `Build.*` field spoofing and
+GPU/CPU strings. (`cpu_info` is emitted as a C raw-string literal, so multi-line
+`/proc/cpuinfo` text is fine.)
+
+**`specs` → `SPECS_*`** — physical hardware metrics. Keys are UPPERCASE here.
+
+| Key | Example | Meaning |
+| --- | --- | --- |
+| `WIDTH` / `HEIGHT` | `1440` / `3120` | Display pixels |
+| `DENSITY` | `"2.75f"` | Logical density |
+| `DENSITY_DPI` | `440` | Density bucket |
+| `XDPI` / `YDPI` | `"440.0f"` | Physical DPI |
+| `TOTAL_SPACE` / `FREE_SPACE` | `549755813888` | Storage bytes |
+| `TOTAL_RAM` / `AVAIL_RAM` | `11886625832` | RAM bytes |
+| `RAM_THRESHOLD` | `594331291` | Low-memory threshold |
+| `BATTERY_LEVEL` | `50` | Battery percentage |
+
+**`network` → `NETWORK_*`** — connectivity.
+
+| Key | Example | Meaning |
+| --- | --- | --- |
+| `net_type` | `0` | Active transport (`0` = mobile, `1` = Wi-Fi) |
+| `mobile_data_local_ip` | `"10.23.45.67"` | Fake mobile interface IP |
+| `wifi_local_ip` | `"192.168.1.211"` | Fake Wi-Fi interface IP |
+
+**`attribution` → `ATTRIBUTION_*`** — install/attribution data.
+
+| Key | Example | Meaning |
+| --- | --- | --- |
+| `install_referrer` | `"utm_source=apps.facebook.com&..."` | Play install referrer |
+| `install_package` | `"com.android.vending"` | Expected installer package |
+| `campaign`, `af_status`, `facebook_app_id` | … | Attribution fields |
+
+**`system_prop`** — see below (handled specially).
+
+### Value typing rules
+
+`config.h` generation infers the C type from the JSON value, so **use the right
+JSON type**:
+
+- **String** → quoted C string. Use this for IDs, names, ISO codes, etc.
+- **Float** (JSON number with a decimal, or a string like `"2.75f"`) → a C
+  `float` literal with an `f` suffix. Density/DPI values are commonly written as
+  strings with a trailing `f`.
+- **Integer** → a plain `int`, **except** the size keys `TOTAL_SPACE`,
+  `FREE_SPACE`, `TOTAL_RAM`, `AVAIL_RAM`, and `RAM_THRESHOLD`, which are emitted
+  as `unsigned long long` (`ULL`) — always give these as plain numbers (bytes),
+  not strings.
+- **`cpu_info`** is special-cased into a raw string literal so it can contain
+  quotes and newlines.
+
+Run with `--dry-run` to see the exact `config.h` that your profile produces
+before building.
+
+### `system_prop`: raw property overrides
+
+`system_prop` is a flat map of Android property keys to spoofed values, e.g.:
+
+```jsonc
+"system_prop": {
+  "persist.sys.timezone": "Europe/Andorra",
+  "ro.product.model":     "Pixel 8 Pro",
+  "ro.kernel.qemu":       "",
+  "ro.serialno":          "7PZGGNTD92N",
+  "gsm.operator.numeric": "21303"
+}
+```
+
+These are handled in two ways:
+
+- **Writable properties** (not starting with `ro.`) are applied live over ADB
+  with `setprop` before launch.
+- **Read-only properties** (`ro.*`) cannot be `setprop`'d, so they are compiled
+  into a `SYSTEM_PROP_OVERRIDES[]` table and served by the **native**
+  `__system_property_get` / `__system_property_read_callback` hooks inside the
+  process. This covers both direct property reads and `getprop` shell calls.
+
+This is where you neutralize the classic emulator tells — set `ro.kernel.qemu`,
+`ro.boot.qemu`, `ro.hardware`, the `qemu.*` keys, `ro.build.fingerprint`,
+`ro.serialno`, SELinux/verified-boot flags, etc. to realistic values. The example
+profiles cover a large, practical set (100+ keys) you can use as a baseline.
+
+---
+
+## What gets spoofed, and where
+
+| Detection vector | Layer | Key(s) / hook |
+| --- | --- | --- |
+| Display size / density | Native + JS | `ANativeWindow_*`, `Display`/`Resources.getDisplayMetrics` ← `specs` |
+| RAM | JS | `ActivityManager.getMemoryInfo` ← `specs` |
+| Storage | Native | `statfs`/`statvfs*` ← `specs` |
+| Battery | JS | `BatteryManager`, battery intent extras ← `specs` |
+| SIM / carrier | JS | `TelephonyManager` ← `telecom` |
+| Build identity | JS + Native | `Build.*` fields + `ro.product.*`/`ro.build.*` props ← `device_profile`, `system_prop` |
+| System properties / `getprop` | Native (+ JS for `ProcessBuilder`) | property hooks + exec rewrite ← `system_prop` |
+| Root / su probes | Native | `exec*`/`posix_spawn*` neutralization |
+| Network / VPN / proxy | JS | `ConnectivityManager`, `NetworkCapabilities`, `Proxy` ← `network` |
+| Install source | JS | `ApplicationPackageManager.getInstallerPackageName`, `InstallSourceInfo` ← `attribution` |
+| Install referrer | JS | `ReferrerDetails`, `Bundle` ← `attribution` |
+| USB debugging state | JS | USB `Intent` extras |
+| `FLAG_SECURE` | JS | `Window.addFlags`/`setFlags` ← `bypass` |
+| Locale / timezone | JS + Native | `Locale`/`TimeZone` + `persist.sys.*` props |
+| SSL pinning | JS | OkHttp / TrustKit / Conscrypt / Appcelerator (if present) |
+| Keyguard | JS | `KeyguardManager` |
+
+---
+
+## Troubleshooting
+
+- **`[!] Error: Invalid NDK directory`** — set `$ANDROID_NDK_HOME` or pass
+  `--ndk /path/to/ndk`.
+- **Devkit missing / download fails** — run `python coyote.py --update-devkit`
+  (with the device connected for auto ABI detection), or specify the arch.
+- **`frida-compile failed`** — run `npm install` so `frida-compile` and
+  `frida-java-bridge` are in `node_modules/`.
+- **Permission / SELinux errors during deploy** — the device must be rooted; the
+  copy step uses `su 0`. Verify `adb shell su 0 id` works.
+- **App still detects the emulator** — check `logcat` for the hook logs. If you
+  see `gate armed` but never `gate fired`, the app may not go through a standard
+  activity launch; if a specific value is wrong, confirm the matching profile key
+  (and run `--dry-run` to verify it made it into `config.h`).
+- **Two `[Coyote] Coyote loaded` lines with different PIDs** — expected. The
+  `wrap` property applies to every process Zygote forks for the package; each one
+  loads the library.
+- **Wrong architecture** — the devkit ABI must match the device. Re-fetch with
+  `--update-devkit <arch>` and rebuild.
+
+---
+
+## Project layout
+
+```
+coyote/
+├── coyote.py               # Orchestrator: profile → config.h → build → inject
+├── package.json            # frida-compile build script + JS deps
+├── profiles/               # Example device profiles
+│   └── pixel7_us_tmobile.json
+├── agent_src/
+│   ├── coyote.c            # Library entry point (constructor, threads, gum init)
+│   ├── puppyc.c            # Native (libgum/C) hooks
+│   ├── puppyjs.c           # Embedded GumJS runtime + macro injection + agent loader
+│   ├── js/
+│   │   └── agent.js        # Managed (Java/ART) hooks + in-process spawn-gating
+│   └── devkit/             # Frida GumJS devkit (git-ignored; via --update-devkit)
+├── build/                  # Generated: config.h, _agent.js, agent.h, libcoyote.so
+└── test/                   # "Border Patrol" validation app (293 detection checks)
+```
+
+---
+
+## Limitations
+
+- **Root required.** Injection relies on the `wrap` property and placing the
+  library in the app's private data dir with the right SELinux label.
+- **One profile + one target per build.** The profile and package are compiled
+  in; rebuild to change either.
+- **Per-ABI builds.** The native library must match the device architecture.
+- **Framework-version sensitivity.** Managed hooks target specific Android
+  classes/methods; very new or heavily customized ROMs may move or rename some,
+  in which case that hook logs an error and is skipped (others continue).
+- **Not an anti-anti-Frida bypass per se.** Coyote's goal is environment
+  spoofing. It avoids a `frida-server` footprint, but a determined app can still
+  look for in-process instrumentation; hardening against that is out of scope.
+
+---
+
+## Legal & ethical use
+
+Coyote is intended for **authorized** malware analysis, security research, and
+quality assurance on devices and applications you own or have explicit permission
+to test. Do not use it to bypass protections on software you are not authorized
+to analyze, to facilitate fraud, or to evade controls in production systems. You
+are responsible for complying with all applicable laws and agreements.
+
+See `LICENSE` for distribution terms.
