@@ -2,6 +2,9 @@
   "telecom": {
     "mcc": "213",
     "mnc": "03",
+    "mcc_country_name": "Andorra",
+    "imei_prefix": "35",
+    "network_type": "LTE",
     "timezone_id": "Europe/Andorra",
     "country_iso": "ad",
     "operator_name": "Andorra Telecom / Mobiland",
@@ -9,6 +12,9 @@
     "phone_code": "376",
     "sim_state": "READY",
     "sim_state_num": 5
+  },
+  "bypass": {
+    "flag_secure": 1
   },
   "device_profile": {
     "profile_id": "google-pixel-8-pro",
@@ -58,7 +64,8 @@
     "TOTAL_RAM": 11886625832,
     "AVAIL_RAM": 4633072000,
     "RAM_THRESHOLD": 594331291,
-    "SWAP_TOTAL_KB": 4194304
+    "SWAP_TOTAL_KB": 4194304,
+    "BATTERY_LEVEL": 50
   },
   "network": {
     "net_type": 0,
@@ -66,8 +73,6 @@
     "wifi_local_ip": "192.168.1.211"
   },
   "attribution": {
-    "utm_source": "apps.facebook.com",
-    "utm_medium": "paid_social",
     "facebook_app_id": "",
     "af_status": "non-Organic",
     "campaign": "fb4a",

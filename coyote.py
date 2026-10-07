@@ -5,6 +5,7 @@ import tarfile
 import os
 import re
 import subprocess
+import platform
 import sys
 import urllib.request
 from pathlib import Path
@@ -22,17 +23,26 @@ ABI_MAP = {
 }
 
 def detect_device_abi() -> dict:
-    """Queries target device via ADB to dynamically resolve CPU ABI and compiler triple."""
+    """Queries target device via ADB, defaulting to the host's architecture if unavailable."""
     try:
         cmd = ["adb", "shell", "getprop", "ro.product.cpu.abi"]
-        raw_abi = subprocess.check_output(cmd).decode().strip()
+        raw_abi = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
         if raw_abi in ABI_MAP:
             return ABI_MAP[raw_abi]
-        print(f"[!] Unknown ABI '{raw_abi}'. Defaulting to arm64-v8a.")
-    except Exception as e:
-        print(f"[!] ADB query failed ({e}). Defaulting compiler to arm64-v8a.")
+        print(f"[!] Unknown ABI '{raw_abi}'. Defaulting to host architecture.")
+    except Exception:
+        print("[!] ADB query failed. Defaulting compiler to host architecture.")
     
-    return ABI_MAP["arm64-v8a"]
+    machine = platform.machine().lower()
+    if machine in ["x86_64", "amd64"]:
+        return ABI_MAP["x86_64"]
+    elif machine in ["aarch64", "arm64"]:
+        return ABI_MAP["arm64-v8a"]
+    elif machine in ["i386", "i686", "x86"]:
+        return ABI_MAP["x86"]
+    
+    # Safe fallback
+    return ABI_MAP["x86_64"]
 
 class Coyote:
 
@@ -125,10 +135,11 @@ class Coyote:
 
         sections = [
             ("1. Telecom Settings", "telecom", "TELECOM_"),
-            ("2. Device Identification & Build Metadata", "device_profile", "DEVICE_"),
-            ("3. Hardware Metrics & Memory Space", "specs", "SPECS_"),
-            ("4. Network Configuration", "network", "NETWORK_"),
-            ("5. Attribution & Install Tracking", "attribution", "ATTRIBUTION_")
+            ("2. Bypass Settings", "bypass", "BYPASS_"),
+            ("3. Device Identification & Build Metadata", "device_profile", "DEVICE_"),
+            ("4. Hardware Metrics & Memory Space", "specs", "SPECS_"),
+            ("5. Network Configuration", "network", "NETWORK_"),
+            ("6. Attribution & Install Tracking", "attribution", "ATTRIBUTION_")
         ]
 
         macro_count = 0
@@ -178,6 +189,51 @@ class Coyote:
                 f.write(content)
             print(f"  [+] Successfully generated {output_file} with {macro_count} dynamic macros.")
 
+    def compile_js(self):
+            """Bundles agent.js using frida-compile and converts it to a C header."""
+            print("\n[+] Compiling JavaScript agent with frida-compile...")
+            src_js = AGENT_SRC / "js" / "agent.js"
+            bundled_js = BUILD_DIR / "_agent.js"
+            agent_h = BUILD_DIR / "agent.h"
+
+            if not src_js.exists():
+                print(f"[!] Error: JavaScript source file not found at {src_js}")
+                sys.exit(1)
+
+            BUILD_DIR.mkdir(exist_ok=True)
+
+            build_cmd = ["frida-compile", "-c", "--no-source-maps", str(src_js), "-o", str(bundled_js),]
+            result = subprocess.run(build_cmd, cwd=str(BASE_DIR), capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"[!] frida-compile failed:\n{result.stderr.strip()}")
+                sys.exit(1)
+            print(f"  [+] frida-compile succeeded")
+
+            with open(bundled_js, "r", encoding="utf-8") as f_in:
+                js_content = f_in.read()
+
+            if "✄" in js_content:
+                js_content = js_content.split("✄")[-1].lstrip()
+
+            content = js_content.encode("utf-8")
+
+            hex_lines = [
+                f"  {', '.join(f'0x{b:02x}' for b in content[i:i+12])},"
+                for i in range(0, len(content), 12)
+            ]
+
+            header_content = (
+                f"unsigned int agent_js_len = {len(content)};\n"
+                f"unsigned char agent_js[] = {{\n"
+                + "\n".join(hex_lines)
+                + f"\n}};\n"
+            )
+
+            with open(agent_h, "w") as f_out:
+                f_out.write(header_content)
+
+            print(f"[+] Successfully generated {agent_h} ({len(content)} bytes)")
+
     def _get_llvm_prebuilt_path(self) -> Path:
         """Dynamically resolves the NDK LLVM prebuilt directory matching the host OS."""
         prebuilt_dir = self.ndk_path / "toolchains" / "llvm" / "prebuilt"
@@ -206,21 +262,25 @@ class Coyote:
         compiler = bin_dir / f"{compiler_prefix}{self.api_level}-clang"
         strip_tool = bin_dir / "llvm-strip"
 
-        output_so = BUILD_DIR / "libpuppy.so"
+        output_so = BUILD_DIR / "libcoyote.so"
 
         compile_cmd = [
             str(compiler),
             "-shared",
             "-fPIC",
-            "-O3",
-            "-s",
+            "-Wall",
+            "-Os",
+            "-pipe",
+            "-g3",
             "-ffunction-sections",
             "-fdata-sections",
             f"-I{AGENT_SRC}",
             f"-I{BUILD_DIR}",
             f"-I{AGENT_SRC / 'devkit'}",
-            str(AGENT_SRC / "puppy.c"),
-            str(AGENT_SRC / "devkit" / "libfrida-gum.a"),
+            str(AGENT_SRC / "coyote.c"),
+            str(AGENT_SRC / "puppyc.c"),
+            str(AGENT_SRC / "puppyjs.c"),
+            str(AGENT_SRC / "devkit" / "libfrida-gumjs.a"),
             "-o",
             str(output_so),
             "-Wl,--gc-sections",
@@ -228,6 +288,8 @@ class Coyote:
             "-lm",
             "-llog",
             "-pthread",
+            "-lc++_static",
+            "-lc++abi",
         ]
 
         self._exec(compile_cmd, desc=f"NDK Shared Library Compilation ({target_info['devkit']})")
@@ -239,21 +301,17 @@ class Coyote:
         return output_so
 
     def launch_target_app(self, so_path: Path):
-        """Pushes libpuppy.so and libc++_shared.so into target app private data directory and launches package via wrap property."""
+        """Pushes libcoyote.so and libc++_shared.so into target app private data directory and launches package via wrap property."""
 
-        target_info = detect_device_abi()
-
-        temp_so = "/data/local/tmp/libpuppy.so"
+        temp_so = "/data/local/tmp/libcoyote.so"
         app_dir = f"/data/data/{self.package_name}"
-        target_so = f"{app_dir}/libpuppy.so"
+        target_so = f"{app_dir}/libcoyote.so"
 
         self._exec(["adb", "push", str(so_path), temp_so], desc="ADB Push to Staging")
 
         print(f"[+] Moving agent into SELinux-compliant path: {target_so}")
         self._exec(["adb", "shell", f"su 0 cp {temp_so} {target_so}"], desc="Copy to App Dir")
 
-        # Fix Ownership & SELinux Security Context
-        # Resolves app UID/GID dynamically and applies app_data_file SELinux label
         fix_perms_cmd = (
             f"su 0 sh -c '"
             f"APP_UID=$(stat -c %u {app_dir}); "
@@ -282,7 +340,7 @@ class Coyote:
         print(f"[+] wrap.{self.package_name} removed and process terminated.")
 
 def update_frida_devkit(arch: str | None = None):
-    """Fetches and extracts the latest Frida-Gum DevKit for specified architecture (auto-detects via ADB if omitted)."""
+    """Fetches and extracts the latest Frida-GumJS DevKit for specified architecture (auto-detects via ADB if omitted)."""
 
     if not arch or arch == "auto":
         device_info = detect_device_abi()
@@ -302,7 +360,7 @@ def update_frida_devkit(arch: str | None = None):
     print(f"[+] Latest Frida version identified: {tag_name}")
     
     target_asset = None
-    prefix = f"frida-gum-devkit-{tag_name}-{platform_target}.tar.xz"
+    prefix = f"frida-gumjs-devkit-{tag_name}-{platform_target}.tar.xz"
     
     for asset in release_data.get("assets", []):
         if asset["name"] == prefix:
@@ -327,13 +385,13 @@ def update_frida_devkit(arch: str | None = None):
             tar.extractall(path=DEVKIT_DIR)
         
     archive_path.unlink()
-    print("[+] Frida-Gum DevKit updated successfully.")
+    print("[+] Frida-GumJS DevKit updated successfully.")
 
 def ensure_devkit(requested_arch: str | None = None):
     """Verifies DevKit files exist. Downloads them if missing or explicitly requested."""
 
-    header_file = DEVKIT_DIR / "frida-gum.h"
-    lib_file = DEVKIT_DIR / "libfrida-gum.a"
+    header_file = DEVKIT_DIR / "frida-gumjs.h"
+    lib_file = DEVKIT_DIR / "libfrida-gumjs.a"
 
     if requested_arch:
         update_frida_devkit(requested_arch)
@@ -342,7 +400,7 @@ def ensure_devkit(requested_arch: str | None = None):
     if header_file.is_file() and lib_file.is_file():
         return
 
-    print("\n[!] Frida-Gum DevKit missing from agent_src/devkit/")
+    print("\n[!] Frida-GumJS DevKit missing from agent_src/devkit/")
 
     print("[+] Attempting to auto-detect target device ABI via ADB...")
     try:
@@ -418,14 +476,16 @@ def parse_args():
         choices=["auto", "arm", "arm64", "x86", "x86_64"],
         nargs="?",
         const="auto",
-        help="Fetch latest Frida-Gum DevKit for specified architecture (auto-detects via ADB if omitted).",
+        help="Fetch latest Frida-GumJS DevKit for specified architecture (auto-detects via ADB if omitted).",
     )
 
     return parser.parse_args()
 
-
 def main():
     args = parse_args()
+
+    if args.skip_deploy:
+        args.skip_adb = True
 
     print("════════════════════════════════════════════════════")
     print("                       COYOTE                       ")
@@ -456,6 +516,7 @@ def main():
     if args.profile:
         orchestrator.generate_c_header()
         ensure_devkit()
+        orchestrator.compile_js()
         agent_so = orchestrator.compile_agent()
 
         if not args.skip_deploy:
