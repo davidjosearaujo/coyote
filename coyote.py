@@ -427,8 +427,15 @@ class Coyote:
 
 def capture_profile(output_path: str):
     """Captures a device profile from a connected real device via ADB and writes
-    it as a Coyote profile JSON ready to edit. Best-effort: fields that can't be
-    read are simply omitted."""
+    it as a Coyote profile JSON ready to edit.
+
+    Device *facts* (build, specs, properties, GPU/CPU, network, Wi-Fi, accounts)
+    are read from the device. Sections that are policy/fabricated rather than
+    readable (`bypass`, `attribution`, and the synthetic parts of `identity`) are
+    filled with sensible auto-generated values so the output is complete and
+    usable as-is. Everything should still be reviewed before use."""
+    import random
+
     print("\n[+] Capturing device profile over ADB...")
 
     def sh(cmd: str) -> str:
@@ -437,6 +444,11 @@ def capture_profile(output_path: str):
             return out.decode(errors="replace").strip()
         except Exception:
             return ""
+
+    def rand_mac() -> str:
+        # Locally-administered, unicast first octet (02/06/0a/0e).
+        octets = [random.choice([0x02, 0x06, 0x0A, 0x0E])] + [random.randint(0, 255) for _ in range(5)]
+        return ":".join(f"{b:02x}" for b in octets)
 
     # --- All system properties ---
     props: dict[str, str] = {}
@@ -452,8 +464,19 @@ def capture_profile(output_path: str):
     def p(key: str, default: str = "") -> str:
         return props.get(key, default)
 
-    # --- device_profile (Build.* identity) ---
+    generated: list[str] = []  # sections/fields we synthesized rather than read
+
+    # --- device_profile (Build.* identity, GPU/CPU, keyboard) ---
+    gl_vendor = gl_renderer = gl_version = ""
+    mgl = re.search(r"GLES:\s*([^,]+),\s*([^,]+),\s*(.+)", sh("dumpsys SurfaceFlinger | grep -i GLES"))
+    if mgl:
+        gl_vendor, gl_renderer, gl_version = (g.strip() for g in mgl.groups())
+    cpu_info = sh("cat /proc/cpuinfo")
+    keyboard = sh("settings get secure default_input_method")
+
     device_profile = {
+        "profile_id": f"{p('ro.product.brand')}-{p('ro.product.model')}".lower().replace(" ", "-").strip("-"),
+        "marketing_name": p("ro.product.model"),
         "model": p("ro.product.model"),
         "device": p("ro.product.device"),
         "board": p("ro.product.board"),
@@ -469,14 +492,25 @@ def capture_profile(output_path: str):
         "tags": p("ro.build.tags"),
         "serial": p("ro.serialno"),
         "type": p("ro.build.type"),
+        "user": p("ro.build.user"),
+        "arch": p("ro.product.cpu.abi"),
+        "baseband": p("gsm.version.baseband"),
+        "characteristics": p("ro.build.characteristics"),
+        "flavor": p("ro.build.flavor"),
         "incremental": p("ro.build.version.incremental"),
+        "build_date": p("ro.build.date"),
+        "build_date_utc": p("ro.build.date.utc"),
         "security_patch": p("ro.build.version.security_patch"),
         "soc_model": p("ro.soc.model"),
-        "build_date_utc": p("ro.build.date.utc"),
+        "gl_vendor": gl_vendor,
+        "gl_renderer": gl_renderer,
+        "gl_version": gl_version,
+        "keyboard": keyboard if keyboard and keyboard != "null" else "",
+        "cpu_info": cpu_info,
     }
     device_profile = {k: v for k, v in device_profile.items() if v}
 
-    # --- specs (display / memory / storage / battery) ---
+    # --- specs (display / memory / storage / battery / swap) ---
     specs: dict = {}
     m = re.search(r"Physical size:\s*(\d+)x(\d+)", sh("wm size"))
     if m:
@@ -488,9 +522,12 @@ def capture_profile(output_path: str):
         specs["DENSITY"] = f"{dpi / 160.0}f"
         specs["XDPI"] = specs["YDPI"] = f"{float(dpi)}f"
     for line in sh("cat /proc/meminfo").splitlines():
-        mm = re.match(r"(MemTotal|MemAvailable):\s*(\d+)\s*kB", line)
+        mm = re.match(r"(MemTotal|MemAvailable|SwapTotal):\s*(\d+)\s*kB", line)
         if mm:
-            specs["TOTAL_RAM" if mm.group(1) == "MemTotal" else "AVAIL_RAM"] = int(mm.group(2)) * 1024
+            if mm.group(1) == "SwapTotal":
+                specs["SWAP_TOTAL_KB"] = int(mm.group(2))
+            else:
+                specs["TOTAL_RAM" if mm.group(1) == "MemTotal" else "AVAIL_RAM"] = int(mm.group(2)) * 1024
     df = sh("df /data")
     md = re.search(r"\s(\d+)\s+(\d+)\s+(\d+)\s+\d+%", df)
     if md:  # columns: 1K-blocks used available
@@ -499,40 +536,120 @@ def capture_profile(output_path: str):
     mb = re.search(r"level:\s*(\d+)", sh("dumpsys battery"))
     if mb:
         specs["BATTERY_LEVEL"] = int(mb.group(1))
+    if "TOTAL_RAM" in specs:  # derived (not directly readable): ~5% low-memory threshold
+        specs["RAM_THRESHOLD"] = int(specs["TOTAL_RAM"] * 0.05)
+        generated.append("specs.RAM_THRESHOLD (derived)")
 
-    # --- telecom (best-effort from gsm.* props) ---
+    # --- telecom (gsm.* props + locale/timezone; auto-fill the rest) ---
+    SIM_STATES = {"ABSENT": 1, "PIN_REQUIRED": 2, "PUK_REQUIRED": 3, "NETWORK_LOCKED": 4, "READY": 5}
     telecom: dict = {}
     numeric = p("gsm.operator.numeric")
     if len(numeric) >= 5:
         telecom["mcc"], telecom["mnc"] = numeric[:3], numeric[3:]
     if p("gsm.operator.alpha"):
         telecom["operator_name"] = p("gsm.operator.alpha")
-    if p("gsm.operator.iso-country"):
-        telecom["country_iso"] = p("gsm.operator.iso-country")
+    iso = p("gsm.operator.iso-country")
+    if iso:
+        telecom["country_iso"] = iso
+    locale = p("persist.sys.locale") or p("ro.product.locale")
+    if "-" in locale:
+        telecom["language"] = locale.split("-")[0]
+    if p("persist.sys.timezone"):
+        telecom["timezone_id"] = p("persist.sys.timezone")
+    sim_state = p("gsm.sim.state").split(",")[0].strip().upper()
+    if sim_state in SIM_STATES:
+        telecom["sim_state"] = sim_state
+        telecom["sim_state_num"] = SIM_STATES[sim_state]
+    # Not device-readable without privileged APIs — synthesize plausible values.
+    if telecom:
+        telecom.setdefault("network_type", "LTE")
+        telecom.setdefault("imei_prefix", "35")
+        generated.append("telecom.network_type/imei_prefix (synthesized)")
 
-    # --- system_prop: a curated, anti-emulator-relevant subset of real values ---
-    CAPTURE_KEYS = [
-        "ro.product.model", "ro.product.brand", "ro.product.manufacturer",
-        "ro.product.device", "ro.product.name", "ro.product.board",
-        "ro.product.cpu.abilist", "ro.hardware", "ro.board.platform",
-        "ro.build.fingerprint", "ro.build.id", "ro.build.display.id",
-        "ro.build.type", "ro.build.tags", "ro.build.flavor", "ro.build.version.incremental",
-        "ro.build.description", "ro.build.host", "ro.build.user",
-        "ro.bootloader", "ro.serialno", "ro.boot.serialno",
-        "ro.boot.hardware", "ro.boot.hardware.platform", "ro.soc.model",
-        "ro.kernel.qemu", "ro.boot.qemu", "ro.build.characteristics",
-        "ro.debuggable", "ro.secure", "ro.adb.secure", "ro.build.selinux",
-        "ro.boot.verifiedbootstate", "ro.boot.flash.locked", "ro.warranty_bit",
-        "ro.sf.lcd_density", "gsm.version.baseband", "gsm.operator.numeric",
-        "gsm.operator.alpha", "gsm.operator.iso-country", "persist.sys.timezone",
-        "persist.sys.locale",
-    ]
-    system_prop = {k: props[k] for k in CAPTURE_KEYS if k in props}
+    # --- network (local IPs + active transport heuristic) ---
+    network: dict = {}
+    mobile_ip = wifi_ip = ""
+    for line in sh("ip -o -4 addr show").splitlines():
+        mi = re.search(r"\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)", line)
+        if not mi:
+            continue
+        iface, ip = mi.group(1), mi.group(2)
+        if iface.startswith("wlan"):
+            wifi_ip = ip
+        elif iface.startswith("rmnet") or iface.startswith("ccmni"):
+            mobile_ip = ip
+    if wifi_ip:
+        network["wifi_local_ip"] = wifi_ip
+    if mobile_ip:
+        network["mobile_data_local_ip"] = mobile_ip
+    network["net_type"] = 1 if wifi_ip else 0  # 1 = Wi-Fi, 0 = mobile
+
+    # --- identity (capture Wi-Fi/account; auto-generate what can't be read) ---
+    identity: dict = {}
+    mssid = re.search(r'SSID:\s*"?([^",\n]+)"?', sh("cmd wifi status"))
+    if mssid and mssid.group(1).strip() not in ("", "<unknown ssid>", "<none>"):
+        identity["wifi_ssid"] = mssid.group(1).strip()
+    else:
+        identity["wifi_ssid"] = random.choice(["HomeWiFi", "NETGEAR", "TP-Link_", "Linksys"]) + str(random.randint(10, 99))
+        generated.append("identity.wifi_ssid (synthesized)")
+    # BSSID/MAC are randomized/redacted on modern Android — synthesize.
+    identity["wifi_bssid"] = rand_mac()
+    identity["wifi_mac"] = rand_mac()
+    macc = re.search(r"name=([^\s,}]+@[^\s,}]+)", sh("dumpsys account"))
+    if macc:
+        identity["account_email"] = macc.group(1)
+    else:
+        identity["account_email"] = f"{random.choice(['alex','sam','jordan','taylor','casey'])}.{random.choice(['lee','khan','silva','jones'])}{random.randint(1, 99)}@gmail.com"
+        generated.append("identity.account_email (synthesized)")
+    identity["account_type"] = "com.google"
+    generated.append("identity.wifi_bssid/wifi_mac (synthesized)")
+
+    # --- bypass / attribution: policy & fabricated — auto-generated defaults ---
+    bypass = {"flag_secure": 1}
+    attribution = {
+        "facebook_app_id": "",
+        "af_status": "Organic",
+        "campaign": "",
+        "install_referrer": "utm_source=google-play&utm_medium=organic",
+        "install_package": "com.android.vending",
+    }
+    generated.append("bypass + attribution (auto-generated defaults)")
+
+    # --- system_prop: the detection-relevant keys present on the device ---
+    PROP_PREFIXES = (
+        "ro.product.", "ro.build.", "ro.boot.", "ro.vendor.", "ro.odm.",
+        "ro.system.", "ro.system_ext.", "ro.boottime.", "init.svc.", "init.svc_debug_pid.",
+        "ro.lineage", "ro.product.vendor", "gsm.",
+    )
+    PROP_EXACT = {
+        "ro.hardware", "ro.board.platform", "ro.soc.model", "ro.serialno",
+        "ro.bootloader", "ro.debuggable", "ro.secure", "ro.adb.secure",
+        "ro.kernel.qemu", "ro.warranty_bit", "ro.crypto.state", "ro.sf.lcd_density",
+        "ro.modversion", "sys.oem_unlock_allowed", "vendor.sys.slpi.firmware.version",
+        "persist.sys.timezone", "persist.sys.locale", "persist.sys.language",
+        "persist.sys.usb.config", "sys.usb.config", "sys.usb.state", "sys.usb.ffs.ready",
+        "service.adb.root", "service.adb.tcp.port", "http.proxyHost",
+        "qemu.sf.lcd_density",
+    }
+
+    def wanted(k: str) -> bool:
+        if k in PROP_EXACT:
+            return True
+        if k.startswith(PROP_PREFIXES):
+            # skip obviously non-detection noise
+            return not k.endswith(".enable_iorap") and "fingerprintd" not in k
+        return k.startswith("qemu.") or "verifiedboot" in k or "flash.locked" in k
+
+    system_prop = {k: v for k, v in sorted(props.items()) if wanted(k)}
 
     profile = {
         "telecom": telecom,
+        "bypass": bypass,
         "device_profile": device_profile,
         "specs": specs,
+        "network": network,
+        "attribution": attribution,
+        "identity": identity,
         "system_prop": system_prop,
     }
     profile = {k: v for k, v in profile.items() if v}
@@ -541,7 +658,12 @@ def capture_profile(output_path: str):
         json.dump(profile, f, indent=2)
 
     print(f"[+] Wrote captured profile to {output_path}")
-    print("    Review/edit it before use — telecom and identity fields are best-effort.")
+    print(f"    Captured {len(system_prop)} system properties and "
+          f"{len(device_profile)} device fields.")
+    if generated:
+        print("    Auto-generated (review these — not read from the device):")
+        for g in generated:
+            print(f"      - {g}")
 
 
 def update_frida_devkit(arch: str | None = None):

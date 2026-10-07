@@ -280,7 +280,7 @@ This builds a `libcoyote.so` tailored to `<profile.json>`, injects it into
 | `--debug` | Build with logging enabled (native `LOGI`/`LOGE` + JS `console`). **Default (release) builds are silent** and carry fewer identifying strings. |
 | `--js-all-processes` | Run the JS/Java layer in **every** forked process of the package. Default runs it only in the main UI process (native hooks still apply everywhere). Use for a target that detects in a sub-process. |
 | `--recon` | Build in **recon mode**: log every intercepted probe (property reads, `getprop`, `ptrace`, installer, accounts, Wi-Fi, sensors) under the `[CoyoteRecon]` / `[RECON]` tags so you can see what the target checks. Independent of `--debug`. |
-| `--capture OUT.json` | Capture a device profile from a connected **real** device via ADB, write it to `OUT.json`, then exit. Review/edit before use. |
+| `--capture OUT.json` | Capture a **complete** profile from a connected **real** device via ADB — device facts read directly, non-readable sections (`bypass`, `attribution`, synthetic `identity` fields) auto-generated to plausible values — write it to `OUT.json`, then exit. It prints which fields were synthesized; review before use. |
 | `--skip-adb` | Build the library but don't push writable `setprop`s to the device. |
 | `--skip-deploy` | Compile only; don't push or launch (implies `--skip-adb`). |
 
@@ -315,9 +315,23 @@ python coyote.py -t com.suspicious.app --reset-target
 
 ```bash
 python coyote.py --capture my_device.json        # reads a connected real phone
-# edit my_device.json as needed, then:
+# review my_device.json (esp. auto-generated fields), then:
 python coyote.py -p my_device.json -t com.suspicious.app
 ```
+
+`--capture` produces a **complete** profile (all sections) in two ways:
+
+- **Read from the device** — `device_profile` (incl. `cpu_info`, GPU strings,
+  keyboard), `specs` (display/RAM/storage/battery/swap), `telecom`
+  (MCC/MNC/operator/ISO, locale, timezone, SIM state), `network` (local IPs,
+  active transport), Wi-Fi SSID / account email where available, and the
+  detection-relevant `system_prop` keys present on the device.
+- **Auto-generated** (not readable off a device, so synthesized to plausible
+  values) — `bypass` (`flag_secure`), `attribution` (Play install source/
+  referrer), `telecom.network_type`/`imei_prefix`, `specs.RAM_THRESHOLD`
+  (derived), and `identity.wifi_bssid`/`wifi_mac` plus `wifi_ssid`/
+  `account_email` when they can't be read. The command prints exactly which
+  fields were synthesized so you can review them.
 
 **See what a target probes (recon mode):**
 
