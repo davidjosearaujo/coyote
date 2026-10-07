@@ -1254,13 +1254,13 @@ function waitForJava() {
                 clearInterval(interval);
                 console.log('[+] JSAgent: Java.available === true at attempt ' + attempts);
 
-                // Do NOT call Java.perform() yet. At this point the app's
-                // Application has not been bound, so perform() would install
-                // hooks on ActivityThread.handleBindApplication to gate on it,
-                // deadlocking the main thread that is running that very method.
-                // Wait until currentApplication() is non-null first; then
-                // perform() runs immediately with no bootstrap hooks.
-                waitForApplication(Java);
+                // In-process spawn-gating: arm a hook on the main-thread
+                // lifecycle method that runs just before the first activity's
+                // onCreate, and install the spoofing hooks from there (on the
+                // main thread, so no cross-thread suspend-all deadlock). This
+                // gets hooks in before onCreate reads anything, on first launch,
+                // with no frida-server. Falls back to waitForApplication.
+                installGate(Java);
                 return;
             }
 
@@ -1281,6 +1281,46 @@ function waitForJava() {
             console.error('[!] JSAgent: FATAL - Java never initialized after 300 seconds');
         }
     }, 50);
+}
+
+// In-process spawn-gating. Instrument android.app.Instrumentation.callActivity-
+// OnCreate — the framework method invoked on the MAIN thread immediately before
+// every Activity's onCreate. Installing this single hook early is safe (the
+// main thread is not executing it yet). When it fires for the first activity we
+// run onJavaReady() *on the main thread*, so all the value-spoofing hooks land
+// before onCreate reads anything, and there is no cross-thread ART suspend-all
+// to deadlock against. performNow() runs immediately (no bridge deferral), so
+// the gate is armed without waiting for the Application to bind.
+function installGate(Java) {
+    let hooksInstalled = false;
+
+    const runOnce = function () {
+        if (hooksInstalled) return;
+        hooksInstalled = true;
+        console.log('[+] JSAgent: gate fired on main thread; installing hooks before onCreate');
+        try {
+            onJavaReady(Java);
+        } catch (e) {
+            console.error('[!] JSAgent: onJavaReady error: ' + e);
+        }
+    };
+
+    try {
+        Java.performNow(function () {
+            const Instrumentation = Java.use('android.app.Instrumentation');
+            const overloads = Instrumentation.callActivityOnCreate.overloads;
+            overloads.forEach(function (ov) {
+                ov.implementation = function () {
+                    runOnce();                       // install hooks first...
+                    return ov.apply(this, arguments); // ...then let onCreate run
+                };
+            });
+            console.log('[+] JSAgent: gate armed on Instrumentation.callActivityOnCreate (' + overloads.length + ' overload(s))');
+        });
+    } catch (e) {
+        console.error('[!] JSAgent: failed to arm gate (' + e.toString() + '); falling back to waitForApplication');
+        waitForApplication(Java);
+    }
 }
 
 // Poll until the app's Application object exists. performNow() only *reads*

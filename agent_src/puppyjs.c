@@ -49,9 +49,6 @@ void apply_gumjs_hooks() {
     g_main_context_push_thread_default(context);
     main_loop = g_main_loop_new(context, FALSE);
     
-    /* Use QuickJS: the V8 backend typically returns NULL in the embedded
-     * gumjs build on Android (no startup snapshot), which silently prevents
-     * the script from ever loading. QJS is what the devkit example uses. */
     GumScriptBackend *backend = gum_script_backend_obtain_qjs();
     if (backend == NULL) {
         LOGE("Failed to obtain script backend; aborting GumJS hooks.");

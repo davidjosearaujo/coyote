@@ -289,7 +289,6 @@ static int hook_posix_spawn(pid_t *pid, const char *path,
                            const posix_spawn_file_actions_t *file_actions,
                            const posix_spawnattr_t *attrp,
                            char *const argv[], char *const envp[]) {
-    LOGI("PuppyC DBG posix_spawn: path=%s a0=%s a1=%s", path?path:"(null)", (argv&&argv[0])?argv[0]:"(null)", (argv&&argv[1])?argv[1]:"(null)");
     if (is_root_check_cmd(path, argv)) {
         LOGI("PuppyC blocked root check (posix_spawn): %s", path);
         char *fake_argv[] = {"/system/bin/echo", NULL};
@@ -316,7 +315,6 @@ static int hook_posix_spawnp(pid_t *pid, const char *path,
                             const posix_spawn_file_actions_t *file_actions,
                             const posix_spawnattr_t *attrp,
                             char *const argv[], char *const envp[]) {
-    LOGI("PuppyC DBG posix_spawnp: path=%s a0=%s a1=%s", path?path:"(null)", (argv&&argv[0])?argv[0]:"(null)", (argv&&argv[1])?argv[1]:"(null)");
     if (is_root_check_cmd(path, argv)) {
         LOGI("PuppyC blocked root check (posix_spawn): %s", path);
         char *fake_argv[] = {"echo", NULL};
@@ -349,10 +347,6 @@ static int hook_execve(const char *path, char *const argv[], char *const envp[])
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
-            // This hook runs in a just-fork()ed child of a multithreaded
-            // process, where malloc/stdio are unsafe (they crash the exec ->
-            // IOException). Exec `echo <val>` directly with argv pointing at
-            // the static mock string: no snprintf, no malloc, async-safe.
             char *fake_argv[] = {"echo", (char *)mock_val, NULL};
             return orig_execve("/system/bin/echo", fake_argv, envp);
         }
@@ -369,7 +363,6 @@ static int hook_execv(const char *path, char *const argv[]) {
         LOGI("PuppyC blocked root check (execv): %s", path);
         char *fake_argv[] = {"/system/bin/echo", NULL};
         char **new_envp = build_preloaded_envp(NULL);
-        // Upgraded to execve to support passing the modified envp
         int res = orig_execve("/system/bin/echo", fake_argv, new_envp);
         free_preloaded_envp(new_envp, NULL);
         return res;
@@ -378,7 +371,6 @@ static int hook_execv(const char *path, char *const argv[]) {
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
-            // See hook_execve: async-safe echo, no malloc/stdio.
             char *fake_argv[] = {"echo", (char *)mock_val, NULL};
             return orig_execve("/system/bin/echo", fake_argv, environ);
         }
@@ -395,7 +387,6 @@ static int hook_execvp(const char *path, char *const argv[]) {
         LOGI("PuppyC blocked root check (execvp): %s", path);
         char *fake_argv[] = {"echo", NULL};
         char **new_envp = build_preloaded_envp(NULL);
-        // Upgraded to execvpe to support passing the modified envp
         int res = orig_execvpe("echo", fake_argv, new_envp);
         free_preloaded_envp(new_envp, NULL);
         return res;
@@ -404,7 +395,6 @@ static int hook_execvp(const char *path, char *const argv[]) {
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
-            // See hook_execve: async-safe echo, no malloc/stdio.
             char *fake_argv[] = {"echo", (char *)mock_val, NULL};
             return orig_execve("/system/bin/echo", fake_argv, environ);
         }
@@ -429,7 +419,6 @@ static int hook_execvpe(const char *path, char *const argv[], char *const envp[]
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
-            // See hook_execve: async-safe echo, no malloc/stdio.
             char *fake_argv[] = {"echo", (char *)mock_val, NULL};
             return orig_execve("/system/bin/echo", fake_argv, envp);
         }
@@ -679,11 +668,9 @@ static void hook_vkGetPhysicalDeviceProperties(void* physicalDevice, void* pProp
         real_vkGetPhysicalDeviceProperties(physicalDevice, pProperties);
         
         if (pProperties) {
-            // Offset 8: vendorID (0x5143 = Qualcomm)
             uint32_t *vendorID = (uint32_t *)((char *)pProperties + 8);
             *vendorID = 0x5143; 
             
-            // Offset 20: deviceName (char[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE])
             char *deviceName = (char *)pProperties + 20;
             strncpy(deviceName, DEVICE_GL_RENDERER, 255);
             deviceName[255] = '\0';
@@ -696,7 +683,6 @@ static PFN_vkVoidFunction hook_vkGetInstanceProcAddr(void* instance, const char*
     
     if (pName != NULL && strcmp(pName, "vkGetPhysicalDeviceProperties") == 0) {
         if (real_func != NULL) {
-            // Save the real function pointer and return ours instead
             real_vkGetPhysicalDeviceProperties = (VkGetPhysicalDevicePropertiesFunc)real_func;
             return (PFN_vkVoidFunction)hook_vkGetPhysicalDeviceProperties;
         }
