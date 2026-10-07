@@ -15,6 +15,8 @@
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
+#include <time.h>
+#include <errno.h>
 
 #include <android/log.h>
 #include <android/native_window.h>
@@ -44,6 +46,14 @@
 #define LOGE(...) ((void)0)
 #endif
 
+// Recon logging is independent of debug/release: in recon builds it records the
+// probes the target makes (under its own tag) regardless of COYOTE_DEBUG.
+#ifdef COYOTE_RECON
+#define RLOG(...) __android_log_print(ANDROID_LOG_INFO, "[CoyoteRecon]", __VA_ARGS__)
+#else
+#define RLOG(...) ((void)0)
+#endif
+
 typedef int (*SystemPropertyGetFunc)(const char *name, char *value);
 typedef void (*PropReadCallback)(void *cookie, const char *name, const char *value, uint32_t serial);
 typedef void (*SystemPropertyReadCallbackFunc)(const prop_info *pi, PropReadCallback callback, void *cookie);
@@ -70,6 +80,7 @@ typedef int (*ExecveFunc)(const char *path, char *const argv[], char *const envp
 typedef int (*ExecvpeFunc)(const char *path, char *const argv[], char *const envp[]);
 
 typedef int (*OpenatFunc)(int dirfd, const char *path, int flags, int mode);
+typedef int (*OpenFunc)(const char *path, int flags, int mode);
 
 typedef const char *(*GlGetStringFunc)(unsigned int name);
 
@@ -95,6 +106,10 @@ static ExecveFunc orig_execve = NULL;
 static ExecvpeFunc orig_execvpe = NULL;
 
 static OpenatFunc orig_openat = NULL;
+static OpenFunc orig_open = NULL;
+
+typedef long (*PtraceFunc)(int request, pid_t pid, void *addr, void *data);
+static PtraceFunc orig_ptrace = NULL;
 
 static GlGetStringFunc orig_glGetString = NULL;
 #define GL_VENDOR   0x1F00
@@ -177,6 +192,7 @@ static const char* get_mocked_prop_value(const char *key) {
 static int hook_system_property_get(const char *name, char *value) {
     if (name != NULL && value != NULL) {
         const char *mock_val = get_mocked_prop_value(name);
+        RLOG("prop_get %s%s", name, mock_val != NULL ? " [spoofed]" : "");
         if (mock_val != NULL) {
             strlcpy(value, mock_val, PROP_VALUE_MAX);
             return (int)strlen(value);
@@ -260,6 +276,30 @@ static int is_root_check_cmd(const char *path, char *const argv[]) {
         }
     }
     
+    return 0;
+}
+
+// Paths whose mere existence reveals root/Magisk/instrumentation. Root detection
+// overwhelmingly works by probing these with File.exists()/access()/stat(), so
+// the file-op hooks below report ENOENT for them. The su binary is matched by
+// full known paths (not a bare "su" substring) to avoid false positives; the
+// distinctive tokens are safe as substrings.
+static int is_hidden_path(const char *path) {
+    if (!path) return 0;
+    static const char *hidden[] = {
+        "/system/xbin/su", "/system/bin/su", "/sbin/su", "/su/bin/su",
+        "/vendor/bin/su", "/system/sbin/su", "/data/local/bin/su",
+        "/data/local/xbin/su", "/data/local/su", "/magisk/.core/bin/su",
+        "/system/app/Superuser", "/system/app/SuperSU",
+        "/sbin/.magisk", "/data/adb/magisk", "/data/adb/modules",
+        "/data/adb/ksu", "/dev/.magisk", "/cache/.disable_magisk",
+        "/init.magisk.rc", "/system/etc/init/magisk",
+        "magisk", "busybox", "superuser", "frida", "xposed", "/re.frida",
+        NULL
+    };
+    for (int i = 0; hidden[i] != NULL; i++) {
+        if (strstr(path, hidden[i]) != NULL) return 1;
+    }
     return 0;
 }
 
@@ -513,11 +553,61 @@ static int hook_statvfs64(const char *path, struct statvfs64 *buf) {
 static int get_intercepted_fd(const char *path);
 
 static int hook_openat(int dirfd, const char *path, int flags, int mode) {
+    if (is_hidden_path(path)) {
+        RLOG("hide openat %s", path);
+        errno = ENOENT;
+        return -1;
+    }
     int fake_fd = get_intercepted_fd(path);
     if (fake_fd >= 0) {
         return fake_fd;
     }
     return orig_openat(dirfd, path, flags, mode);
+}
+
+// bionic's open() goes straight to the openat syscall rather than the libc
+// openat() function we hook above, so a Java FileInputStream/FileReader (which
+// uses open()) would bypass the /proc/* interception. Hook open() as well.
+static int hook_open(const char *path, int flags, int mode) {
+    if (is_hidden_path(path)) {
+        RLOG("hide open %s", path);
+        errno = ENOENT;
+        return -1;
+    }
+    int fake_fd = get_intercepted_fd(path);
+    if (fake_fd >= 0) {
+        return fake_fd;
+    }
+    return orig_open(path, flags, mode);
+}
+
+// File-existence probes used by root detection: access()/faccessat() (what
+// java.io.File.exists() calls) and stat()/lstat() (File.isFile/isDirectory).
+// Report ENOENT for hidden paths; the stat buffer is never touched, so its
+// layout is irrelevant (declared void* to avoid depending on struct stat).
+typedef int (*AccessFunc)(const char *path, int mode);
+typedef int (*FaccessatFunc)(int dirfd, const char *path, int mode, int flags);
+typedef int (*StatFunc)(const char *path, void *buf);
+static AccessFunc orig_access = NULL;
+static FaccessatFunc orig_faccessat = NULL;
+static StatFunc orig_stat = NULL;
+static StatFunc orig_lstat = NULL;
+
+static int hook_access(const char *path, int mode) {
+    if (is_hidden_path(path)) { RLOG("hide access %s", path); errno = ENOENT; return -1; }
+    return orig_access(path, mode);
+}
+static int hook_faccessat(int dirfd, const char *path, int mode, int flags) {
+    if (is_hidden_path(path)) { RLOG("hide faccessat %s", path); errno = ENOENT; return -1; }
+    return orig_faccessat(dirfd, path, mode, flags);
+}
+static int hook_stat(const char *path, void *buf) {
+    if (is_hidden_path(path)) { RLOG("hide stat %s", path); errno = ENOENT; return -1; }
+    return orig_stat(path, buf);
+}
+static int hook_lstat(const char *path, void *buf) {
+    if (is_hidden_path(path)) { RLOG("hide lstat %s", path); errno = ENOENT; return -1; }
+    return orig_lstat(path, buf);
 }
 
 static int create_memfd_with_data(const char *name, const char *data, size_t size) {
@@ -538,8 +628,87 @@ static int create_memfd_with_data(const char *name, const char *data, size_t siz
     return fd;
 }
 
+// Serve a copy of a mounts file (/proc/mounts, /proc/self/mounts|mountinfo) with
+// Magisk/root mount lines stripped, so root detection that scans the mount table
+// finds nothing. The real file is opened via the openat syscall directly to
+// bypass our own open/openat hooks (no recursion). Returns -1 on any failure so
+// the caller falls through to the real file.
+static int create_filtered_mounts_fd(const char *path) {
+    int rfd = (int) syscall(__NR_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
+    if (rfd < 0) return -1;
+
+    const size_t CAP = 65536;
+    char *raw = (char *) malloc(CAP);
+    char *out = (char *) malloc(CAP);
+    if (raw == NULL || out == NULL) {
+        free(raw); free(out); close(rfd);
+        return -1;
+    }
+
+    size_t total = 0;
+    ssize_t n;
+    while (total < CAP - 1 && (n = read(rfd, raw + total, CAP - 1 - total)) > 0) {
+        total += (size_t) n;
+    }
+    close(rfd);
+    raw[total] = '\0';
+
+    size_t olen = 0;
+    char *saveptr = NULL;
+    for (char *line = strtok_r(raw, "\n", &saveptr); line != NULL; line = strtok_r(NULL, "\n", &saveptr)) {
+        if (strstr(line, "magisk") || strstr(line, "/data/adb") ||
+            strstr(line, "kernelsu") || strstr(line, "KSU")) {
+            continue; // drop Magisk/KernelSU mount entries
+        }
+        size_t len = strlen(line);
+        if (olen + len + 1 < CAP) {
+            memcpy(out + olen, line, len);
+            olen += len;
+            out[olen++] = '\n';
+        }
+    }
+
+    int fd = create_memfd_with_data("mounts_fake", out, olen);
+    free(raw);
+    free(out);
+    return fd;
+}
+
 static int get_intercepted_fd(const char *path) {
     if (path == NULL) return -1;
+
+    if (strcmp(path, "/proc/mounts") == 0 ||
+        strcmp(path, "/proc/self/mounts") == 0 ||
+        strcmp(path, "/proc/self/mountinfo") == 0) {
+        int fd = create_filtered_mounts_fd(path);
+        if (fd >= 0) {
+            LOGI("PuppyC filtered Magisk mounts from %s", path);
+            RLOG("filter mounts %s", path);
+            return fd;
+        }
+    }
+
+    // Spoof /proc/uptime: emulators/fresh sandboxes report a tiny uptime, which
+    // is a common tell. Base it on the real boot clock + a constant offset so
+    // the device looks booted days ago and the value still advances naturally
+    // across reads. Done here (not by hooking the managed SystemClock) because
+    // those clocks are far too hot to wrap.
+    if (strcmp(path, "/proc/uptime") == 0) {
+        RLOG("open /proc/uptime [spoofed]");
+        struct timespec ts;
+        double up = 300000.0; // ~3.5 day fallback if the clock read fails
+        if (clock_gettime(CLOCK_BOOTTIME, &ts) == 0) {
+            up = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+        }
+        double spoof_up = up + (4.0 * 24 * 60 * 60); // +4 days
+        double spoof_idle = spoof_up * 3.7;          // plausible summed-core idle
+        char buf[64];
+        int len = snprintf(buf, sizeof(buf), "%.2f %.2f\n", spoof_up, spoof_idle);
+        if (len > 0) {
+            LOGI("PuppyC intercepted open for /proc/uptime");
+            return create_memfd_with_data("uptime_fake", buf, (size_t)len);
+        }
+    }
 
     #ifdef DEVICE_CPU_INFO
     if (strcmp(path, "/proc/cpuinfo") == 0) {
@@ -703,6 +872,19 @@ static PFN_vkVoidFunction hook_vkGetInstanceProcAddr(void* instance, const char*
 }
 #endif
 
+// Anti-debug neutralization. Apps commonly call ptrace(PTRACE_TRACEME) to detect
+// a debugger/instrumentation (it fails if the process is already being traced)
+// or to self-attach as a defense. Report success for TRACEME without actually
+// tracing, and pass everything else through.
+#define PT_TRACE_ME 0 // PTRACE_TRACEME
+static long hook_ptrace(int request, pid_t pid, void *addr, void *data) {
+    RLOG("ptrace request=%d", request);
+    if (request == PT_TRACE_ME) {
+        return 0;
+    }
+    return orig_ptrace(request, pid, addr, data);
+}
+
 void apply_native_gum_hooks() {
     LOGI("PuppyC waking up in the background... sniffing out environment.");
     GumInterceptor *interceptor = gum_interceptor_obtain();
@@ -733,6 +915,10 @@ void apply_native_gum_hooks() {
     if (t_execv)        gum_interceptor_replace(interceptor, t_execv,        GSIZE_TO_POINTER(hook_execv),        NULL,        NULL);
     if (t_execvp)       gum_interceptor_replace(interceptor, t_execvp,       GSIZE_TO_POINTER(hook_execvp),       NULL,       NULL);
     if (t_execvpe)      gum_interceptor_replace(interceptor, t_execvpe,      GSIZE_TO_POINTER(hook_execvpe),      (gpointer *)&orig_execvpe,      NULL);
+
+    // Anti-debug: neutralize ptrace(PTRACE_TRACEME)-based detection.
+    gpointer t_ptrace = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "ptrace"));
+    if (t_ptrace) gum_interceptor_replace(interceptor, t_ptrace, GSIZE_TO_POINTER(hook_ptrace), (gpointer *)&orig_ptrace, NULL);
     #endif
 
     #if defined(SPECS_WIDTH) || defined(SPECS_HEIGHT)
@@ -763,6 +949,19 @@ void apply_native_gum_hooks() {
     #if defined(DEVICE_CPU_INFO) || (defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB))
     gpointer target_openat = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "openat"));
     if (target_openat) gum_interceptor_replace(interceptor, target_openat, GSIZE_TO_POINTER(hook_openat), (gpointer *)&orig_openat, NULL);
+
+    gpointer target_open = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "open"));
+    if (target_open) gum_interceptor_replace(interceptor, target_open, GSIZE_TO_POINTER(hook_open), (gpointer *)&orig_open, NULL);
+
+    // Root/Magisk file-existence hiding.
+    gpointer target_access    = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "access"));
+    gpointer target_faccessat = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "faccessat"));
+    gpointer target_stat      = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "stat"));
+    gpointer target_lstat     = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "lstat"));
+    if (target_access)    gum_interceptor_replace(interceptor, target_access,    GSIZE_TO_POINTER(hook_access),    (gpointer *)&orig_access,    NULL);
+    if (target_faccessat) gum_interceptor_replace(interceptor, target_faccessat, GSIZE_TO_POINTER(hook_faccessat), (gpointer *)&orig_faccessat, NULL);
+    if (target_stat)      gum_interceptor_replace(interceptor, target_stat,      GSIZE_TO_POINTER(hook_stat),      (gpointer *)&orig_stat,      NULL);
+    if (target_lstat)     gum_interceptor_replace(interceptor, target_lstat,     GSIZE_TO_POINTER(hook_lstat),     (gpointer *)&orig_lstat,     NULL);
     #endif
 
     #if defined(DEVICE_GL_VENDOR) || defined(DEVICE_GL_RENDERER) || defined(DEVICE_GL_VERSION)

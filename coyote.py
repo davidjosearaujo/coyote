@@ -55,10 +55,12 @@ class Coyote:
         package_name: str = "test.target.app",
         debug: bool = False,
         js_all_processes: bool = False,
+        recon: bool = False,
     ):
         self.dry_run = dry_run
         self.debug = debug
         self.js_all_processes = js_all_processes
+        self.recon = recon
         self.api_level = api_level
         self.package_name = package_name
         self.ndk_path = Path(ndk_path) if ndk_path else None
@@ -75,6 +77,71 @@ class Coyote:
             sys.exit(1)
         with open(profile_file, "r") as f:
             return json.load(f)
+
+    def validate_profile(self) -> bool:
+        """Validates the loaded profile: section shapes, value types, and a few
+        cross-consistency checks. Hard errors abort the build; soft issues warn."""
+        print("\n[+] Validating profile...")
+
+        KNOWN_SECTIONS = {
+            "telecom", "bypass", "device_profile", "specs",
+            "network", "attribution", "identity", "system_prop",
+        }
+        # Keys that must be plain integers (emitted as unsigned long long bytes).
+        SIZE_KEYS = {"TOTAL_SPACE", "FREE_SPACE", "TOTAL_RAM", "AVAIL_RAM", "RAM_THRESHOLD"}
+
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        if not isinstance(self.profile, dict) or not self.profile:
+            print("[!] Profile is empty or not a JSON object.")
+            sys.exit(1)
+
+        for section in self.profile:
+            if section not in KNOWN_SECTIONS:
+                warnings.append(f"Unknown top-level section '{section}' (ignored by the build).")
+
+        for section in KNOWN_SECTIONS:
+            val = self.profile.get(section)
+            if val is not None and not isinstance(val, dict):
+                errors.append(f"Section '{section}' must be an object, got {type(val).__name__}.")
+
+        specs = self.profile.get("specs", {})
+        if isinstance(specs, dict):
+            for k in SIZE_KEYS:
+                if k in specs and not isinstance(specs[k], int):
+                    errors.append(f"specs.{k} must be an integer (bytes), got {type(specs[k]).__name__}.")
+            for k in ("WIDTH", "HEIGHT", "DENSITY_DPI", "BATTERY_LEVEL"):
+                if k in specs and not isinstance(specs[k], int):
+                    errors.append(f"specs.{k} must be an integer, got {type(specs[k]).__name__}.")
+
+        sysp = self.profile.get("system_prop", {})
+        if isinstance(sysp, dict):
+            for k, v in sysp.items():
+                if not isinstance(v, str):
+                    errors.append(f"system_prop['{k}'] must be a string, got {type(v).__name__}.")
+
+        # Cross-consistency: MCC+MNC vs the gsm.operator.numeric property.
+        tel = self.profile.get("telecom", {})
+        if isinstance(tel, dict) and isinstance(sysp, dict):
+            if "mcc" in tel and "mnc" in tel and "gsm.operator.numeric" in sysp:
+                expected = f"{tel['mcc']}{tel['mnc']}"
+                if sysp["gsm.operator.numeric"] != expected:
+                    warnings.append(
+                        f"telecom mcc+mnc ('{expected}') != system_prop['gsm.operator.numeric'] "
+                        f"('{sysp['gsm.operator.numeric']}') — a detector comparing them would notice."
+                    )
+
+        for w in warnings:
+            print(f"    [warn] {w}")
+        if errors:
+            for e in errors:
+                print(f"    [error] {e}")
+            print(f"[!] Profile validation failed with {len(errors)} error(s).")
+            sys.exit(1)
+
+        print(f"    [+] Profile OK ({len(warnings)} warning(s)).")
+        return True
 
     def _exec(self, cmd: list, desc: str = "") -> str:
         """Executes shell commands or prints them if dry_run is set."""
@@ -143,7 +210,8 @@ class Coyote:
             ("3. Device Identification & Build Metadata", "device_profile", "DEVICE_"),
             ("4. Hardware Metrics & Memory Space", "specs", "SPECS_"),
             ("5. Network Configuration", "network", "NETWORK_"),
-            ("6. Attribution & Install Tracking", "attribution", "ATTRIBUTION_")
+            ("6. Attribution & Install Tracking", "attribution", "ATTRIBUTION_"),
+            ("7. Identity & Accounts (Wi-Fi, accounts)", "identity", "IDENTITY_"),
         ]
 
         macro_count = 0
@@ -290,6 +358,8 @@ class Coyote:
             # Default: run the JS/Java layer only in the main process. This flag
             # forces it into every forked process of the package.
             *(["-DCOYOTE_JS_ALL_PROCESSES"] if self.js_all_processes else []),
+            # Recon mode: log intercepted probes regardless of debug/release.
+            *(["-DCOYOTE_RECON"] if self.recon else []),
             f"-I{AGENT_SRC}",
             f"-I{BUILD_DIR}",
             f"-I{AGENT_SRC / 'devkit'}",
@@ -354,6 +424,125 @@ class Coyote:
         self._exec(["adb", "shell", f"pm clear {self.package_name}"])
         
         print(f"[+] wrap.{self.package_name} removed and process terminated.")
+
+def capture_profile(output_path: str):
+    """Captures a device profile from a connected real device via ADB and writes
+    it as a Coyote profile JSON ready to edit. Best-effort: fields that can't be
+    read are simply omitted."""
+    print("\n[+] Capturing device profile over ADB...")
+
+    def sh(cmd: str) -> str:
+        try:
+            out = subprocess.check_output(["adb", "shell", cmd], stderr=subprocess.DEVNULL)
+            return out.decode(errors="replace").strip()
+        except Exception:
+            return ""
+
+    # --- All system properties ---
+    props: dict[str, str] = {}
+    for line in sh("getprop").splitlines():
+        m = re.match(r"\[(.*?)\]:\s*\[(.*?)\]$", line)
+        if m:
+            props[m.group(1)] = m.group(2)
+
+    if not props:
+        print("[!] Could not read properties over ADB. Is a device connected and authorized?")
+        sys.exit(1)
+
+    def p(key: str, default: str = "") -> str:
+        return props.get(key, default)
+
+    # --- device_profile (Build.* identity) ---
+    device_profile = {
+        "model": p("ro.product.model"),
+        "device": p("ro.product.device"),
+        "board": p("ro.product.board"),
+        "product": p("ro.product.name"),
+        "hardware": p("ro.hardware"),
+        "fingerprint": p("ro.build.fingerprint"),
+        "manufacturer": p("ro.product.manufacturer"),
+        "bootloader": p("ro.bootloader"),
+        "brand": p("ro.product.brand"),
+        "host": p("ro.build.host"),
+        "display": p("ro.build.display.id"),
+        "display_id": p("ro.build.id"),
+        "tags": p("ro.build.tags"),
+        "serial": p("ro.serialno"),
+        "type": p("ro.build.type"),
+        "incremental": p("ro.build.version.incremental"),
+        "security_patch": p("ro.build.version.security_patch"),
+        "soc_model": p("ro.soc.model"),
+        "build_date_utc": p("ro.build.date.utc"),
+    }
+    device_profile = {k: v for k, v in device_profile.items() if v}
+
+    # --- specs (display / memory / storage / battery) ---
+    specs: dict = {}
+    m = re.search(r"Physical size:\s*(\d+)x(\d+)", sh("wm size"))
+    if m:
+        specs["WIDTH"], specs["HEIGHT"] = int(m.group(1)), int(m.group(2))
+    m = re.search(r"Physical density:\s*(\d+)", sh("wm density"))
+    if m:
+        dpi = int(m.group(1))
+        specs["DENSITY_DPI"] = dpi
+        specs["DENSITY"] = f"{dpi / 160.0}f"
+        specs["XDPI"] = specs["YDPI"] = f"{float(dpi)}f"
+    for line in sh("cat /proc/meminfo").splitlines():
+        mm = re.match(r"(MemTotal|MemAvailable):\s*(\d+)\s*kB", line)
+        if mm:
+            specs["TOTAL_RAM" if mm.group(1) == "MemTotal" else "AVAIL_RAM"] = int(mm.group(2)) * 1024
+    df = sh("df /data")
+    md = re.search(r"\s(\d+)\s+(\d+)\s+(\d+)\s+\d+%", df)
+    if md:  # columns: 1K-blocks used available
+        specs["TOTAL_SPACE"] = int(md.group(1)) * 1024
+        specs["FREE_SPACE"] = int(md.group(3)) * 1024
+    mb = re.search(r"level:\s*(\d+)", sh("dumpsys battery"))
+    if mb:
+        specs["BATTERY_LEVEL"] = int(mb.group(1))
+
+    # --- telecom (best-effort from gsm.* props) ---
+    telecom: dict = {}
+    numeric = p("gsm.operator.numeric")
+    if len(numeric) >= 5:
+        telecom["mcc"], telecom["mnc"] = numeric[:3], numeric[3:]
+    if p("gsm.operator.alpha"):
+        telecom["operator_name"] = p("gsm.operator.alpha")
+    if p("gsm.operator.iso-country"):
+        telecom["country_iso"] = p("gsm.operator.iso-country")
+
+    # --- system_prop: a curated, anti-emulator-relevant subset of real values ---
+    CAPTURE_KEYS = [
+        "ro.product.model", "ro.product.brand", "ro.product.manufacturer",
+        "ro.product.device", "ro.product.name", "ro.product.board",
+        "ro.product.cpu.abilist", "ro.hardware", "ro.board.platform",
+        "ro.build.fingerprint", "ro.build.id", "ro.build.display.id",
+        "ro.build.type", "ro.build.tags", "ro.build.flavor", "ro.build.version.incremental",
+        "ro.build.description", "ro.build.host", "ro.build.user",
+        "ro.bootloader", "ro.serialno", "ro.boot.serialno",
+        "ro.boot.hardware", "ro.boot.hardware.platform", "ro.soc.model",
+        "ro.kernel.qemu", "ro.boot.qemu", "ro.build.characteristics",
+        "ro.debuggable", "ro.secure", "ro.adb.secure", "ro.build.selinux",
+        "ro.boot.verifiedbootstate", "ro.boot.flash.locked", "ro.warranty_bit",
+        "ro.sf.lcd_density", "gsm.version.baseband", "gsm.operator.numeric",
+        "gsm.operator.alpha", "gsm.operator.iso-country", "persist.sys.timezone",
+        "persist.sys.locale",
+    ]
+    system_prop = {k: props[k] for k in CAPTURE_KEYS if k in props}
+
+    profile = {
+        "telecom": telecom,
+        "device_profile": device_profile,
+        "specs": specs,
+        "system_prop": system_prop,
+    }
+    profile = {k: v for k, v in profile.items() if v}
+
+    with open(output_path, "w") as f:
+        json.dump(profile, f, indent=2)
+
+    print(f"[+] Wrote captured profile to {output_path}")
+    print("    Review/edit it before use — telecom and identity fields are best-effort.")
+
 
 def update_frida_devkit(arch: str | None = None):
     """Fetches and extracts the latest Frida-GumJS DevKit for specified architecture (auto-detects via ADB if omitted)."""
@@ -491,6 +680,19 @@ def parse_args():
         "everywhere). Use this if a target runs detection in a sub-process.",
     )
     parser.add_argument(
+        "--recon",
+        action="store_true",
+        help="Build in recon mode: log every intercepted probe (property reads, "
+        "getprop, Build fields, key detection APIs) under the [CoyoteRecon] tag, "
+        "so you can see what the target checks. Independent of --debug.",
+    )
+    parser.add_argument(
+        "--capture",
+        metavar="OUT.json",
+        help="Capture a device profile from a connected real device via ADB, "
+        "write it to OUT.json, then exit. Review/edit before use.",
+    )
+    parser.add_argument(
         "--skip-adb",
         action="store_true",
         help="Skip executing setprop commands over ADB.",
@@ -526,6 +728,10 @@ def main():
         ensure_devkit(args.update_devkit)
         return
 
+    if args.capture:
+        capture_profile(args.capture)
+        return
+
     orchestrator = Coyote(
         profile_path=args.profile,
         ndk_path=args.ndk,
@@ -534,6 +740,7 @@ def main():
         package_name=args.target,
         debug=args.debug,
         js_all_processes=args.js_all_processes,
+        recon=args.recon,
     )
 
     if args.reset_target:
@@ -545,6 +752,7 @@ def main():
         orchestrator.configure_adb_properties()
 
     if args.profile:
+        orchestrator.validate_profile()
         orchestrator.generate_c_header()
         ensure_devkit()
         orchestrator.compile_js()

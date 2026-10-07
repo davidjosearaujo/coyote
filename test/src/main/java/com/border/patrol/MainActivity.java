@@ -1,8 +1,12 @@
 package com.border.patrol;
 
+import android.accounts.Account;
+import android.accounts.AccountManager;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.content.Intent;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.ConnectivityManager;
@@ -25,6 +29,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Method;
 import java.util.Iterator;
@@ -97,6 +103,7 @@ public class MainActivity extends Activity {
             JSONObject network = profile.optJSONObject("network");
             JSONObject attribution = profile.optJSONObject("attribution");
             JSONObject sysProps = profile.optJSONObject("system_prop");
+            JSONObject identity = profile.optJSONObject("identity");
 
             // 1. Hardware Specs Section
             if (specs != null) {
@@ -497,6 +504,212 @@ public class MainActivity extends Activity {
 
                 buildHeader.setText("Vector: Build Mapping  •  " + buildPassed + " / " + buildTotal + " Passed");
                 addPassedDropdown(container, buildPassedContainer, buildPassed);
+            }
+
+            // 9. Uptime Vector (native /proc/uptime spoofing)
+            {
+                TextView upHeader = addSectionHeader(container, "Vector: Uptime");
+                int upTotal = 0, upPassed = 0;
+                LinearLayout upPassedContainer = new LinearLayout(this);
+                upPassedContainer.setOrientation(LinearLayout.VERTICAL);
+                upPassedContainer.setVisibility(View.GONE);
+
+                double uptimeSec = -1;
+                try {
+                    BufferedReader r = new BufferedReader(new FileReader("/proc/uptime"));
+                    String upLine = r.readLine();
+                    r.close();
+                    if (upLine != null) {
+                        uptimeSec = Double.parseDouble(upLine.trim().split("\\s+")[0]);
+                    }
+                } catch (Exception e) {}
+
+                // A real, lived-in device has a non-trivial uptime; a fresh
+                // emulator reports minutes. Expect > 2 days.
+                boolean passUptime = uptimeSec > 172800;
+                addPropRow(passUptime ? upPassedContainer : container, "/proc/uptime (> 2 days)",
+                        "> 172800 s", String.valueOf(uptimeSec), passUptime);
+                upTotal++; if (passUptime) upPassed++;
+
+                upHeader.setText("Vector: Uptime  •  " + upPassed + " / " + upTotal + " Passed");
+                addPassedDropdown(container, upPassedContainer, upPassed);
+            }
+
+            // 10. Sensors Vector (PackageManager.hasSystemFeature spoofing)
+            {
+                TextView senHeader = addSectionHeader(container, "Vector: Sensors");
+                int senTotal = 0, senPassed = 0;
+                LinearLayout senPassedContainer = new LinearLayout(this);
+                senPassedContainer.setOrientation(LinearLayout.VERTICAL);
+                senPassedContainer.setVisibility(View.GONE);
+
+                String[] sensorFeatures = {
+                        "android.hardware.sensor.accelerometer",
+                        "android.hardware.sensor.gyroscope",
+                        "android.hardware.sensor.compass",
+                };
+                for (String feat : sensorFeatures) {
+                    boolean has = getPackageManager().hasSystemFeature(feat);
+                    addPropRow(has ? senPassedContainer : container,
+                            feat.substring(feat.lastIndexOf('.') + 1), "true", String.valueOf(has), has);
+                    senTotal++; if (has) senPassed++;
+                }
+
+                senHeader.setText("Vector: Sensors  •  " + senPassed + " / " + senTotal + " Passed");
+                addPassedDropdown(container, senPassedContainer, senPassed);
+            }
+
+            // 11. Accounts Vector (AccountManager spoofing)
+            if (identity != null && identity.has("account_email")) {
+                TextView accHeader = addSectionHeader(container, "Vector: Accounts");
+                int accTotal = 0, accPassed = 0;
+                LinearLayout accPassedContainer = new LinearLayout(this);
+                accPassedContainer.setOrientation(LinearLayout.VERTICAL);
+                accPassedContainer.setVisibility(View.GONE);
+
+                String expEmail = identity.getString("account_email");
+                String actEmail = "(none)";
+                boolean found = false;
+                try {
+                    Account[] accts = AccountManager.get(this).getAccounts();
+                    if (accts != null && accts.length > 0) {
+                        actEmail = accts[0].name;
+                        for (Account a : accts) {
+                            if (expEmail.equals(a.name)) found = true;
+                        }
+                    }
+                } catch (Exception e) {
+                    actEmail = "[Error: " + e.getMessage() + "]";
+                }
+
+                addPropRow(found ? accPassedContainer : container, "Google Account", expEmail, actEmail, found);
+                accTotal++; if (found) accPassed++;
+
+                accHeader.setText("Vector: Accounts  •  " + accPassed + " / " + accTotal + " Passed");
+                addPassedDropdown(container, accPassedContainer, accPassed);
+            }
+
+            // 12. Wi-Fi Identity Vector (WifiInfo spoofing)
+            if (identity != null && (identity.has("wifi_ssid") || identity.has("wifi_bssid") || identity.has("wifi_mac"))) {
+                TextView wifiHeader = addSectionHeader(container, "Vector: Wi-Fi Identity");
+                int wifiTotal = 0, wifiPassed = 0;
+                LinearLayout wifiPassedContainer = new LinearLayout(this);
+                wifiPassedContainer.setOrientation(LinearLayout.VERTICAL);
+                wifiPassedContainer.setVisibility(View.GONE);
+
+                WifiInfo info = null;
+                try {
+                    WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+                    if (wm != null) info = wm.getConnectionInfo();
+                } catch (Exception e) {}
+
+                if (identity.has("wifi_ssid")) {
+                    String exp = identity.getString("wifi_ssid");
+                    String act = info != null && info.getSSID() != null ? info.getSSID().replace("\"", "") : "null";
+                    boolean pass = exp.equals(act);
+                    addPropRow(pass ? wifiPassedContainer : container, "WifiInfo SSID", exp, act, pass);
+                    wifiTotal++; if (pass) wifiPassed++;
+                }
+                if (identity.has("wifi_bssid")) {
+                    String exp = identity.getString("wifi_bssid");
+                    String act = info != null && info.getBSSID() != null ? info.getBSSID() : "null";
+                    boolean pass = exp.equals(act);
+                    addPropRow(pass ? wifiPassedContainer : container, "WifiInfo BSSID", exp, act, pass);
+                    wifiTotal++; if (pass) wifiPassed++;
+                }
+                if (identity.has("wifi_mac")) {
+                    String exp = identity.getString("wifi_mac");
+                    String act = info != null && info.getMacAddress() != null ? info.getMacAddress() : "null";
+                    boolean pass = exp.equals(act);
+                    addPropRow(pass ? wifiPassedContainer : container, "WifiInfo MAC", exp, act, pass);
+                    wifiTotal++; if (pass) wifiPassed++;
+                }
+
+                wifiHeader.setText("Vector: Wi-Fi Identity  •  " + wifiPassed + " / " + wifiTotal + " Passed");
+                addPassedDropdown(container, wifiPassedContainer, wifiPassed);
+            }
+
+            // 13. Root / Magisk Hiding Vector (native file-existence hiding)
+            {
+                TextView rootHeader = addSectionHeader(container, "Vector: Root / Magisk Hiding");
+                int rootTotal = 0, rootPassed = 0;
+                LinearLayout rootPassedContainer = new LinearLayout(this);
+                rootPassedContainer.setOrientation(LinearLayout.VERTICAL);
+                rootPassedContainer.setVisibility(View.GONE);
+
+                String[] rootPaths = {
+                        "/system/xbin/su", "/sbin/su", "/sbin/.magisk", "/data/adb/magisk",
+                };
+                for (String rp : rootPaths) {
+                    boolean exists = new File(rp).exists();
+                    boolean passRoot = !exists; // expect hidden / absent
+                    addPropRow(passRoot ? rootPassedContainer : container, rp,
+                            "absent", exists ? "present" : "absent", passRoot);
+                    rootTotal++; if (passRoot) rootPassed++;
+                }
+
+                rootHeader.setText("Vector: Root / Magisk Hiding  •  " + rootPassed + " / " + rootTotal + " Passed");
+                addPassedDropdown(container, rootPassedContainer, rootPassed);
+            }
+
+            // 14. CPU Fingerprint Vector (native /proc/cpuinfo spoofing)
+            {
+                TextView cpuHeader = addSectionHeader(container, "Vector: CPU Fingerprint");
+                int cpuTotal = 0, cpuPassed = 0;
+                LinearLayout cpuPassedContainer = new LinearLayout(this);
+                cpuPassedContainer.setOrientation(LinearLayout.VERTICAL);
+                cpuPassedContainer.setVisibility(View.GONE);
+
+                StringBuilder cpuinfo = new StringBuilder();
+                try {
+                    BufferedReader r = new BufferedReader(new FileReader("/proc/cpuinfo"));
+                    String cl;
+                    while ((cl = r.readLine()) != null) cpuinfo.append(cl).append('\n');
+                    r.close();
+                } catch (Exception e) {}
+
+                String lower = cpuinfo.toString().toLowerCase();
+                boolean clean = lower.length() > 0
+                        && !lower.contains("goldfish")
+                        && !lower.contains("ranchu")
+                        && !lower.contains("intel")   // emulators often expose x86 host CPU
+                        && !lower.contains("virtual");
+                addPropRow(clean ? cpuPassedContainer : container, "/proc/cpuinfo (no emulator markers)",
+                        "clean", clean ? "clean" : "emulator markers present", clean);
+                cpuTotal++; if (clean) cpuPassed++;
+
+                cpuHeader.setText("Vector: CPU Fingerprint  •  " + cpuPassed + " / " + cpuTotal + " Passed");
+                addPassedDropdown(container, cpuPassedContainer, cpuPassed);
+            }
+
+            // 15. Mount Table Vector (native /proc/mounts Magisk filtering)
+            {
+                TextView mntHeader = addSectionHeader(container, "Vector: Mount Table");
+                int mntTotal = 0, mntPassed = 0;
+                LinearLayout mntPassedContainer = new LinearLayout(this);
+                mntPassedContainer.setOrientation(LinearLayout.VERTICAL);
+                mntPassedContainer.setVisibility(View.GONE);
+
+                boolean mntMagisk = false;
+                int mntLines = 0;
+                try {
+                    BufferedReader r = new BufferedReader(new FileReader("/proc/mounts"));
+                    String ml;
+                    while ((ml = r.readLine()) != null) {
+                        mntLines++;
+                        String low = ml.toLowerCase();
+                        if (low.contains("magisk") || low.contains("/data/adb")) mntMagisk = true;
+                    }
+                    r.close();
+                } catch (Exception e) {}
+
+                boolean passMnt = mntLines > 0 && !mntMagisk;
+                addPropRow(passMnt ? mntPassedContainer : container, "/proc/mounts (no Magisk entries)",
+                        "clean", mntMagisk ? "magisk mounts present" : "clean", passMnt);
+                mntTotal++; if (passMnt) mntPassed++;
+
+                mntHeader.setText("Vector: Mount Table  •  " + mntPassed + " / " + mntTotal + " Passed");
+                addPassedDropdown(container, mntPassedContainer, mntPassed);
             }
 
             updateSummaryBanner();

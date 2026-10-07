@@ -1,7 +1,20 @@
-if (typeof globalThis.COYOTE_DEBUG === 'undefined') {
+// Keep the console only when there's something to say: debug builds (verbose
+// hook logs) or recon builds (probe telemetry). Pure release stubs it so no
+// messages are dispatched through the GumJS message pipe.
+var COYOTE_DEBUG = (typeof globalThis.COYOTE_DEBUG !== 'undefined');
+var COYOTE_RECON = (typeof globalThis.COYOTE_RECON !== 'undefined');
+if (!COYOTE_DEBUG && !COYOTE_RECON) {
     console.log = function () {};
     console.error = function () {};
     console.warn = function () {};
+}
+
+// Recon telemetry: in recon builds, record a probe the target made. Prefixed so
+// it's easy to filter (`adb logcat -s "[PuppyJS]" | grep RECON`).
+function recon(vector, detail) {
+    if (COYOTE_RECON) {
+        console.log('[RECON] ' + vector + (detail !== undefined ? ': ' + detail : ''));
+    }
 }
 
 console.log('[+] JSAgent: Starting...');
@@ -895,7 +908,13 @@ function onJavaReady(Java) {
             'app.greyshirts.sslcapture', 'com.minhui.networkcapture.pro', 'com.evbadroid.wicapdemo',
             'com.evbadroid.wicap', 'com.luckypatchers.luckypatcherinstaller', 'ru.UbLBBRLf.jSziIaUjL',
             'com.emanuelef.remote_capture', 'com.minhui.wifianalyzer', 'com.evbadroid.proxymon',
-            'com.privateinternetaccess.android'
+            'com.privateinternetaccess.android',
+            // Root / Magisk / superuser / instrumentation managers
+            'com.topjohnwu.magisk', 'io.github.vvb2060.magisk', 'io.github.huskydg.magisk',
+            'eu.chainfire.supersu', 'com.koushikdutta.superuser', 'com.thirdparty.superuser',
+            'com.noshufou.android.su', 'me.weishu.kernelsu', 'me.weishu.exp',
+            'de.robv.android.xposed.installer', 'org.lsposed.manager',
+            'com.saurik.substrate', 're.frida.server'
         ];
 
         const forcedFeatures = [
@@ -1058,6 +1077,7 @@ function onJavaReady(Java) {
         try {
             const ApplicationPackageManager = Java.use('android.app.ApplicationPackageManager');
             ApplicationPackageManager.getInstallerPackageName.overload('java.lang.String').implementation = function (pkg) {
+                recon('getInstallerPackageName', pkg);
                 if (pkg === targetPackageName) {
                     return 'com.android.vending';
                 }
@@ -1166,6 +1186,7 @@ function onJavaReady(Java) {
             try {
                 const key = extractGetpropKey(this.command());
                 if (key !== null) {
+                    recon('exec getprop', key);
                     const val = SystemProperties.get(key);
                     const newCmd = ArrayList.$new();
                     newCmd.add('/system/bin/echo');
@@ -1207,6 +1228,104 @@ function onJavaReady(Java) {
         console.log('[+] JSAgent spoofed android.os.Build static fields');
     } catch (e) {
         console.log('[-] Error spoofing Build fields: ' + e);
+    }
+
+    // NOTE: boot/uptime spoofing via SystemClock.elapsedRealtime/uptimeMillis
+    // was removed — those clocks are called constantly by the framework's
+    // render/input loop, and a per-call Java hook freezes the app. If uptime
+    // realism is needed, do it at the native layer (spoof reads of /proc/uptime)
+    // instead of hooking the hot managed clocks.
+
+    // ============================================
+    // BLOCK 22: Accounts (a "lived-in" device has a Google account)
+    // ============================================
+    if (typeof global.IDENTITY_ACCOUNT_EMAIL !== 'undefined') {
+        try {
+            const AccountManager = Java.use('android.accounts.AccountManager');
+            const Account = Java.use('android.accounts.Account'); // public ctor (name, type)
+            const accType = (typeof global.IDENTITY_ACCOUNT_TYPE !== 'undefined')
+                ? global.IDENTITY_ACCOUNT_TYPE : 'com.google';
+
+            const makeAccounts = function () {
+                return Java.array('android.accounts.Account', [
+                    Account.$new(global.IDENTITY_ACCOUNT_EMAIL, accType)
+                ]);
+            };
+
+            AccountManager.getAccounts.implementation = function () {
+                recon('AccountManager.getAccounts');
+                return makeAccounts();
+            };
+            if (AccountManager.getAccountsByType) {
+                AccountManager.getAccountsByType.overload('java.lang.String').implementation = function (type) {
+                    recon('AccountManager.getAccountsByType', type);
+                    if (type === null || type === accType) return makeAccounts();
+                    return Java.array('android.accounts.Account', []);
+                };
+            }
+            console.log('[+] JSAgent hooked AccountManager successfully');
+        } catch (e) {
+            console.log('[-] Error hooking AccountManager: ' + e);
+        }
+    }
+
+    // ============================================
+    // BLOCK 23: Wi-Fi identity (SSID / BSSID / MAC)
+    // ============================================
+    if (typeof global.IDENTITY_WIFI_SSID !== 'undefined' ||
+        typeof global.IDENTITY_WIFI_BSSID !== 'undefined' ||
+        typeof global.IDENTITY_WIFI_MAC !== 'undefined') {
+        try {
+            const WifiInfo = Java.use('android.net.wifi.WifiInfo');
+
+            if (typeof global.IDENTITY_WIFI_SSID !== 'undefined' && WifiInfo.getSSID) {
+                WifiInfo.getSSID.implementation = function () {
+                    recon('WifiInfo.getSSID');
+                    return '"' + global.IDENTITY_WIFI_SSID + '"'; // framework wraps SSID in quotes
+                };
+            }
+            if (typeof global.IDENTITY_WIFI_BSSID !== 'undefined' && WifiInfo.getBSSID) {
+                WifiInfo.getBSSID.implementation = function () {
+                    recon('WifiInfo.getBSSID');
+                    return global.IDENTITY_WIFI_BSSID;
+                };
+            }
+            if (typeof global.IDENTITY_WIFI_MAC !== 'undefined' && WifiInfo.getMacAddress) {
+                WifiInfo.getMacAddress.implementation = function () {
+                    recon('WifiInfo.getMacAddress');
+                    return global.IDENTITY_WIFI_MAC;
+                };
+            }
+            console.log('[+] JSAgent hooked WifiInfo successfully');
+        } catch (e) {
+            console.log('[-] Error hooking WifiInfo: ' + e);
+        }
+    }
+
+    // ============================================
+    // BLOCK 24: Sensor probes (recon)
+    // Sensor *presence* is already forced via PackageManager.hasSystemFeature
+    // (BLOCK 17). Fabricating android.hardware.Sensor objects has no public
+    // constructor and is unsafe to do blindly, so here we only record sensor
+    // enumeration so you can see whether the target inspects them.
+    // ============================================
+    try {
+        const SensorManager = Java.use('android.hardware.SensorManager');
+        if (SensorManager.getSensorList) {
+            SensorManager.getSensorList.overload('int').implementation = function (type) {
+                recon('SensorManager.getSensorList', type);
+                return this.getSensorList(type);
+            };
+        }
+        if (SensorManager.getDefaultSensor) {
+            SensorManager.getDefaultSensor.overload('int').implementation = function (type) {
+                recon('SensorManager.getDefaultSensor', type);
+                return this.getDefaultSensor(type);
+            };
+        }
+        console.log('[+] JSAgent instrumented SensorManager (recon)');
+    } catch (e) {
+        console.log('[-] Error instrumenting SensorManager: ' + e);
     }
 
     console.log('[+] JSAgent: All hook blocks installed');

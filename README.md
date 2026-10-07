@@ -105,10 +105,22 @@ from native code:
 - **Process execution** — `execve`, `execv`, `execvp`, `execvpe`, `posix_spawn`,
   `posix_spawnp`. Neutralizes root/su probes and serves spoofed `getprop <key>`
   output.
+- **Anti-debug** — `ptrace`. Reports success for `PTRACE_TRACEME` without
+  tracing, defeating ptrace-based debugger/instrumentation detection.
 - **Storage** — `statfs`/`statfs64`/`statvfs`/`statvfs64` (total/free space).
 - **Display / GPU** — `ANativeWindow_getWidth`/`getHeight`, `glGetString`,
   `vkGetInstanceProcAddr`.
-- **Filesystem** — `openat` (hides emulator-specific pseudo-files).
+- **Filesystem** — `open`/`openat`. Redirects reads of `/proc/cpuinfo` (←
+  `device_profile.cpu_info`), `/proc/meminfo`, `/proc/uptime` (uptime = real
+  boot clock + a multi-day offset), `/sys/fs/selinux/enforce`, etc. to in-memory
+  spoofed content. Both `open` and `openat` are hooked so Java
+  `FileReader`/`FileInputStream` reads are covered too.
+- **Root / Magisk hiding** — `open`/`openat`/`access`/`faccessat`/`stat`/`lstat`
+  report `ENOENT` for `su` binaries, Magisk/KernelSU/SuperSU paths, and
+  Xposed/Frida artifacts, so `File.exists()`/`access()`/`stat()` existence probes
+  come back negative. Reads of `/proc/mounts`, `/proc/self/mounts` and
+  `/proc/self/mountinfo` are served with Magisk/`/data/adb` mount lines stripped
+  out. (Magisk/root *apps* are also hidden at the package-manager layer.)
 
 The native layer is applied from the library constructor, so it is active before
 the app's first instruction.
@@ -138,6 +150,9 @@ that native hooks can't reach cleanly:
 - `android.os.Build` static fields (e.g. `Build.SERIAL`, which is hard-coded to
   `"unknown"` on modern Android and can only be fixed as a field)
 - `getprop` via `ProcessBuilder`/`Runtime.exec` (rewritten to echo spoofed values)
+- Accounts (`AccountManager.getAccounts`/`getAccountsByType` ← `identity`)
+- Wi-Fi identity (`WifiInfo.getSSID`/`getBSSID`/`getMacAddress` ← `identity`)
+- Sensors (recon only — presence is forced via `PackageManager.hasSystemFeature`)
 
 ### Process model
 
@@ -264,6 +279,8 @@ This builds a `libcoyote.so` tailored to `<profile.json>`, injects it into
 | `--dry-run` | Print the generated `config.h` and all commands without compiling or changing the device. |
 | `--debug` | Build with logging enabled (native `LOGI`/`LOGE` + JS `console`). **Default (release) builds are silent** and carry fewer identifying strings. |
 | `--js-all-processes` | Run the JS/Java layer in **every** forked process of the package. Default runs it only in the main UI process (native hooks still apply everywhere). Use for a target that detects in a sub-process. |
+| `--recon` | Build in **recon mode**: log every intercepted probe (property reads, `getprop`, `ptrace`, installer, accounts, Wi-Fi, sensors) under the `[CoyoteRecon]` / `[RECON]` tags so you can see what the target checks. Independent of `--debug`. |
+| `--capture OUT.json` | Capture a device profile from a connected **real** device via ADB, write it to `OUT.json`, then exit. Review/edit before use. |
 | `--skip-adb` | Build the library but don't push writable `setprop`s to the device. |
 | `--skip-deploy` | Compile only; don't push or launch (implies `--skip-adb`). |
 
@@ -292,6 +309,21 @@ python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --skip
 
 ```bash
 python coyote.py -t com.suspicious.app --reset-target
+```
+
+**Capture a profile from a real device, then use it:**
+
+```bash
+python coyote.py --capture my_device.json        # reads a connected real phone
+# edit my_device.json as needed, then:
+python coyote.py -p my_device.json -t com.suspicious.app
+```
+
+**See what a target probes (recon mode):**
+
+```bash
+python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --recon
+adb logcat -s "[CoyoteRecon]" "[PuppyJS]" | grep -E 'RECON|prop_get|ptrace'
 ```
 
 **Build a verbose (debug) agent and watch it work:**
@@ -401,6 +433,17 @@ GPU/CPU strings. (`cpu_info` is emitted as a C raw-string literal, so multi-line
 | `install_package` | `"com.android.vending"` | Expected installer package |
 | `campaign`, `af_status`, `facebook_app_id` | … | Attribution fields |
 
+**`identity` → `IDENTITY_*`** — Wi-Fi and account identity (a "lived-in" device).
+All keys optional; omit one and that hook stays off.
+
+| Key | Example | Meaning |
+| --- | --- | --- |
+| `wifi_ssid` | `"HomeWiFi_5G"` | `WifiInfo.getSSID` |
+| `wifi_bssid` | `"a4:2b:8c:11:22:33"` | `WifiInfo.getBSSID` |
+| `wifi_mac` | `"a4:2b:8c:44:55:66"` | `WifiInfo.getMacAddress` |
+| `account_email` | `"jane.doe@gmail.com"` | Fake account name from `AccountManager` |
+| `account_type` | `"com.google"` | Account type (defaults to `com.google`) |
+
 **`system_prop`** — see below (handled specially).
 
 ### Value typing rules
@@ -472,6 +515,13 @@ profiles cover a large, practical set (100+ keys) you can use as a baseline.
 | Locale / timezone | JS + Native | `Locale`/`TimeZone` + `persist.sys.*` props |
 | SSL pinning | JS | OkHttp / TrustKit / Conscrypt / Appcelerator (if present) |
 | Keyguard | JS | `KeyguardManager` |
+| Anti-debug | Native | `ptrace(PTRACE_TRACEME)` neutralized |
+| Root / Magisk | Native + JS | `su`/Magisk paths hidden from `open`/`access`/`stat`; Magisk mounts stripped from `/proc/mounts`; root apps hidden from `PackageManager` |
+| CPU fingerprint | Native | `/proc/cpuinfo` ← `device_profile.cpu_info` |
+| Uptime | Native | `/proc/uptime` → real boot clock + multi-day offset |
+| Accounts | JS | `AccountManager` ← `identity` |
+| Wi-Fi identity | JS | `WifiInfo` SSID/BSSID/MAC ← `identity` |
+| Sensors (presence) | JS | `PackageManager.hasSystemFeature` |
 
 ---
 
@@ -517,7 +567,7 @@ coyote/
 │   │   └── agent.js        # Managed (Java/ART) hooks + in-process spawn-gating
 │   └── devkit/             # Frida GumJS devkit (git-ignored; via --update-devkit)
 ├── build/                  # Generated: config.h, _agent.js, agent.h, libcoyote.so
-└── test/                   # "Border Patrol" validation app (293 detection checks)
+└── test/                   # "Border Patrol" validation app (~307 detection checks)
 ```
 
 ---

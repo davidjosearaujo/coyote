@@ -7,7 +7,9 @@
 #include <unistd.h>
 
 #define LOG_TAG "[PuppyJS]"
-#ifdef COYOTE_DEBUG
+// Surface JS console/recon output in debug OR recon builds (the JS agent's
+// recon() telemetry is delivered to logcat through this handler).
+#if defined(COYOTE_DEBUG) || defined(COYOTE_RECON)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #else
@@ -71,6 +73,11 @@ void apply_gumjs_hooks() {
     // through the message pipe.
     #ifdef COYOTE_DEBUG
     g_string_append(js, "globalThis.COYOTE_DEBUG = true;\n");
+    #endif
+
+    // Recon flag: when set, the JS agent logs every probe it sees.
+    #ifdef COYOTE_RECON
+    g_string_append(js, "globalThis.COYOTE_RECON = true;\n");
     #endif
 
     g_string_append(js, "var global = globalThis;\n");
@@ -313,6 +320,29 @@ void apply_gumjs_hooks() {
 
     #ifdef DEVICE_HARDWARE
     g_string_append_printf(js, "global.DEVICE_HARDWARE = '%s';\n", DEVICE_HARDWARE);
+    #endif
+
+    // ============================================
+    // BLOCK 16c: Identity & Accounts Macro Injection (Wi-Fi, accounts)
+    // ============================================
+    #ifdef IDENTITY_WIFI_SSID
+    g_string_append_printf(js, "global.IDENTITY_WIFI_SSID = '%s';\n", IDENTITY_WIFI_SSID);
+    #endif
+
+    #ifdef IDENTITY_WIFI_BSSID
+    g_string_append_printf(js, "global.IDENTITY_WIFI_BSSID = '%s';\n", IDENTITY_WIFI_BSSID);
+    #endif
+
+    #ifdef IDENTITY_WIFI_MAC
+    g_string_append_printf(js, "global.IDENTITY_WIFI_MAC = '%s';\n", IDENTITY_WIFI_MAC);
+    #endif
+
+    #ifdef IDENTITY_ACCOUNT_EMAIL
+    g_string_append_printf(js, "global.IDENTITY_ACCOUNT_EMAIL = '%s';\n", IDENTITY_ACCOUNT_EMAIL);
+    #endif
+
+    #ifdef IDENTITY_ACCOUNT_TYPE
+    g_string_append_printf(js, "global.IDENTITY_ACCOUNT_TYPE = '%s';\n", IDENTITY_ACCOUNT_TYPE);
     #endif
 
     // ============================================

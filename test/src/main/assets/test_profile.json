@@ -209,5 +209,12 @@
     "ro.build.date": "Tue Feb 18 11:17:00 UTC 2025",
     "ro.build.date.utc": "1739877420",
     "ro.build.version.security_patch": "2025-02-05"
+  },
+  "identity": {
+    "wifi_ssid": "HomeWiFi_5G",
+    "wifi_bssid": "a4:2b:8c:11:22:33",
+    "wifi_mac": "a4:2b:8c:44:55:66",
+    "account_email": "jane.doe@gmail.com",
+    "account_type": "com.google"
   }
 }
