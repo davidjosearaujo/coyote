@@ -10,18 +10,56 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-static GumScript *puppy_script = NULL;
+static GumScript *agent_script = NULL;
+static GMainLoop *main_loop = NULL;
 
 static void on_message(const gchar *message, GBytes *data, gpointer user_data) {
-    LOGI("PuppyJS message: %s", message);
+    JsonParser *parser = json_parser_new();
+    if (!json_parser_load_from_data(parser, message, -1, NULL)) {
+        LOGI("PuppyJS message (unparsed): %s", message);
+        g_object_unref(parser);
+        return;
+    }
+
+    JsonObject *root = json_node_get_object(json_parser_get_root(parser));
+    const gchar *type = json_object_get_string_member(root, "type");
+
+    if (g_strcmp0(type, "log") == 0) {
+        LOGI("JS: %s", json_object_get_string_member(root, "payload"));
+    } else if (g_strcmp0(type, "error") == 0) {
+        const gchar *desc = json_object_has_member(root, "description")
+            ? json_object_get_string_member(root, "description") : message;
+        const gchar *stack = json_object_has_member(root, "stack")
+            ? json_object_get_string_member(root, "stack") : "";
+        LOGE("JS EXCEPTION: %s\n%s", desc, stack);
+    } else {
+        LOGI("PuppyJS message: %s", message);
+    }
+
+    g_object_unref(parser);
+}
+
+static gboolean on_script_loaded(gpointer user_data) {
+    LOGI("Script loaded successfully, entering main loop...");
+    return G_SOURCE_REMOVE;
 }
 
 void apply_gumjs_hooks() {
     GMainContext *context = g_main_context_new();
     g_main_context_push_thread_default(context);
-    GMainLoop *loop = g_main_loop_new(context, FALSE);
+    main_loop = g_main_loop_new(context, FALSE);
     
+    /* Use QuickJS: the V8 backend typically returns NULL in the embedded
+     * gumjs build on Android (no startup snapshot), which silently prevents
+     * the script from ever loading. QJS is what the devkit example uses. */
     GumScriptBackend *backend = gum_script_backend_obtain_qjs();
+    if (backend == NULL) {
+        LOGE("Failed to obtain script backend; aborting GumJS hooks.");
+        g_main_loop_unref(main_loop);
+        g_main_context_pop_thread_default(context);
+        g_main_context_unref(context);
+        return;
+    }
     GError *error = NULL;
 
     GString *js = g_string_new("");
@@ -234,6 +272,39 @@ void apply_gumjs_hooks() {
     #endif
 
     // ============================================
+    // BLOCK 16b: android.os.Build static-field Macro Injection
+    // (Build.SERIAL is hard-coded to "unknown" on API 26+, so the native
+    //  property hook cannot fix it; the JS agent sets the static field.)
+    // ============================================
+    #ifdef DEVICE_SERIAL
+    g_string_append_printf(js, "global.DEVICE_SERIAL = '%s';\n", DEVICE_SERIAL);
+    #endif
+
+    #ifdef DEVICE_FINGERPRINT
+    g_string_append_printf(js, "global.DEVICE_FINGERPRINT = '%s';\n", DEVICE_FINGERPRINT);
+    #endif
+
+    #ifdef DEVICE_MANUFACTURER
+    g_string_append_printf(js, "global.DEVICE_MANUFACTURER = '%s';\n", DEVICE_MANUFACTURER);
+    #endif
+
+    #ifdef DEVICE_BRAND
+    g_string_append_printf(js, "global.DEVICE_BRAND = '%s';\n", DEVICE_BRAND);
+    #endif
+
+    #ifdef DEVICE_DEVICE
+    g_string_append_printf(js, "global.DEVICE_DEVICE = '%s';\n", DEVICE_DEVICE);
+    #endif
+
+    #ifdef DEVICE_BOARD
+    g_string_append_printf(js, "global.DEVICE_BOARD = '%s';\n", DEVICE_BOARD);
+    #endif
+
+    #ifdef DEVICE_HARDWARE
+    g_string_append_printf(js, "global.DEVICE_HARDWARE = '%s';\n", DEVICE_HARDWARE);
+    #endif
+
+    // ============================================
     // BLOCK 17: Package Manager Spoofing Macro Injection
     // ============================================
     #ifdef PACKAGE_NAME
@@ -242,33 +313,33 @@ void apply_gumjs_hooks() {
     g_string_append(js, "global.PACKAGE_NAME = 'com.border.patrol';\n");
     #endif
 
-    // 2. Append the massive frida-java-bridge bundle
     g_string_append_len(js, (const gchar *)agent_js, agent_js_len);
 
-    // 3. Compile and execute
-    puppy_script = gum_script_backend_create_sync(backend, "puppy_js", js->str, NULL, NULL, &error);
+    agent_script = gum_script_backend_create_sync(backend, "agent", js->str, NULL, NULL, &error);
     
-    if (error != NULL) {
-        LOGE("PuppyJS script compilation failed: %s", error->message);
-        g_error_free(error);
+    if (error != NULL || agent_script == NULL) {
+        LOGE("PuppyJS script compilation failed: %s",
+             error != NULL ? error->message : "backend returned NULL script");
+        if (error != NULL) g_error_free(error);
         g_string_free(js, TRUE);
 
-        g_main_loop_unref(loop);
+        g_main_loop_unref(main_loop);
         g_main_context_pop_thread_default(context);
         g_main_context_unref(context);
         return;
     }
 
-    gum_script_set_message_handler(puppy_script, on_message, NULL, NULL);
-    gum_script_load_sync(puppy_script, NULL);
+    gum_script_set_message_handler(agent_script, on_message, NULL, NULL);
+    gum_script_load_sync(agent_script, NULL);
+
     g_string_free(js, TRUE);
 
-    // 2. Block the thread efficiently using GMainLoop
     LOGI("Starting GMainLoop for GumJS...");
-    g_main_loop_run(loop);
 
-    // 3. Cleanup (unreachable unless g_main_loop_quit is called)
-    g_main_loop_unref(loop);
+    g_idle_add(on_script_loaded, NULL);
+    g_main_loop_run(main_loop);
+
+    g_main_loop_unref(main_loop);
     g_main_context_pop_thread_default(context);
     g_main_context_unref(context);
 }

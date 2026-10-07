@@ -289,6 +289,7 @@ static int hook_posix_spawn(pid_t *pid, const char *path,
                            const posix_spawn_file_actions_t *file_actions,
                            const posix_spawnattr_t *attrp,
                            char *const argv[], char *const envp[]) {
+    LOGI("PuppyC DBG posix_spawn: path=%s a0=%s a1=%s", path?path:"(null)", (argv&&argv[0])?argv[0]:"(null)", (argv&&argv[1])?argv[1]:"(null)");
     if (is_root_check_cmd(path, argv)) {
         LOGI("PuppyC blocked root check (posix_spawn): %s", path);
         char *fake_argv[] = {"/system/bin/echo", NULL};
@@ -315,6 +316,7 @@ static int hook_posix_spawnp(pid_t *pid, const char *path,
                             const posix_spawn_file_actions_t *file_actions,
                             const posix_spawnattr_t *attrp,
                             char *const argv[], char *const envp[]) {
+    LOGI("PuppyC DBG posix_spawnp: path=%s a0=%s a1=%s", path?path:"(null)", (argv&&argv[0])?argv[0]:"(null)", (argv&&argv[1])?argv[1]:"(null)");
     if (is_root_check_cmd(path, argv)) {
         LOGI("PuppyC blocked root check (posix_spawn): %s", path);
         char *fake_argv[] = {"echo", NULL};
@@ -347,9 +349,12 @@ static int hook_execve(const char *path, char *const argv[], char *const envp[])
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
-            printf("%s\n", mock_val);
-            fflush(stdout);
-            _exit(0);
+            // This hook runs in a just-fork()ed child of a multithreaded
+            // process, where malloc/stdio are unsafe (they crash the exec ->
+            // IOException). Exec `echo <val>` directly with argv pointing at
+            // the static mock string: no snprintf, no malloc, async-safe.
+            char *fake_argv[] = {"echo", (char *)mock_val, NULL};
+            return orig_execve("/system/bin/echo", fake_argv, envp);
         }
     }
 
@@ -373,9 +378,9 @@ static int hook_execv(const char *path, char *const argv[]) {
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
-            printf("%s\n", mock_val);
-            fflush(stdout);
-            _exit(0);
+            // See hook_execve: async-safe echo, no malloc/stdio.
+            char *fake_argv[] = {"echo", (char *)mock_val, NULL};
+            return orig_execve("/system/bin/echo", fake_argv, environ);
         }
     }
 
@@ -399,9 +404,9 @@ static int hook_execvp(const char *path, char *const argv[]) {
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
-            printf("%s\n", mock_val);
-            fflush(stdout);
-            _exit(0);
+            // See hook_execve: async-safe echo, no malloc/stdio.
+            char *fake_argv[] = {"echo", (char *)mock_val, NULL};
+            return orig_execve("/system/bin/echo", fake_argv, environ);
         }
     }
 
@@ -424,9 +429,9 @@ static int hook_execvpe(const char *path, char *const argv[], char *const envp[]
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
-            printf("%s\n", mock_val);
-            fflush(stdout);
-            _exit(0);
+            // See hook_execve: async-safe echo, no malloc/stdio.
+            char *fake_argv[] = {"echo", (char *)mock_val, NULL};
+            return orig_execve("/system/bin/echo", fake_argv, envp);
         }
     }
 
