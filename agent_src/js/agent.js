@@ -1,6 +1,3 @@
-// Release builds don't define COYOTE_DEBUG (injected by puppyjs.c). Stub the
-// console so no log messages are dispatched through the GumJS message pipe —
-// this both silences logcat and removes the per-log marshalling overhead.
 if (typeof globalThis.COYOTE_DEBUG === 'undefined') {
     console.log = function () {};
     console.error = function () {};
@@ -9,10 +6,6 @@ if (typeof globalThis.COYOTE_DEBUG === 'undefined') {
 
 console.log('[+] JSAgent: Starting...');
 
-// Runs inside Java.perform(), after the app's Application is bound (see
-// waitForApplication). `global.*` values are injected by puppyjs.c before this
-// bundle. Each block is independently try/guarded so one failure never stops
-// the rest. Do NOT enumerate wrappers (Object.keys) here.
 function onJavaReady(Java) {
     console.log('[+] JSAgent: Java is ready! Attaching Java hooks...');
 
@@ -71,9 +64,6 @@ function onJavaReady(Java) {
                 patchMetrics(metrics);
             };
 
-            // Most apps read metrics via Resources.getDisplayMetrics(), which
-            // returns a cached DisplayMetrics and never calls Display.getMetrics.
-            // Hook it too and patch the object it hands back.
             try {
                 const Resources = Java.use('android.content.res.Resources');
                 Resources.getDisplayMetrics.implementation = function() {
@@ -736,7 +726,6 @@ function onJavaReady(Java) {
                         const iface = Java.cast(realEnum.nextElement(), NetworkInterface);
                         const name = iface.getName();
 
-                        // Filter out VPN and PPP interfaces
                         if (name && (name.indexOf('tun') < 0 && name.indexOf('ppp') < 0)) {
                             if (name.startsWith('rmnet_data0')) {
                                 mobileFound = true;
@@ -782,11 +771,6 @@ function onJavaReady(Java) {
     // ============================================
     // BLOCK 15: SSL Pinning Bypass Hooks
     // ============================================
-    // SSL libraries are optional: most apps bundle only one (or none). Loading
-    // an absent class throws ClassNotFoundException, which is expected and not
-    // an error — only log genuinely unexpected failures. `optionalClass` returns
-    // null for a missing class silently, and `hookSsl` runs the hook only when
-    // the class is present.
     const optionalClass = function (name) {
         try {
             return Java.use(name);
@@ -800,7 +784,7 @@ function onJavaReady(Java) {
 
     const hookSsl = function (className, label, fn) {
         const clazz = optionalClass(className);
-        if (!clazz) return; // library not present in this app — skip quietly
+        if (!clazz) return;
         try {
             fn(clazz);
             console.log('[+] JSAgent hooked ' + label + ' successfully');
@@ -1032,7 +1016,7 @@ function onJavaReady(Java) {
                     try {
                         const pkg = Java.cast(castedList.get(i), ApplicationInfo).packageName.value;
                         if (hidePackages.includes(pkg)) {
-                            castedList.remove(i);  // ← Use castedList here
+                            castedList.remove(i);
                         }
                     } catch (e) {}
                 }
@@ -1071,17 +1055,12 @@ function onJavaReady(Java) {
             return list;
         };
 
-        // getInstallerPackageName is ABSTRACT on PackageManager; the concrete
-        // override lives in android.app.ApplicationPackageManager, so hooking
-        // PackageManager has no effect. Hook the concrete class instead.
         try {
             const ApplicationPackageManager = Java.use('android.app.ApplicationPackageManager');
             ApplicationPackageManager.getInstallerPackageName.overload('java.lang.String').implementation = function (pkg) {
                 if (pkg === targetPackageName) {
                     return 'com.android.vending';
                 }
-                // A null installer (sideloaded) is itself an emulator/debug
-                // tell, so coalesce it to the Play Store for any package.
                 const real = this.getInstallerPackageName(pkg);
                 return (real === null) ? 'com.android.vending' : real;
             };
@@ -1156,12 +1135,6 @@ function onJavaReady(Java) {
 
     // ============================================
     // BLOCK 20: Shell getprop interception (Java layer)
-    // The native exec hooks for `getprop` run in a forked child and keep
-    // failing the exec ("[Error executing shell]"). Intercept at the Java call
-    // site instead: ProcessBuilder.start() is where Runtime.exec() funnels, and
-    // it runs in the parent before any fork. Rewrite `getprop <key>` into
-    // `echo <spoofed>`, taking the value from SystemProperties.get() which
-    // already routes through the native __system_property_get hook.
     // ============================================
     try {
         const ProcessBuilder = Java.use('java.lang.ProcessBuilder');
@@ -1173,11 +1146,9 @@ function onJavaReady(Java) {
             if (n === 0) return null;
             const c0 = cmdList.get(0).toString();
             const base0 = c0.substring(c0.lastIndexOf('/') + 1);
-            // Form: ["getprop", "<key>"]
             if (base0 === 'getprop' && n >= 2) {
                 return cmdList.get(1).toString();
             }
-            // Form: ["... getprop <key> ..."] or ["sh","-c","getprop <key>"]
             for (let i = 0; i < n; i++) {
                 const ci = cmdList.get(i).toString();
                 const idx = ci.indexOf('getprop ');
@@ -1195,7 +1166,7 @@ function onJavaReady(Java) {
             try {
                 const key = extractGetpropKey(this.command());
                 if (key !== null) {
-                    const val = SystemProperties.get(key); // native hook -> spoofed
+                    const val = SystemProperties.get(key);
                     const newCmd = ArrayList.$new();
                     newCmd.add('/system/bin/echo');
                     newCmd.add(val !== null ? val : '');
@@ -1204,7 +1175,7 @@ function onJavaReady(Java) {
             } catch (e) {
                 console.log('[-] getprop rewrite error: ' + e);
             }
-            return this.start(); // frida idiom: calls the ORIGINAL start()
+            return this.start();
         };
 
         console.log('[+] JSAgent hooked ProcessBuilder getprop interception');
@@ -1214,9 +1185,6 @@ function onJavaReady(Java) {
 
     // ============================================
     // BLOCK 19: android.os.Build static field spoofing
-    // Build.SERIAL returns "unknown" on API 26+ regardless of ro.serialno, so
-    // it can only be fixed by overwriting the static field here. We also set
-    // the other identity fields to the profile for consistency.
     // ============================================
     try {
         const Build = Java.use('android.os.Build');
@@ -1251,47 +1219,30 @@ function waitForJava() {
         attempts++;
 
         try {
-            // frida-compile returns the ES-module namespace ({ default: runtime }),
-            // so the actual Java runtime is on `.default`. Without this unwrap,
-            // `Java.available` reads off the namespace object and is always undefined.
             const mod = require("frida-java-bridge");
             const Java = (mod && mod.default) ? mod.default : mod;
 
-            // If an earlier probe faulted (e.g. getApi() dereferenced an ART
-            // struct that was not populated yet), the bridge caches that error
-            // in `_apiError` and `available` re-throws it forever. Clear it so
-            // the next probe can retry once ART has finished coming up.
             if (Java._apiError) {
                 Java._apiError = null;
             }
 
-            // Key: Check if we can actually USE Java, not just if the module exists
             if (Java && typeof Java.available !== 'undefined' && Java.available === true) {
                 clearInterval(interval);
                 console.log('[+] JSAgent: Java.available === true at attempt ' + attempts);
 
-                // In-process spawn-gating: arm a hook on the main-thread
-                // lifecycle method that runs just before the first activity's
-                // onCreate, and install the spoofing hooks from there (on the
-                // main thread, so no cross-thread suspend-all deadlock). This
-                // gets hooks in before onCreate reads anything, on first launch,
-                // with no frida-server. Falls back to waitForApplication.
                 installGate(Java);
                 return;
             }
 
-            // Log progress
             if (attempts % 40 === 0) {
                 console.log('[+] JSAgent: Attempt ' + attempts + ' - Java.available: ' + Java.available);
             }
         } catch (e) {
-            // Rate-limited: early probes can fault until ART is ready; keep retrying.
             if (attempts === 1 || attempts % 40 === 0) {
                 console.error('[!] JSAgent: probe error (attempt ' + attempts + '): ' + e.toString());
             }
         }
 
-        // 300 second timeout (6 minutes)
         if (attempts > 6000) {
             clearInterval(interval);
             console.error('[!] JSAgent: FATAL - Java never initialized after 300 seconds');
@@ -1299,14 +1250,6 @@ function waitForJava() {
     }, 50);
 }
 
-// In-process spawn-gating. Instrument android.app.Instrumentation.callActivity-
-// OnCreate — the framework method invoked on the MAIN thread immediately before
-// every Activity's onCreate. Installing this single hook early is safe (the
-// main thread is not executing it yet). When it fires for the first activity we
-// run onJavaReady() *on the main thread*, so all the value-spoofing hooks land
-// before onCreate reads anything, and there is no cross-thread ART suspend-all
-// to deadlock against. performNow() runs immediately (no bridge deferral), so
-// the gate is armed without waiting for the Application to bind.
 function installGate(Java) {
     let hooksInstalled = false;
 
@@ -1327,8 +1270,8 @@ function installGate(Java) {
             const overloads = Instrumentation.callActivityOnCreate.overloads;
             overloads.forEach(function (ov) {
                 ov.implementation = function () {
-                    runOnce();                       // install hooks first...
-                    return ov.apply(this, arguments); // ...then let onCreate run
+                    runOnce();
+                    return ov.apply(this, arguments);
                 };
             });
             console.log('[+] JSAgent: gate armed on Instrumentation.callActivityOnCreate (' + overloads.length + ' overload(s))');
@@ -1339,11 +1282,6 @@ function installGate(Java) {
     }
 }
 
-// Poll until the app's Application object exists. performNow() only *reads*
-// ActivityThread.currentApplication() (no method replacement), so it is safe
-// to call during early startup. Once the app is bound, the bridge's class
-// factory is initialized and Java.perform() runs synchronously with no gating
-// hooks, so there is nothing left to race the main thread's bootstrap.
 function waitForApplication(Java) {
     let tries = 0;
 
@@ -1375,7 +1313,6 @@ function waitForApplication(Java) {
             console.log('[+] JSAgent: waiting for Application... (try ' + tries + ')');
         }
 
-        // ~60 second timeout (3000 tries * 20ms)
         if (tries > 3000) {
             clearInterval(interval);
             console.error('[!] JSAgent: FATAL - Application never bound');
@@ -1383,10 +1320,5 @@ function waitForApplication(Java) {
     }, 20);
 }
 
-// Small settle delay before the first probe: probing getApi() in the first
-// ~100ms of process life can dereference ART structs that are not populated
-// yet (access violation at 0x8). Keep this SHORT — the app's checks run in
-// MainActivity.onCreate, so hooks must be installed before then. The _apiError
-// reset in waitForJava() recovers from any probe that still faults this early.
 console.log('[+] JSAgent: Waiting for Java to initialize...');
 setTimeout(waitForJava, 200);
