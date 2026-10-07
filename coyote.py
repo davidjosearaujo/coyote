@@ -53,8 +53,10 @@ class Coyote:
         api_level: int = 30,
         dry_run: bool = False,
         package_name: str = "test.target.app",
+        debug: bool = False,
     ):
         self.dry_run = dry_run
+        self.debug = debug
         self.api_level = api_level
         self.package_name = package_name
         self.ndk_path = Path(ndk_path) if ndk_path else None
@@ -169,7 +171,11 @@ class Coyote:
             lines.append("} prop_override_t;\n")
 
             lines.append("static const prop_override_t SYSTEM_PROP_OVERRIDES[] = {")
-            for raw_key, macro_name in prop_overrides:
+            # Emit sorted by key so the native lookup can use bsearch(). Property
+            # keys are ASCII, so Python's string ordering matches C strcmp byte
+            # ordering. The {NULL, NULL} sentinel stays last and is excluded from
+            # the searched range via SYSTEM_PROP_OVERRIDES_COUNT.
+            for raw_key, macro_name in sorted(prop_overrides, key=lambda x: x[0]):
                 lines.append(f'    {{"{raw_key}", {macro_name}}},')
             lines.append("    {NULL, NULL}")
             lines.append("};\n")
@@ -274,6 +280,9 @@ class Coyote:
             "-g3",
             "-ffunction-sections",
             "-fdata-sections",
+            # Debug builds keep LOGI/LOGE and the JS console; release builds
+            # compile them out (quieter, fewer identifying strings in the .so).
+            *(["-DCOYOTE_DEBUG"] if self.debug else []),
             f"-I{AGENT_SRC}",
             f"-I{BUILD_DIR}",
             f"-I{AGENT_SRC / 'devkit'}",
@@ -462,6 +471,12 @@ def parse_args():
         help="Print actions and commands without modifying system or compiling.",
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Build with logging enabled (native LOGI/LOGE + JS console). "
+        "Default (release) builds are silent and carry fewer identifying strings.",
+    )
+    parser.add_argument(
         "--skip-adb",
         action="store_true",
         help="Skip executing setprop commands over ADB.",
@@ -503,6 +518,7 @@ def main():
         api_level=args.api_level,
         dry_run=args.dry_run,
         package_name=args.target,
+        debug=args.debug,
     )
 
     if args.reset_target:

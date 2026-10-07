@@ -10,7 +10,11 @@
 #include <android/log.h> 
 
 #define LOG_TAG "[Coyote]"
+#ifdef COYOTE_DEBUG
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGI(...) ((void)0)
+#endif
 
 // Declare external functions
 extern void apply_native_gum_hooks();

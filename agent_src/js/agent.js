@@ -1,3 +1,12 @@
+// Release builds don't define COYOTE_DEBUG (injected by puppyjs.c). Stub the
+// console so no log messages are dispatched through the GumJS message pipe —
+// this both silences logcat and removes the per-log marshalling overhead.
+if (typeof globalThis.COYOTE_DEBUG === 'undefined') {
+    console.log = function () {};
+    console.error = function () {};
+    console.warn = function () {};
+}
+
 console.log('[+] JSAgent: Starting...');
 
 // Runs inside Java.perform(), after the app's Application is bound (see
@@ -773,52 +782,59 @@ function onJavaReady(Java) {
     // ============================================
     // BLOCK 15: SSL Pinning Bypass Hooks
     // ============================================
-    try {
-        const CertificatePinner = Java.use('okhttp3.CertificatePinner');
+    // SSL libraries are optional: most apps bundle only one (or none). Loading
+    // an absent class throws ClassNotFoundException, which is expected and not
+    // an error — only log genuinely unexpected failures. `optionalClass` returns
+    // null for a missing class silently, and `hookSsl` runs the hook only when
+    // the class is present.
+    const optionalClass = function (name) {
+        try {
+            return Java.use(name);
+        } catch (e) {
+            if (('' + e).indexOf('ClassNotFound') === -1) {
+                console.log('[-] Unexpected error loading ' + name + ': ' + e);
+            }
+            return null;
+        }
+    };
+
+    const hookSsl = function (className, label, fn) {
+        const clazz = optionalClass(className);
+        if (!clazz) return; // library not present in this app — skip quietly
+        try {
+            fn(clazz);
+            console.log('[+] JSAgent hooked ' + label + ' successfully');
+        } catch (e) {
+            console.log('[-] Error hooking ' + label + ': ' + e);
+        }
+    };
+
+    hookSsl('okhttp3.CertificatePinner', 'okhttp3', function (CertificatePinner) {
         CertificatePinner.check.overload('java.lang.String', 'java.util.List').implementation = function (str) {
             return;
         };
+    });
 
-        console.log('[+] JSAgent hooked okhttp3 successfully');
-    } catch (e) {
-        console.log('[-] Error hooking okhttp3: ' + e);
-    }
-
-    try {
-        const OkHostnameVerifier = Java.use('com.datatheorem.android.trustkit.pinning.OkHostnameVerifier');
+    hookSsl('com.datatheorem.android.trustkit.pinning.OkHostnameVerifier', 'trustkit', function (OkHostnameVerifier) {
         OkHostnameVerifier.verify.overload('java.lang.String', 'javax.net.ssl.SSLSession').implementation = function () {
             return true;
         };
         OkHostnameVerifier.verify.overload('java.lang.String', 'java.security.cert.X509Certificate').implementation = function () {
             return true;
         };
+    });
 
-        console.log('[+] JSAgent hooked trustkit successfully');
-    } catch (e) {
-        console.log('[-] Error hooking trustkit: ' + e);
-    }
-
-    try {
-        const TrustManagerImpl = Java.use('com.android.org.conscrypt.TrustManagerImpl');
+    hookSsl('com.android.org.conscrypt.TrustManagerImpl', 'TrustManagerImpl', function (TrustManagerImpl) {
         TrustManagerImpl.verifyChain.implementation = function (untrustedChain) {
             return untrustedChain;
         };
+    });
 
-        console.log('[+] JSAgent hooked TrustManagerImpl successfully');
-    } catch (e) {
-        console.log('[-] Error hooking TrustManagerImpl: ' + e);
-    }
-
-    try {
-        const PinningTrustManager = Java.use('appcelerator.https.PinningTrustManager');
+    hookSsl('appcelerator.https.PinningTrustManager', 'Appcelerator', function (PinningTrustManager) {
         PinningTrustManager.checkServerTrusted.implementation = function () {
             return;
         };
-
-        console.log('[+] JSAgent hooked Appcelerator successfully');
-    } catch (e) {
-        console.log('[-] Error hooking Appcelerator: ' + e);
-    }
+    });
 
     // ============================================
     // BLOCK 16: User-Agent Spoofing Hooks

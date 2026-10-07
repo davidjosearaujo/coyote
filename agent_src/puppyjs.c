@@ -7,8 +7,13 @@
 #include <unistd.h>
 
 #define LOG_TAG "[PuppyJS]"
+#ifdef COYOTE_DEBUG
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGI(...) ((void)0)
+#define LOGE(...) ((void)0)
+#endif
 
 static GumScript *agent_script = NULL;
 static GMainLoop *main_loop = NULL;
@@ -61,8 +66,17 @@ void apply_gumjs_hooks() {
 
     GString *js = g_string_new("");
 
-    g_string_append(js, "console.log('[+] Injecting C-macros into JS globals...');\n");
+    // Debug flag for the JS agent. In release builds (no COYOTE_DEBUG) this is
+    // absent, and agent.js stubs console.* to no-ops so nothing is dispatched
+    // through the message pipe.
+    #ifdef COYOTE_DEBUG
+    g_string_append(js, "globalThis.COYOTE_DEBUG = true;\n");
+    #endif
+
     g_string_append(js, "var global = globalThis;\n");
+    #ifdef COYOTE_DEBUG
+    g_string_append(js, "console.log('[+] Injecting C-macros into JS globals...');\n");
+    #endif
 
     // ============================================
     // BLOCK 1: Display Metrics Hooks

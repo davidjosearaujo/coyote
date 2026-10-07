@@ -36,8 +36,13 @@
 #endif
 
 #define LOG_TAG "[PuppyC]"
+#ifdef COYOTE_DEBUG
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGI(...) ((void)0)
+#define LOGE(...) ((void)0)
+#endif
 
 typedef int (*SystemPropertyGetFunc)(const char *name, char *value);
 typedef void (*PropReadCallback)(void *cookie, const char *name, const char *value, uint32_t serial);
@@ -153,14 +158,20 @@ static void free_preloaded_envp(char **new_envp, char *const orig_envp[]) {
 }
 
 #ifdef SYSTEM_PROP_OVERRIDES_COUNT
+static int prop_override_cmp(const void *key, const void *elem) {
+    return strcmp((const char *)key, ((const prop_override_t *)elem)->key);
+}
+
+// SYSTEM_PROP_OVERRIDES is emitted sorted by key (see coyote.py), so this is an
+// O(log n) binary search instead of a linear strcmp scan. __system_property_get
+// is called constantly during an app's life, so this is the one genuinely hot
+// native hook worth optimizing.
 static const char* get_mocked_prop_value(const char *key) {
     if (!key) return NULL;
-    for (size_t i = 0; i < SYSTEM_PROP_OVERRIDES_COUNT; i++) {
-        if (strcmp(key, SYSTEM_PROP_OVERRIDES[i].key) == 0) {
-            return SYSTEM_PROP_OVERRIDES[i].value;
-        }
-    }
-    return NULL;
+    const prop_override_t *hit = (const prop_override_t *)bsearch(
+        key, SYSTEM_PROP_OVERRIDES, SYSTEM_PROP_OVERRIDES_COUNT,
+        sizeof(SYSTEM_PROP_OVERRIDES[0]), prop_override_cmp);
+    return hit ? hit->value : NULL;
 }
 
 static int hook_system_property_get(const char *name, char *value) {
