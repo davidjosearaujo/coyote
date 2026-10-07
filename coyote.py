@@ -54,9 +54,11 @@ class Coyote:
         dry_run: bool = False,
         package_name: str = "test.target.app",
         debug: bool = False,
+        js_all_processes: bool = False,
     ):
         self.dry_run = dry_run
         self.debug = debug
+        self.js_all_processes = js_all_processes
         self.api_level = api_level
         self.package_name = package_name
         self.ndk_path = Path(ndk_path) if ndk_path else None
@@ -277,12 +279,17 @@ class Coyote:
             "-Wall",
             "-Os",
             "-pipe",
-            "-g3",
+            # Debug info only in debug builds; it is stripped later anyway and
+            # just bloats/slows the release compile.
+            *(["-g3"] if self.debug else ["-g0"]),
             "-ffunction-sections",
             "-fdata-sections",
             # Debug builds keep LOGI/LOGE and the JS console; release builds
             # compile them out (quieter, fewer identifying strings in the .so).
             *(["-DCOYOTE_DEBUG"] if self.debug else []),
+            # Default: run the JS/Java layer only in the main process. This flag
+            # forces it into every forked process of the package.
+            *(["-DCOYOTE_JS_ALL_PROCESSES"] if self.js_all_processes else []),
             f"-I{AGENT_SRC}",
             f"-I{BUILD_DIR}",
             f"-I{AGENT_SRC / 'devkit'}",
@@ -477,6 +484,13 @@ def parse_args():
         "Default (release) builds are silent and carry fewer identifying strings.",
     )
     parser.add_argument(
+        "--js-all-processes",
+        action="store_true",
+        help="Run the JS/Java layer in every forked process of the package. "
+        "Default runs it only in the main UI process (native hooks still apply "
+        "everywhere). Use this if a target runs detection in a sub-process.",
+    )
+    parser.add_argument(
         "--skip-adb",
         action="store_true",
         help="Skip executing setprop commands over ADB.",
@@ -519,6 +533,7 @@ def main():
         dry_run=args.dry_run,
         package_name=args.target,
         debug=args.debug,
+        js_all_processes=args.js_all_processes,
     )
 
     if args.reset_target:

@@ -139,6 +139,22 @@ that native hooks can't reach cleanly:
   `"unknown"` on modern Android and can only be fixed as a field)
 - `getprop` via `ProcessBuilder`/`Runtime.exec` (rewritten to echo spoofed values)
 
+### Process model
+
+The `wrap` property applies to **every** process Zygote forks for the package,
+so `libcoyote.so` loads into all of them. The two layers are scoped differently:
+
+- The **native layer** is cheap, so it runs in **every** process.
+- The **managed (JS/Java) layer** is heavy (a QuickJS runtime, `frida-java-bridge`,
+  and a persistent event loop), so by default it runs **only in the main UI
+  process** — where detection almost always happens. Auxiliary processes
+  (named `<package>:<suffix>`) skip it and pay no JS cost.
+
+The process is classified from `/proc/self/cmdline` (the bare package name is the
+main process; a `:suffix` marks an auxiliary one); if it can't be determined,
+Coyote runs the JS layer to avoid losing coverage. Pass `--js-all-processes` to
+run the managed layer in every process instead.
+
 ### In-process spawn-gating
 
 The hard problem: Java-layer hooks can only be installed once ART is up, but
@@ -246,6 +262,8 @@ This builds a `libcoyote.so` tailored to `<profile.json>`, injects it into
 | `--update-devkit [arch]` | Fetch the latest Frida GumJS devkit (`auto`/`arm`/`arm64`/`x86`/`x86_64`), then exit. |
 | `--reset-target` | Remove the `wrap` property, force-stop, and `pm clear` the target, undoing injection. |
 | `--dry-run` | Print the generated `config.h` and all commands without compiling or changing the device. |
+| `--debug` | Build with logging enabled (native `LOGI`/`LOGE` + JS `console`). **Default (release) builds are silent** and carry fewer identifying strings. |
+| `--js-all-processes` | Run the JS/Java layer in **every** forked process of the package. Default runs it only in the main UI process (native hooks still apply everywhere). Use for a target that detects in a sub-process. |
 | `--skip-adb` | Build the library but don't push writable `setprop`s to the device. |
 | `--skip-deploy` | Compile only; don't push or launch (implies `--skip-adb`). |
 
@@ -276,11 +294,20 @@ python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --skip
 python coyote.py -t com.suspicious.app --reset-target
 ```
 
-After a run, inspect behavior with `logcat`. The agent logs under these tags:
+**Build a verbose (debug) agent and watch it work:**
 
 ```bash
+python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --debug
 adb logcat -s "[Coyote]" "[PuppyC]" "[PuppyJS]"
 ```
+
+Release builds (the default) are **silent** — they emit no log lines and omit the
+agent's log/tag strings from the binary. Use `--debug` when you need to observe
+the agent: you'll see the native hooks apply, then `gate armed …`, `gate fired
+…`, and `All hook blocks installed` before the app's UI appears. In a debug run
+you can also confirm the process model: the **main** process prints the full
+`JSAgent` hook log, while **auxiliary** processes print `Auxiliary process;
+skipping JS layer.` and nothing more.
 
 You should see the native hooks apply, then `gate armed …`, `gate fired …`, and
 `All hook blocks installed` before the app's UI appears.
@@ -458,13 +485,17 @@ profiles cover a large, practical set (100+ keys) you can use as a baseline.
   `frida-java-bridge` are in `node_modules/`.
 - **Permission / SELinux errors during deploy** — the device must be rooted; the
   copy step uses `su 0`. Verify `adb shell su 0 id` works.
-- **App still detects the emulator** — check `logcat` for the hook logs. If you
-  see `gate armed` but never `gate fired`, the app may not go through a standard
-  activity launch; if a specific value is wrong, confirm the matching profile key
-  (and run `--dry-run` to verify it made it into `config.h`).
-- **Two `[Coyote] Coyote loaded` lines with different PIDs** — expected. The
+- **App still detects the emulator** — build with `--debug` and check `logcat`
+  for the hook logs (release builds are silent). If you see `gate armed` but never
+  `gate fired`, the app may not go through a standard activity launch; if a
+  specific value is wrong, confirm the matching profile key (and run `--dry-run`
+  to verify it made it into `config.h`). If the detection runs in a sub-process,
+  rebuild with `--js-all-processes`.
+- **Multiple `[Coyote] Coyote loaded` lines with different PIDs** — expected. The
   `wrap` property applies to every process Zygote forks for the package; each one
-  loads the library.
+  loads the library and applies the native hooks. By default only the main
+  process also runs the JS layer (auxiliary processes log `Auxiliary process;
+  skipping JS layer.` in a `--debug` build).
 - **Wrong architecture** — the devkit ABI must match the device. Re-fetch with
   `--update-devkit <arch>` and rebuild.
 
