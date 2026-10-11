@@ -400,7 +400,9 @@ through. Start from an existing profile and change what you need.
   "specs":          { ... },   // display, memory, storage, battery
   "network":        { ... },   // connectivity type & local IPs
   "attribution":    { ... },   // install referrer / attribution
-  "system_prop":    { ... }    // raw Android system properties (getprop)
+  "system_prop":    { ... },   // raw Android system properties (getprop)
+  "identity":       { ... },   // Wi-Fi and account identity
+  "location":       { ... }    // GPS coordinates
 }
 ```
 
