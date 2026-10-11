@@ -773,6 +773,13 @@ def parse_args():
         help="Target app package name",
     )
     parser.add_argument(
+        "-s",
+        "--serial",
+        help="ADB device serial to target (from `adb devices`). Scopes every ADB "
+        "call to that device — useful when a physical phone and an emulator are "
+        "both connected (e.g. --capture from the phone, deploy to the emulator).",
+    )
+    parser.add_argument(
         "--reset-target",
         action="store_true",
         help="Reset target app",
@@ -839,6 +846,13 @@ def main():
 
     if args.skip_deploy:
         args.skip_adb = True
+
+    # Scope every ADB call (capture, ABI detection, devkit, deploy, reset) to a
+    # specific device. adb honors ANDROID_SERIAL, and all subprocesses inherit
+    # it, so this covers every `adb` invocation without threading a parameter
+    # through each call site.
+    if args.serial:
+        os.environ["ANDROID_SERIAL"] = args.serial
 
     print("════════════════════════════════════════════════════")
     print("                       COYOTE                       ")

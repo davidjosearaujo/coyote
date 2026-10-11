@@ -272,6 +272,7 @@ This builds a `libcoyote.so` tailored to `<profile.json>`, injects it into
 | --- | --- |
 | `-p`, `--profile <path>` | JSON device profile to compile in. Required to build/deploy. |
 | `-t`, `--target <pkg>` | Target app package name (e.g. `com.example.app`). |
+| `-s`, `--serial <id>` | ADB device serial (from `adb devices`) to scope **every** ADB call to. Use when a physical phone and an emulator are both connected. |
 | `--ndk <path>` | Android NDK directory. Defaults to `$ANDROID_NDK_HOME`. |
 | `--api-level <n>` | Target Android API level for NDK compilation (default `30`). |
 | `--update-devkit [arch]` | Fetch the latest Frida GumJS devkit (`auto`/`arm`/`arm64`/`x86`/`x86_64`), then exit. |
@@ -318,6 +319,18 @@ python coyote.py --capture my_device.json        # reads a connected real phone
 # review my_device.json (esp. auto-generated fields), then:
 python coyote.py -p my_device.json -t com.suspicious.app
 ```
+
+**Capture from a physical phone, inject into an emulator** (both connected) —
+scope each step to a device with `--serial` (from `adb devices`):
+
+```bash
+adb devices -l                                   # find the serials
+python coyote.py -s TA9990XYZ    --capture phone.json          # read the phone
+python coyote.py -s emulator-5554 -p phone.json -t com.suspicious.app   # build/inject into the emulator
+```
+
+The deploy step's ABI/devkit are resolved from the `--serial` target (the
+emulator), so the `.so` matches where it runs.
 
 `--capture` produces a **complete** profile (all sections) in two ways:
 
