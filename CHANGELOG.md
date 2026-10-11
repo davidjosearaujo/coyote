@@ -45,3 +45,6 @@ analysis, with no `frida-server` footprint.
   `--update-devkit`, `--reset-target`, and `--dry-run`.
 - **Test harness**: the "Border Patrol" validation app covering every spoofing
   vector.
+
+[Unreleased]: https://codeberg.org/davidjosearaujo/coyote/compare/v1.0.0...HEAD
+[1.0.0]: https://codeberg.org/davidjosearaujo/coyote/releases/tag/v1.0.0
