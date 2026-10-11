@@ -5,6 +5,12 @@ import android.accounts.AccountManager;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.content.Intent;
+import android.hardware.Sensor;
+import android.hardware.SensorManager;
+import android.location.Address;
+import android.location.Geocoder;
+import android.location.Location;
+import android.location.LocationManager;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.graphics.Typeface;
@@ -34,6 +40,8 @@ import java.io.FileReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Method;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
 import org.json.JSONObject;
 
 public class MainActivity extends Activity {
@@ -104,6 +112,7 @@ public class MainActivity extends Activity {
             JSONObject attribution = profile.optJSONObject("attribution");
             JSONObject sysProps = profile.optJSONObject("system_prop");
             JSONObject identity = profile.optJSONObject("identity");
+            JSONObject location = profile.optJSONObject("location");
 
             // 1. Hardware Specs Section
             if (specs != null) {
@@ -555,6 +564,31 @@ public class MainActivity extends Activity {
                     senTotal++; if (has) senPassed++;
                 }
 
+                // SensorManager fabrication: default sensors should exist and
+                // the sensor list should be non-empty (emulators often expose none).
+                SensorManager sm = (SensorManager) getSystemService(SENSOR_SERVICE);
+                int[] sensorTypes = {
+                        Sensor.TYPE_ACCELEROMETER, Sensor.TYPE_GYROSCOPE, Sensor.TYPE_MAGNETIC_FIELD,
+                };
+                String[] sensorTypeNames = {"ACCELEROMETER", "GYROSCOPE", "MAGNETIC_FIELD"};
+                for (int i = 0; i < sensorTypes.length; i++) {
+                    Sensor s = (sm != null) ? sm.getDefaultSensor(sensorTypes[i]) : null;
+                    boolean present = s != null;
+                    addPropRow(present ? senPassedContainer : container,
+                            "getDefaultSensor " + sensorTypeNames[i], "non-null",
+                            present ? s.getName() : "null", present);
+                    senTotal++; if (present) senPassed++;
+                }
+                int sensorCount = 0;
+                try {
+                    List<Sensor> sl = (sm != null) ? sm.getSensorList(Sensor.TYPE_ALL) : null;
+                    if (sl != null) sensorCount = sl.size();
+                } catch (Exception e) {}
+                boolean listOk = sensorCount > 0;
+                addPropRow(listOk ? senPassedContainer : container, "getSensorList(ALL) non-empty",
+                        "> 0", String.valueOf(sensorCount), listOk);
+                senTotal++; if (listOk) senPassed++;
+
                 senHeader.setText("Vector: Sensors  •  " + senPassed + " / " + senTotal + " Passed");
                 addPassedDropdown(container, senPassedContainer, senPassed);
             }
@@ -710,6 +744,58 @@ public class MainActivity extends Activity {
 
                 mntHeader.setText("Vector: Mount Table  •  " + mntPassed + " / " + mntTotal + " Passed");
                 addPassedDropdown(container, mntPassedContainer, mntPassed);
+            }
+
+            // 16. Location Vector (LocationManager spoofing)
+            if (location != null && location.has("latitude") && location.has("longitude")) {
+                TextView locHeader = addSectionHeader(container, "Vector: Location");
+                int locTotal = 0, locPassed = 0;
+                LinearLayout locPassedContainer = new LinearLayout(this);
+                locPassedContainer.setOrientation(LinearLayout.VERTICAL);
+                locPassedContainer.setVisibility(View.GONE);
+
+                double expLat = location.getDouble("latitude");
+                double expLon = location.getDouble("longitude");
+                LocationManager lm = (LocationManager) getSystemService(LOCATION_SERVICE);
+
+                // Last-known fix should match the profile across providers.
+                String[] providers = {LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER};
+                for (String prov : providers) {
+                    double actLat = -999, actLon = -999;
+                    try {
+                        Location loc = (lm != null) ? lm.getLastKnownLocation(prov) : null;
+                        if (loc != null) {
+                            actLat = loc.getLatitude();
+                            actLon = loc.getLongitude();
+                        }
+                    } catch (Exception e) {}
+                    boolean passLoc = Math.abs(actLat - expLat) < 0.001 && Math.abs(actLon - expLon) < 0.001;
+                    addPropRow(passLoc ? locPassedContainer : container, prov + " last-known fix",
+                            expLat + ", " + expLon, actLat + ", " + actLon, passLoc);
+                    locTotal++; if (passLoc) locPassed++;
+                }
+
+                // Reverse geocoding should resolve the fix to the SIM country.
+                if (telecom != null && telecom.has("country_iso")) {
+                    String expCc = telecom.getString("country_iso").toUpperCase();
+                    String actCc = "(none)";
+                    try {
+                        Geocoder gc = new Geocoder(this, Locale.getDefault());
+                        List<Address> addrs = gc.getFromLocation(expLat, expLon, 1);
+                        if (addrs != null && !addrs.isEmpty() && addrs.get(0).getCountryCode() != null) {
+                            actCc = addrs.get(0).getCountryCode();
+                        }
+                    } catch (Exception e) {
+                        actCc = "[Error: " + e.getMessage() + "]";
+                    }
+                    boolean passCc = expCc.equals(actCc);
+                    addPropRow(passCc ? locPassedContainer : container, "Geocoder country code",
+                            expCc, actCc, passCc);
+                    locTotal++; if (passCc) locPassed++;
+                }
+
+                locHeader.setText("Vector: Location  •  " + locPassed + " / " + locTotal + " Passed");
+                addPassedDropdown(container, locPassedContainer, locPassed);
             }
 
             updateSummaryBanner();

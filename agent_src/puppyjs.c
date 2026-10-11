@@ -346,6 +346,25 @@ void apply_gumjs_hooks() {
     #endif
 
     // ============================================
+    // BLOCK 16d: Location (GPS fix) Macro Injection
+    // ============================================
+    #ifdef LOCATION_LATITUDE
+    g_string_append_printf(js, "global.LOCATION_LATITUDE = %.8f;\n", (double) LOCATION_LATITUDE);
+    #endif
+
+    #ifdef LOCATION_LONGITUDE
+    g_string_append_printf(js, "global.LOCATION_LONGITUDE = %.8f;\n", (double) LOCATION_LONGITUDE);
+    #endif
+
+    #ifdef LOCATION_ACCURACY
+    g_string_append_printf(js, "global.LOCATION_ACCURACY = %.3f;\n", (double) LOCATION_ACCURACY);
+    #endif
+
+    #ifdef LOCATION_ALTITUDE
+    g_string_append_printf(js, "global.LOCATION_ALTITUDE = %.3f;\n", (double) LOCATION_ALTITUDE);
+    #endif
+
+    // ============================================
     // BLOCK 17: Package Manager Spoofing Macro Injection
     // ============================================
     #ifdef PACKAGE_NAME

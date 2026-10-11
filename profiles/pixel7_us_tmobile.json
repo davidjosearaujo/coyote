@@ -76,5 +76,11 @@
     "wifi_mac": "9c:3d:cf:dd:ee:ff",
     "account_email": "john.smith@gmail.com",
     "account_type": "com.google"
+  },
+  "location": {
+    "latitude": 40.7128,
+    "longitude": -74.0060,
+    "accuracy": 20.0,
+    "altitude": 10.0
   }
 }

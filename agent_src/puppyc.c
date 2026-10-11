@@ -349,10 +349,10 @@ static int hook_posix_spawn(pid_t *pid, const char *path,
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
-            char cmd_buf[512];
-            snprintf(cmd_buf, sizeof(cmd_buf), "echo '%s'", mock_val);
-            char *fake_argv[] = {"/system/bin/sh", "-c", cmd_buf, NULL};
-            return orig_posix_spawn(pid, "/system/bin/sh", file_actions, attrp, fake_argv, envp);
+            // Exec `echo <val>` directly (argv, not a shell) so a value with a
+            // quote or shell metacharacter needs no escaping and can't inject.
+            char *fake_argv[] = {"echo", (char *) mock_val, NULL};
+            return orig_posix_spawn(pid, "/system/bin/echo", file_actions, attrp, fake_argv, envp);
         }
     }
 
@@ -375,10 +375,9 @@ static int hook_posix_spawnp(pid_t *pid, const char *path,
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
-            char cmd_buf[512];
-            snprintf(cmd_buf, sizeof(cmd_buf), "echo '%s'", mock_val);
-            char *fake_argv[] = {"sh", "-c", cmd_buf, NULL};
-            return orig_posix_spawnp(pid, "sh", file_actions, attrp, fake_argv, envp);
+            // Exec `echo <val>` directly (argv, not a shell) — no quoting needed.
+            char *fake_argv[] = {"echo", (char *) mock_val, NULL};
+            return orig_posix_spawnp(pid, "/system/bin/echo", file_actions, attrp, fake_argv, envp);
         }
     }
 
@@ -588,10 +587,12 @@ static int hook_open(const char *path, int flags, int mode) {
 typedef int (*AccessFunc)(const char *path, int mode);
 typedef int (*FaccessatFunc)(int dirfd, const char *path, int mode, int flags);
 typedef int (*StatFunc)(const char *path, void *buf);
+typedef int (*FstatatFunc)(int dirfd, const char *path, void *buf, int flags);
 static AccessFunc orig_access = NULL;
 static FaccessatFunc orig_faccessat = NULL;
 static StatFunc orig_stat = NULL;
 static StatFunc orig_lstat = NULL;
+static FstatatFunc orig_fstatat = NULL;
 
 static int hook_access(const char *path, int mode) {
     if (is_hidden_path(path)) { RLOG("hide access %s", path); errno = ENOENT; return -1; }
@@ -608,6 +609,12 @@ static int hook_stat(const char *path, void *buf) {
 static int hook_lstat(const char *path, void *buf) {
     if (is_hidden_path(path)) { RLOG("hide lstat %s", path); errno = ENOENT; return -1; }
     return orig_lstat(path, buf);
+}
+// On many bionic builds stat()/lstat() are inline wrappers around fstatat, so
+// hook it too (this is also what java.io.File's stat path ultimately calls).
+static int hook_fstatat(int dirfd, const char *path, void *buf, int flags) {
+    if (is_hidden_path(path)) { RLOG("hide fstatat %s", path); errno = ENOENT; return -1; }
+    return orig_fstatat(dirfd, path, buf, flags);
 }
 
 static int create_memfd_with_data(const char *name, const char *data, size_t size) {
@@ -633,13 +640,18 @@ static int create_memfd_with_data(const char *name, const char *data, size_t siz
 // finds nothing. The real file is opened via the openat syscall directly to
 // bypass our own open/openat hooks (no recursion). Returns -1 on any failure so
 // the caller falls through to the real file.
-static int create_filtered_mounts_fd(const char *path) {
+// Serve a copy of a line-oriented /proc file with any line containing one of the
+// `drop` substrings removed, via a memfd. The real file is opened through the
+// openat syscall directly (bypassing our own hooks → no recursion). `cap` bounds
+// the buffer (maps can be large). Returns -1 on failure so the caller falls
+// through to the real file.
+static int create_filtered_fd(const char *path, const char *const *drop,
+                              const char *memfd_name, size_t cap) {
     int rfd = (int) syscall(__NR_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
     if (rfd < 0) return -1;
 
-    const size_t CAP = 65536;
-    char *raw = (char *) malloc(CAP);
-    char *out = (char *) malloc(CAP);
+    char *raw = (char *) malloc(cap);
+    char *out = (char *) malloc(cap);
     if (raw == NULL || out == NULL) {
         free(raw); free(out); close(rfd);
         return -1;
@@ -647,7 +659,7 @@ static int create_filtered_mounts_fd(const char *path) {
 
     size_t total = 0;
     ssize_t n;
-    while (total < CAP - 1 && (n = read(rfd, raw + total, CAP - 1 - total)) > 0) {
+    while (total < cap - 1 && (n = read(rfd, raw + total, cap - 1 - total)) > 0) {
         total += (size_t) n;
     }
     close(rfd);
@@ -656,19 +668,20 @@ static int create_filtered_mounts_fd(const char *path) {
     size_t olen = 0;
     char *saveptr = NULL;
     for (char *line = strtok_r(raw, "\n", &saveptr); line != NULL; line = strtok_r(NULL, "\n", &saveptr)) {
-        if (strstr(line, "magisk") || strstr(line, "/data/adb") ||
-            strstr(line, "kernelsu") || strstr(line, "KSU")) {
-            continue; // drop Magisk/KernelSU mount entries
+        int drop_line = 0;
+        for (int i = 0; drop[i] != NULL; i++) {
+            if (strstr(line, drop[i]) != NULL) { drop_line = 1; break; }
         }
+        if (drop_line) continue;
         size_t len = strlen(line);
-        if (olen + len + 1 < CAP) {
+        if (olen + len + 1 < cap) {
             memcpy(out + olen, line, len);
             olen += len;
             out[olen++] = '\n';
         }
     }
 
-    int fd = create_memfd_with_data("mounts_fake", out, olen);
+    int fd = create_memfd_with_data(memfd_name, out, olen);
     free(raw);
     free(out);
     return fd;
@@ -680,10 +693,24 @@ static int get_intercepted_fd(const char *path) {
     if (strcmp(path, "/proc/mounts") == 0 ||
         strcmp(path, "/proc/self/mounts") == 0 ||
         strcmp(path, "/proc/self/mountinfo") == 0) {
-        int fd = create_filtered_mounts_fd(path);
+        static const char *const drop[] = {"magisk", "/data/adb", "kernelsu", "KSU", NULL};
+        int fd = create_filtered_fd(path, drop, "mounts", 65536);
         if (fd >= 0) {
             LOGI("PuppyC filtered Magisk mounts from %s", path);
             RLOG("filter mounts %s", path);
+            return fd;
+        }
+    }
+
+    // Hide the injected library from a /proc/self/maps scan (anti-tamper checks
+    // enumerate mapped libraries looking for an injected .so). The embedded
+    // GumJS runtime is linked into libcoyote.so, so dropping its lines hides it.
+    if (strcmp(path, "/proc/self/maps") == 0 || strcmp(path, "/proc/self/task/maps") == 0) {
+        static const char *const drop[] = {"libcoyote", NULL};
+        int fd = create_filtered_fd(path, drop, "maps", 4 * 1024 * 1024);
+        if (fd >= 0) {
+            LOGI("PuppyC filtered libcoyote from %s", path);
+            RLOG("filter maps %s", path);
             return fd;
         }
     }
@@ -706,21 +733,21 @@ static int get_intercepted_fd(const char *path) {
         int len = snprintf(buf, sizeof(buf), "%.2f %.2f\n", spoof_up, spoof_idle);
         if (len > 0) {
             LOGI("PuppyC intercepted open for /proc/uptime");
-            return create_memfd_with_data("uptime_fake", buf, (size_t)len);
+            return create_memfd_with_data("uptime", buf, (size_t)len);
         }
     }
 
     #ifdef DEVICE_CPU_INFO
     if (strcmp(path, "/proc/cpuinfo") == 0) {
         LOGI("PuppyC intercepted open for /proc/cpuinfo");
-        return create_memfd_with_data("cpuinfo_fake", DEVICE_CPU_INFO, strlen(DEVICE_CPU_INFO));
+        return create_memfd_with_data("cpuinfo", DEVICE_CPU_INFO, strlen(DEVICE_CPU_INFO));
     }
     #endif
     
     if (strcmp(path, "/sys/fs/selinux/enforce") == 0) {
         LOGI("PuppyC intercepted open for /sys/fs/selinux/enforce");
         const char *val = "1\n";
-        return create_memfd_with_data("selinux_fake", val, strlen(val));
+        return create_memfd_with_data("enforce", val, strlen(val));
     }
     
     #if defined(SPECS_TOTAL_RAM) && defined(SPECS_AVAIL_RAM) && defined(SPECS_SWAP_TOTAL_KB)
@@ -804,7 +831,7 @@ static int get_intercepted_fd(const char *path) {
             _VMALLOC_TOTAL, apply_jitter(385400, 0.01)
         );
         
-        return create_memfd_with_data("meminfo_fake", meminfo_buf, len);
+        return create_memfd_with_data("meminfo", meminfo_buf, len);
     }
     #endif
 
@@ -962,6 +989,10 @@ void apply_native_gum_hooks() {
     if (target_faccessat) gum_interceptor_replace(interceptor, target_faccessat, GSIZE_TO_POINTER(hook_faccessat), (gpointer *)&orig_faccessat, NULL);
     if (target_stat)      gum_interceptor_replace(interceptor, target_stat,      GSIZE_TO_POINTER(hook_stat),      (gpointer *)&orig_stat,      NULL);
     if (target_lstat)     gum_interceptor_replace(interceptor, target_lstat,     GSIZE_TO_POINTER(hook_lstat),     (gpointer *)&orig_lstat,     NULL);
+    // fstatat / newfstatat (stat/lstat are often inline wrappers around it).
+    gpointer target_fstatat = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "fstatat"));
+    if (!target_fstatat) target_fstatat = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "newfstatat"));
+    if (target_fstatat) gum_interceptor_replace(interceptor, target_fstatat, GSIZE_TO_POINTER(hook_fstatat), (gpointer *)&orig_fstatat, NULL);
     #endif
 
     #if defined(DEVICE_GL_VENDOR) || defined(DEVICE_GL_RENDERER) || defined(DEVICE_GL_VERSION)

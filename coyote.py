@@ -22,6 +22,28 @@ ABI_MAP = {
     "x86": {"compiler": "i686-linux-android", "devkit": "x86"},
 }
 
+# Representative city coordinates per ISO-3166 alpha-2 country code, used to
+# derive a plausible GPS fix that matches a profile's telecom country when no
+# explicit `location` is given. (lat, lon)
+COUNTRY_COORDS = {
+    "ad": (42.5063, 1.5218), "us": (40.7128, -74.0060), "gb": (51.5074, -0.1278),
+    "ca": (43.6532, -79.3832), "au": (-33.8688, 151.2093), "de": (52.5200, 13.4050),
+    "fr": (48.8566, 2.3522), "es": (40.4168, -3.7038), "pt": (38.7223, -9.1393),
+    "it": (41.9028, 12.4964), "nl": (52.3676, 4.9041), "be": (50.8503, 4.3517),
+    "ch": (47.3769, 8.5417), "at": (48.2082, 16.3738), "ie": (53.3498, -6.2603),
+    "se": (59.3293, 18.0686), "no": (59.9139, 10.7522), "dk": (55.6761, 12.5683),
+    "fi": (60.1699, 24.9384), "pl": (52.2297, 21.0122), "cz": (50.0755, 14.4378),
+    "ru": (55.7558, 37.6173), "ua": (50.4501, 30.5234), "tr": (41.0082, 28.9784),
+    "gr": (37.9838, 23.7275), "br": (-23.5505, -46.6333), "mx": (19.4326, -99.1332),
+    "ar": (-34.6037, -58.3816), "cl": (-33.4489, -70.6693), "co": (4.7110, -74.0721),
+    "in": (28.6139, 77.2090), "cn": (39.9042, 116.4074), "jp": (35.6762, 139.6503),
+    "kr": (37.5665, 126.9780), "id": (-6.2088, 106.8456), "th": (13.7563, 100.5018),
+    "vn": (21.0278, 105.8342), "ph": (14.5995, 120.9842), "my": (3.1390, 101.6869),
+    "sg": (1.3521, 103.8198), "ae": (25.2048, 55.2708), "sa": (24.7136, 46.6753),
+    "il": (32.0853, 34.7818), "za": (-26.2041, 28.0473), "ng": (6.5244, 3.3792),
+    "eg": (30.0444, 31.2357), "nz": (-36.8485, 174.7633),
+}
+
 def detect_device_abi() -> dict:
     """Queries target device via ADB, defaulting to the host's architecture if unavailable."""
     try:
@@ -85,7 +107,7 @@ class Coyote:
 
         KNOWN_SECTIONS = {
             "telecom", "bypass", "device_profile", "specs",
-            "network", "attribution", "identity", "system_prop",
+            "network", "attribution", "identity", "location", "system_prop",
         }
         # Keys that must be plain integers (emitted as unsigned long long bytes).
         SIZE_KEYS = {"TOTAL_SPACE", "FREE_SPACE", "TOTAL_RAM", "AVAIL_RAM", "RAM_THRESHOLD"}
@@ -179,10 +201,25 @@ class Coyote:
         sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", prop_key).upper()
         return f"SYS_PROP_{sanitized}"
 
+    def _resolve_location(self):
+        """Fill in a GPS fix when the profile has none: if there's no explicit
+        `location` (with lat/lon) but telecom.country_iso maps to a known city,
+        derive coordinates from it so the fix matches the SIM country."""
+        loc = self.profile.get("location") or {}
+        if "latitude" in loc and "longitude" in loc:
+            return  # explicit coordinates win
+        iso = (self.profile.get("telecom", {}) or {}).get("country_iso", "").lower()
+        coords = COUNTRY_COORDS.get(iso)
+        if coords:
+            lat, lon = coords
+            self.profile["location"] = {"latitude": lat, "longitude": lon, "accuracy": 20.0}
+            print(f"    [+] Derived location from telecom.country_iso='{iso}': {lat}, {lon}")
+
     def generate_c_header(self):
         """Dynamically generates config.h from the JSON profile without a template."""
         print("\n[+] Generating agent_src/config.h header file...")
         output_file = BUILD_DIR / "config.h"
+        self._resolve_location()
 
         def format_value(key: str, val) -> str:
             """Infers the correct C-type formatting for the macro value."""
@@ -191,6 +228,10 @@ class Coyote:
             if isinstance(val, str):
                 return f'"{val}"'
             if isinstance(val, float):
+                # GPS coordinates need double precision — emit as a double (no
+                # 'f' suffix) so latitude/longitude aren't truncated to float.
+                if key in ("LATITUDE", "LONGITUDE", "ACCURACY", "ALTITUDE"):
+                    return repr(val)
                 return f"{val}f"
             if isinstance(val, int):
                 if key in ["TOTAL_SPACE", "FREE_SPACE", "TOTAL_RAM", "AVAIL_RAM", "RAM_THRESHOLD"]:
@@ -212,6 +253,7 @@ class Coyote:
             ("5. Network Configuration", "network", "NETWORK_"),
             ("6. Attribution & Install Tracking", "attribution", "ATTRIBUTION_"),
             ("7. Identity & Accounts (Wi-Fi, accounts)", "identity", "IDENTITY_"),
+            ("8. Location (GPS fix)", "location", "LOCATION_"),
         ]
 
         macro_count = 0
@@ -604,6 +646,16 @@ def capture_profile(output_path: str):
     identity["account_type"] = "com.google"
     generated.append("identity.wifi_bssid/wifi_mac (synthesized)")
 
+    # --- location: last-known GPS fix from the device (if any) ---
+    location: dict = {}
+    mloc = re.search(r"Location\[\w+\s+([-\d.]+),\s*([-\d.]+)", sh("dumpsys location"))
+    if mloc:
+        location["latitude"] = float(mloc.group(1))
+        location["longitude"] = float(mloc.group(2))
+        macc = re.search(r"hAcc=([\d.]+)", sh("dumpsys location"))
+        location["accuracy"] = float(macc.group(1)) if macc else 20.0
+    # else left empty — the build derives a fix from telecom.country_iso.
+
     # --- bypass / attribution: policy & fabricated — auto-generated defaults ---
     bypass = {"flag_secure": 1}
     attribution = {
@@ -650,6 +702,7 @@ def capture_profile(output_path: str):
         "network": network,
         "attribution": attribution,
         "identity": identity,
+        "location": location,
         "system_prop": system_prop,
     }
     profile = {k: v for k, v in profile.items() if v}

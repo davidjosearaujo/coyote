@@ -7,11 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-11
+
 ### Added
 - `-s` / `--serial <id>` flag to scope every ADB call (capture, ABI detection,
   devkit, deploy, reset) to a specific device via `ANDROID_SERIAL` — e.g.
   capture a profile from a physical phone and inject it into an emulator while
   both are connected.
+- `/proc/self/maps` filtering that strips `libcoyote.so`, hiding the injected
+  library from anti-tamper scans of mapped modules.
+- `fstatat`/`newfstatat` hook so root/Magisk file-existence hiding also covers
+  the stat path on bionic builds where `stat`/`lstat` are inline wrappers.
+- Sensor fabrication: `SensorManager.getSensorList`/`getDefaultSensor` now
+  return a fabricated set of `android.hardware.Sensor` objects (accelerometer,
+  gyroscope, magnetometer, light, proximity, pressure) instead of only logging —
+  defensive, falling back to recon-only if the ART build won't allow it.
+- Location spoofing: new `location` profile section (lat/lon/accuracy/altitude);
+  `LocationManager.getLastKnownLocation` returns the fix and `Geocoder` reverse-
+  geocodes to the matching country. Coordinates come from an explicit `location`
+  or, failing that, are derived from `telecom.country_iso`. `--capture` prefills
+  `location` from the device's last-known fix (`dumpsys location`).
+
+### Changed
+- Native `getprop` spoofing now execs `echo <value>` directly (argv, no shell)
+  in the `posix_spawn`/`posix_spawnp` paths, matching the `exec*` paths.
+- JS agent waits for the ART VM via the JNI invocation API
+  (`JNI_GetCreatedJavaVMs`) before probing the Java bridge, instead of poking
+  frida-java-bridge's private `_apiError` field — version-proof, and it avoids
+  the early-probe fault that made that poke necessary.
+
+### Fixed
+- Self-detection leak: in-memory spoof files (`/proc/cpuinfo`, `/proc/meminfo`,
+  `/proc/uptime`, `/proc/mounts`, selinux) no longer use obvious `*_fake` memfd
+  names that were visible under `/proc/self/fd`.
+- Native `getprop` values containing a quote or shell metacharacter are no
+  longer mishandled (and can't inject), since the shell is no longer involved.
 
 ## [1.0.0] - 2026-10-11
 
@@ -46,5 +76,6 @@ analysis, with no `frida-server` footprint.
 - **Test harness**: the "Border Patrol" validation app covering every spoofing
   vector.
 
-[Unreleased]: https://codeberg.org/davidjosearaujo/coyote/compare/v1.0.0...HEAD
+[Unreleased]: https://codeberg.org/davidjosearaujo/coyote/compare/v1.1.0...HEAD
+[1.1.0]: https://codeberg.org/davidjosearaujo/coyote/compare/v1.0.0...v1.1.0
 [1.0.0]: https://codeberg.org/davidjosearaujo/coyote/releases/tag/v1.0.0

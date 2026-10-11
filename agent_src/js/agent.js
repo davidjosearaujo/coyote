@@ -1303,32 +1303,193 @@ function onJavaReady(Java) {
     }
 
     // ============================================
-    // BLOCK 24: Sensor probes (recon)
-    // Sensor *presence* is already forced via PackageManager.hasSystemFeature
-    // (BLOCK 17). Fabricating android.hardware.Sensor objects has no public
-    // constructor and is unsafe to do blindly, so here we only record sensor
-    // enumeration so you can see whether the target inspects them.
+    // BLOCK 24: Sensor fabrication
+    // Emulators expose few/no sensors, which is a strong tell. Fabricate a
+    // plausible set of android.hardware.Sensor objects via the package-private
+    // no-arg constructor + private field writes. All of it is defensive: if the
+    // ART build doesn't allow the construction, we fall back to recon-only so we
+    // never crash a getSensorList() call.
     // ============================================
     try {
         const SensorManager = Java.use('android.hardware.SensorManager');
-        if (SensorManager.getSensorList) {
+        const Sensor = Java.use('android.hardware.Sensor');
+        const ArrayList = Java.use('java.util.ArrayList');
+
+        // type, name, vendor, maxRange, resolution, power(mA), minDelay(us)
+        const SENSORS = [
+            {type: 1,  name: 'LSM6DSO Accelerometer', vendor: 'STMicroelectronics', max: 78.4532,   res: 0.0023956, power: 0.15,   minDelay: 2404},
+            {type: 4,  name: 'LSM6DSO Gyroscope',     vendor: 'STMicroelectronics', max: 34.906586, res: 0.0010653, power: 0.65,   minDelay: 2404},
+            {type: 2,  name: 'AK09918 Magnetometer',  vendor: 'AKM',                max: 4912.0,     res: 0.15,      power: 0.1,    minDelay: 10000},
+            {type: 5,  name: 'TMD4906 Light',         vendor: 'AMS',                max: 60000.0,    res: 1.0,       power: 0.12,   minDelay: 0},
+            {type: 8,  name: 'TMD4906 Proximity',     vendor: 'AMS',                max: 5.0,        res: 1.0,       power: 0.12,   minDelay: 0},
+            {type: 6,  name: 'LPS22HH Pressure',      vendor: 'STMicroelectronics', max: 1260.0,     res: 0.0002,    power: 0.0017, minDelay: 40000},
+        ];
+
+        const setField = function (obj, field, val) {
+            try { obj[field].value = val; } catch (e) {}
+        };
+        const buildSensor = function (spec, handle) {
+            const s = Sensor.$new(); // package-private Sensor()
+            setField(s, 'mType', spec.type);
+            setField(s, 'mName', spec.name);
+            setField(s, 'mVendor', spec.vendor);
+            setField(s, 'mVersion', 1);
+            setField(s, 'mHandle', handle);
+            setField(s, 'mMaxRange', spec.max);
+            setField(s, 'mResolution', spec.res);
+            setField(s, 'mPower', spec.power);
+            setField(s, 'mMinDelay', spec.minDelay);
+            setField(s, 'mMaxDelay', 1000000);
+            setField(s, 'mFifoReservedEventCount', 0);
+            setField(s, 'mFifoMaxEventCount', 0);
+            setField(s, 'mRequiredPermission', '');
+            setField(s, 'mFlags', 0);
+            return s;
+        };
+
+        // Probe once; only install fabricating hooks if construction works.
+        let probe = null;
+        try { probe = buildSensor(SENSORS[0], 0); } catch (e) { probe = null; }
+
+        if (probe !== null && probe.getType() === 1) {
+            // Build fresh each call — Frida Java wrappers don't survive across
+            // call frames, so caching them makes a later getType()/add() throw
+            // (which would return null to Java and NPE the caller).
+            SensorManager.getSensorList.overload('int').implementation = function (type) {
+                recon('SensorManager.getSensorList', type);
+                const list = ArrayList.$new();
+                for (let i = 0; i < SENSORS.length; i++) {
+                    if (type === -1 /* TYPE_ALL */ || SENSORS[i].type === type) {
+                        try { list.add(buildSensor(SENSORS[i], i + 1)); } catch (e) {}
+                    }
+                }
+                return list;
+            };
+            SensorManager.getDefaultSensor.overload('int').implementation = function (type) {
+                recon('SensorManager.getDefaultSensor', type);
+                for (let i = 0; i < SENSORS.length; i++) {
+                    if (SENSORS[i].type === type) {
+                        try { return buildSensor(SENSORS[i], i + 1); } catch (e) {}
+                    }
+                }
+                return this.getDefaultSensor(type);
+            };
+            console.log('[+] JSAgent fabricated SensorManager sensors (' + SENSORS.length + ')');
+        } else {
+            // Fabrication not supported here — keep recon only, change nothing.
             SensorManager.getSensorList.overload('int').implementation = function (type) {
                 recon('SensorManager.getSensorList', type);
                 return this.getSensorList(type);
             };
+            console.log('[-] Sensor fabrication unavailable on this ART; recon-only');
         }
-        if (SensorManager.getDefaultSensor) {
-            SensorManager.getDefaultSensor.overload('int').implementation = function (type) {
-                recon('SensorManager.getDefaultSensor', type);
-                return this.getDefaultSensor(type);
-            };
-        }
-        console.log('[+] JSAgent instrumented SensorManager (recon)');
     } catch (e) {
-        console.log('[-] Error instrumenting SensorManager: ' + e);
+        console.log('[-] Error hooking SensorManager: ' + e);
+    }
+
+    // ============================================
+    // BLOCK 25: Location spoofing (GPS fix matching the profile)
+    // Coordinates come from the profile's `location` section (explicit or
+    // country-derived). Also returns a matching-country Address for apps that
+    // reverse-geocode the fix.
+    // ============================================
+    if (typeof global.LOCATION_LATITUDE !== 'undefined' && typeof global.LOCATION_LONGITUDE !== 'undefined') {
+        try {
+            const Location = Java.use('android.location.Location');
+            const SystemClock = Java.use('android.os.SystemClock');
+            const System = Java.use('java.lang.System');
+
+            const makeLocation = function (provider) {
+                const loc = Location.$new(provider ? provider : 'gps');
+                loc.setLatitude(global.LOCATION_LATITUDE);
+                loc.setLongitude(global.LOCATION_LONGITUDE);
+                if (typeof global.LOCATION_ACCURACY !== 'undefined') loc.setAccuracy(global.LOCATION_ACCURACY);
+                if (typeof global.LOCATION_ALTITUDE !== 'undefined') loc.setAltitude(global.LOCATION_ALTITUDE);
+                loc.setTime(System.currentTimeMillis());
+                try { loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos()); } catch (e) {}
+                return loc;
+            };
+
+            const LocationManager = Java.use('android.location.LocationManager');
+            if (LocationManager.getLastKnownLocation) {
+                LocationManager.getLastKnownLocation.overload('java.lang.String').implementation = function (provider) {
+                    recon('LocationManager.getLastKnownLocation', provider);
+                    return makeLocation(provider);
+                };
+            }
+            console.log('[+] JSAgent hooked LocationManager successfully');
+
+            // Reverse geocoding: hand back an Address with the matching country.
+            try {
+                const Geocoder = Java.use('android.location.Geocoder');
+                const ArrayList = Java.use('java.util.ArrayList');
+                const Address = Java.use('android.location.Address');
+                const Locale = Java.use('java.util.Locale');
+                const ccode = (typeof global.TELECOM_COUNTRY_ISO !== 'undefined') ? global.TELECOM_COUNTRY_ISO.toUpperCase() : '';
+                const cname = (typeof global.TELECOM_MCC_COUNTRY_NAME !== 'undefined') ? global.TELECOM_MCC_COUNTRY_NAME : '';
+                if (Geocoder.getFromLocation) {
+                    Geocoder.getFromLocation.overload('double', 'double', 'int').implementation = function (lat, lon, max) {
+                        recon('Geocoder.getFromLocation', lat + ',' + lon);
+                        const list = ArrayList.$new();
+                        try {
+                            const addr = Address.$new(Locale.getDefault());
+                            addr.setLatitude(global.LOCATION_LATITUDE);
+                            addr.setLongitude(global.LOCATION_LONGITUDE);
+                            if (ccode) addr.setCountryCode(ccode);
+                            if (cname) addr.setCountryName(cname);
+                            list.add(addr);
+                        } catch (e) {}
+                        return list;
+                    };
+                }
+                console.log('[+] JSAgent hooked Geocoder successfully');
+            } catch (e) {
+                console.log('[-] Error hooking Geocoder: ' + e);
+            }
+        } catch (e) {
+            console.log('[-] Error hooking location: ' + e);
+        }
     }
 
     console.log('[+] JSAgent: All hook blocks installed');
+}
+
+// Resolve a global native export across Gum API versions (newer builds expose
+// findGlobalExportByName/getGlobalExportByName; older ones findExportByName).
+function findGlobalSym(name) {
+    if (typeof Module.findGlobalExportByName === 'function') {
+        return Module.findGlobalExportByName(name);
+    }
+    if (typeof Module.getGlobalExportByName === 'function') {
+        try { return Module.getGlobalExportByName(name); } catch (e) { return null; }
+    }
+    if (typeof Module.findExportByName === 'function') {
+        return Module.findExportByName(null, name);
+    }
+    return null;
+}
+
+// Version-proof readiness check: has the ART VM actually been created yet?
+// Queries the JNI invocation API (JNI_GetCreatedJavaVMs) via Gum. This depends
+// on no frida-java-bridge internals, and lets us defer the first Java.available
+// probe until it is guaranteed to succeed — so getApi() never faults early and
+// the bridge never caches a permanent init error (the reason the old code had
+// to poke the private _apiError field).
+let _jniGetCreatedVMs = null;
+function artVmReady() {
+    try {
+        if (_jniGetCreatedVMs === null) {
+            const sym = findGlobalSym('JNI_GetCreatedJavaVMs');
+            if (sym === null) return false; // libart not loaded yet
+            _jniGetCreatedVMs = new NativeFunction(sym, 'int', ['pointer', 'int', 'pointer']);
+        }
+        const vmBuf = Memory.alloc(Process.pointerSize);
+        const nVms = Memory.alloc(4); // jsize (int)
+        if (_jniGetCreatedVMs(vmBuf, 1, nVms) !== 0) return false;
+        return nVms.readInt() > 0;
+    } catch (e) {
+        return false;
+    }
 }
 
 function waitForJava() {
@@ -1338,23 +1499,26 @@ function waitForJava() {
         attempts++;
 
         try {
-            const mod = require("frida-java-bridge");
-            const Java = (mod && mod.default) ? mod.default : mod;
-
-            if (Java._apiError) {
-                Java._apiError = null;
-            }
-
-            if (Java && typeof Java.available !== 'undefined' && Java.available === true) {
-                clearInterval(interval);
-                console.log('[+] JSAgent: Java.available === true at attempt ' + attempts);
-
-                installGate(Java);
+            // Don't touch the bridge until the ART VM exists — see artVmReady().
+            if (!artVmReady()) {
+                if (attempts % 40 === 0) {
+                    console.log('[+] JSAgent: waiting for ART VM... (attempt ' + attempts + ')');
+                }
+                if (attempts > 6000) {
+                    clearInterval(interval);
+                    console.error('[!] JSAgent: FATAL - ART VM never came up');
+                }
                 return;
             }
 
-            if (attempts % 40 === 0) {
-                console.log('[+] JSAgent: Attempt ' + attempts + ' - Java.available: ' + Java.available);
+            const mod = require("frida-java-bridge");
+            const Java = (mod && mod.default) ? mod.default : mod;
+
+            if (Java && Java.available === true) {
+                clearInterval(interval);
+                console.log('[+] JSAgent: Java available at attempt ' + attempts);
+                installGate(Java);
+                return;
             }
         } catch (e) {
             if (attempts === 1 || attempts % 40 === 0) {

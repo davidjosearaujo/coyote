@@ -152,7 +152,10 @@ that native hooks can't reach cleanly:
 - `getprop` via `ProcessBuilder`/`Runtime.exec` (rewritten to echo spoofed values)
 - Accounts (`AccountManager.getAccounts`/`getAccountsByType` ← `identity`)
 - Wi-Fi identity (`WifiInfo.getSSID`/`getBSSID`/`getMacAddress` ← `identity`)
-- Sensors (recon only — presence is forced via `PackageManager.hasSystemFeature`)
+- Sensors (`SensorManager.getSensorList`/`getDefaultSensor` return a fabricated
+  set of `Sensor` objects; presence also forced via `hasSystemFeature`)
+- Location (`LocationManager.getLastKnownLocation` + `Geocoder.getFromLocation`
+  ← `location`, with the reverse-geocode country matching `telecom`)
 
 ### Process model
 
@@ -337,14 +340,17 @@ emulator), so the `.so` matches where it runs.
 - **Read from the device** — `device_profile` (incl. `cpu_info`, GPU strings,
   keyboard), `specs` (display/RAM/storage/battery/swap), `telecom`
   (MCC/MNC/operator/ISO, locale, timezone, SIM state), `network` (local IPs,
-  active transport), Wi-Fi SSID / account email where available, and the
-  detection-relevant `system_prop` keys present on the device.
+  active transport), Wi-Fi SSID / account email where available, the last-known
+  GPS fix (`location`, from `dumpsys location`), and the detection-relevant
+  `system_prop` keys present on the device.
 - **Auto-generated** (not readable off a device, so synthesized to plausible
   values) — `bypass` (`flag_secure`), `attribution` (Play install source/
   referrer), `telecom.network_type`/`imei_prefix`, `specs.RAM_THRESHOLD`
   (derived), and `identity.wifi_bssid`/`wifi_mac` plus `wifi_ssid`/
   `account_email` when they can't be read. The command prints exactly which
   fields were synthesized so you can review them.
+- **Derived at build time** — if no `location` is captured or set,
+  `telecom.country_iso` picks a representative coordinate for that country.
 
 **See what a target probes (recon mode):**
 
@@ -471,6 +477,17 @@ All keys optional; omit one and that hook stays off.
 | `account_email` | `"jane.doe@gmail.com"` | Fake account name from `AccountManager` |
 | `account_type` | `"com.google"` | Account type (defaults to `com.google`) |
 
+**`location` → `LOCATION_*`** — a GPS fix. If omitted but `telecom.country_iso`
+is known, Coyote derives a representative coordinate for that country so the fix
+matches the SIM country automatically.
+
+| Key | Example | Meaning |
+| --- | --- | --- |
+| `latitude` | `42.5063` | degrees (double) |
+| `longitude` | `1.5218` | degrees (double) |
+| `accuracy` | `18.0` | meters, optional |
+| `altitude` | `1023.0` | meters, optional |
+
 **`system_prop`** — see below (handled specially).
 
 ### Value typing rules
@@ -548,7 +565,8 @@ profiles cover a large, practical set (100+ keys) you can use as a baseline.
 | Uptime | Native | `/proc/uptime` → real boot clock + multi-day offset |
 | Accounts | JS | `AccountManager` ← `identity` |
 | Wi-Fi identity | JS | `WifiInfo` SSID/BSSID/MAC ← `identity` |
-| Sensors (presence) | JS | `PackageManager.hasSystemFeature` |
+| Sensors | JS | fabricated `Sensor` objects via `SensorManager`; presence via `hasSystemFeature` |
+| Location | JS | `LocationManager` + `Geocoder` ← `location` (country-derived fallback) |
 
 ---
 
@@ -594,7 +612,7 @@ coyote/
 │   │   └── agent.js        # Managed (Java/ART) hooks + in-process spawn-gating
 │   └── devkit/             # Frida GumJS devkit (git-ignored; via --update-devkit)
 ├── build/                  # Generated: config.h, _agent.js, agent.h, libcoyote.so
-└── test/                   # "Border Patrol" validation app (~307 detection checks)
+└── test/                   # "Border Patrol" validation app (~314 detection checks)
 ```
 
 ---

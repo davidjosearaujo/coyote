@@ -216,5 +216,11 @@
     "wifi_mac": "a4:2b:8c:44:55:66",
     "account_email": "jane.doe@gmail.com",
     "account_type": "com.google"
+  },
+  "location": {
+    "latitude": 42.5063,
+    "longitude": 1.5218,
+    "accuracy": 18.0,
+    "altitude": 1023.0
   }
 }
