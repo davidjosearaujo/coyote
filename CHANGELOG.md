@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `-s` / `--serial <id>` flag to scope every ADB call (capture, ABI detection,
-  devkit, deploy, reset) to a specific device via `ANDROID_SERIAL` — e.g.
+  devkit, deploy, reset) to a specific device via `ANDROID_SERIAL`, e.g.
   capture a profile from a physical phone and inject it into an emulator while
   both are connected.
 - `/proc/self/maps` filtering that strips `libcoyote.so`, hiding the injected
@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the stat path on bionic builds where `stat`/`lstat` are inline wrappers.
 - Sensor fabrication: `SensorManager.getSensorList`/`getDefaultSensor` now
   return a fabricated set of `android.hardware.Sensor` objects (accelerometer,
-  gyroscope, magnetometer, light, proximity, pressure) instead of only logging —
+  gyroscope, magnetometer, light, proximity, pressure) instead of only logging,
   defensive, falling back to recon-only if the ART build won't allow it.
 - Location spoofing: new `location` profile section (lat/lon/accuracy/altitude);
   `LocationManager.getLastKnownLocation` returns the fix and `Geocoder` reverse-
@@ -33,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the `posix_spawn`/`posix_spawnp` paths, matching the `exec*` paths.
 - JS agent waits for the ART VM via the JNI invocation API
   (`JNI_GetCreatedJavaVMs`) before probing the Java bridge, instead of poking
-  frida-java-bridge's private `_apiError` field — version-proof, and it avoids
+  frida-java-bridge's private `_apiError` field, version-proof, and it avoids
   the early-probe fault that made that poke necessary.
 
 ### Fixed
@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - 2026-10-11
 
-Initial release — an in-process Android device-spoofing agent for malware
+Initial release, an in-process Android device-spoofing agent for malware
 analysis, with no `frida-server` footprint.
 
 ### Added

@@ -5,9 +5,9 @@
 Coyote makes a real analysis device or emulator look like an arbitrary "clean"
 physical phone to the app under test. It compiles a native shared library
 (`libcoyote.so`) that is loaded into the target process and rewrites the answers
-to the APIs apps use for environment/emulator detection — display metrics, RAM,
+to the APIs apps use for environment/emulator detection, display metrics, RAM,
 storage, battery, SIM/carrier, system properties, build fingerprint, network
-state, installer source, and more — so that evasive apps which refuse to run on
+state, installer source, and more, so that evasive apps which refuse to run on
 an emulator will run, and can be observed.
 
 Unlike a typical Frida setup, Coyote does **not** require `frida-server` running
@@ -57,7 +57,7 @@ values that scream "Android Studio AVD", a missing Play Store installer, USB
 debugging flags, and so on.
 
 Coyote intercepts those probes inside the target process and returns values from
-a **device profile** you supply — a JSON description of the phone you want the
+a **device profile** you supply, a JSON description of the phone you want the
 app to believe it is running on (e.g. a Google Pixel 8 Pro on Andorra Telecom).
 The app's detection checks pass, and it proceeds to run so you can analyze it.
 
@@ -93,29 +93,29 @@ allowed to map it under SELinux.
 Coyote spoofs at two levels because detection happens at two levels. Everything
 is driven by the compiled-in profile (`build/config.h`).
 
-**1. Native layer — `agent_src/puppyc.c` (libgum / C).**
-Installs inline hooks (via Frida's GumJS devkit, used as a plain C library — no
+**1. Native layer, `agent_src/puppyc.c` (libgum / C).**
+Installs inline hooks (via Frida's GumJS devkit, used as a plain C library, no
 scripts, no server) on libc/NDK functions that are reached very early, directly
 from native code:
 
-- **System properties** — `__system_property_get`, `__system_property_find`,
+- **System properties**, `__system_property_get`, `__system_property_find`,
   `__system_property_read_callback`. Returns profile values for keys listed in
   `system_prop` (this is how `ro.*` read-only props are spoofed, since they can't
   be `setprop`'d).
-- **Process execution** — `execve`, `execv`, `execvp`, `execvpe`, `posix_spawn`,
+- **Process execution**, `execve`, `execv`, `execvp`, `execvpe`, `posix_spawn`,
   `posix_spawnp`. Neutralizes root/su probes and serves spoofed `getprop <key>`
   output.
-- **Anti-debug** — `ptrace`. Reports success for `PTRACE_TRACEME` without
+- **Anti-debug**, `ptrace`. Reports success for `PTRACE_TRACEME` without
   tracing, defeating ptrace-based debugger/instrumentation detection.
-- **Storage** — `statfs`/`statfs64`/`statvfs`/`statvfs64` (total/free space).
-- **Display / GPU** — `ANativeWindow_getWidth`/`getHeight`, `glGetString`,
+- **Storage**, `statfs`/`statfs64`/`statvfs`/`statvfs64` (total/free space).
+- **Display / GPU**, `ANativeWindow_getWidth`/`getHeight`, `glGetString`,
   `vkGetInstanceProcAddr`.
-- **Filesystem** — `open`/`openat`. Redirects reads of `/proc/cpuinfo` (←
+- **Filesystem**, `open`/`openat`. Redirects reads of `/proc/cpuinfo` (←
   `device_profile.cpu_info`), `/proc/meminfo`, `/proc/uptime` (uptime = real
   boot clock + a multi-day offset), `/sys/fs/selinux/enforce`, etc. to in-memory
   spoofed content. Both `open` and `openat` are hooked so Java
   `FileReader`/`FileInputStream` reads are covered too.
-- **Root / Magisk hiding** — `open`/`openat`/`access`/`faccessat`/`stat`/`lstat`
+- **Root / Magisk hiding**, `open`/`openat`/`access`/`faccessat`/`stat`/`lstat`
   report `ENOENT` for `su` binaries, Magisk/KernelSU/SuperSU paths, and
   Xposed/Frida artifacts, so `File.exists()`/`access()`/`stat()` existence probes
   come back negative. Reads of `/proc/mounts`, `/proc/self/mounts` and
@@ -125,7 +125,7 @@ from native code:
 The native layer is applied from the library constructor, so it is active before
 the app's first instruction.
 
-**2. Managed layer — `agent_src/js/agent.js` (Frida GumJS / Java).**
+**2. Managed layer, `agent_src/js/agent.js` (Frida GumJS / Java).**
 A JavaScript agent, compiled into the library and executed by an embedded GumJS
 runtime, uses `frida-java-bridge` to hook Android framework (Java/ART) methods
 that native hooks can't reach cleanly:
@@ -142,7 +142,7 @@ that native hooks can't reach cleanly:
 - Network & VPN (`NetworkInfo`, `ConnectivityManager`, `NetworkCapabilities`,
   `NetworkInterface`)
 - Proxy (`Proxy.getDefaultHost`)
-- SSL pinning bypass (OkHttp, TrustKit, Conscrypt, Appcelerator — when present)
+- SSL pinning bypass (OkHttp, TrustKit, Conscrypt, Appcelerator, when present)
 - User-Agent (`System.getProperty`, `WebView`, `HttpURLConnection`)
 - Package manager (installer source, app hiding, fake installed apps, forced
   `hasSystemFeature`, install time)
@@ -165,7 +165,7 @@ so `libcoyote.so` loads into all of them. The two layers are scoped differently:
 - The **native layer** is cheap, so it runs in **every** process.
 - The **managed (JS/Java) layer** is heavy (a QuickJS runtime, `frida-java-bridge`,
   and a persistent event loop), so by default it runs **only in the main UI
-  process** — where detection almost always happens. Auxiliary processes
+  process**, where detection almost always happens. Auxiliary processes
   (named `<package>:<suffix>`) skip it and pay no JS cost.
 
 The process is classified from `/proc/self/cmdline` (the bare package name is the
@@ -183,7 +183,7 @@ from another thread deadlocks).
 Coyote solves this **in-process**, without `frida-server`'s spawn gating:
 
 1. As soon as the Java VM is usable, it arms **one** hook on
-   `android.app.Instrumentation.callActivityOnCreate` — the framework method that
+   `android.app.Instrumentation.callActivityOnCreate`, the framework method that
    runs, on the main thread, immediately before every activity's `onCreate`.
 2. When that fires for the first activity, Coyote installs all the Java hooks
    **from the main thread**, before `onCreate` executes. Because the
@@ -198,19 +198,19 @@ first checks) with zero added device footprint.
 
 Running `coyote.py` with a profile performs, in order:
 
-1. **`configure_adb_properties`** — `setprop`s the writable (`non-ro.*`) keys from
+1. **`configure_adb_properties`**, `setprop`s the writable (`non-ro.*`) keys from
    `system_prop` over ADB. `ro.*` keys are skipped here and handled by the native
    property hook instead.
-2. **`generate_c_header`** — turns the JSON profile into `build/config.h`
+2. **`generate_c_header`**, turns the JSON profile into `build/config.h`
    (`#define`s + a `SYSTEM_PROP_OVERRIDES[]` table).
-3. **`ensure_devkit`** — makes sure the Frida GumJS devkit for the target ABI is
+3. **`ensure_devkit`**, makes sure the Frida GumJS devkit for the target ABI is
    present in `agent_src/devkit/` (auto-downloads the latest release if missing).
-4. **`compile_js`** — bundles `agent_src/js/agent.js` with `frida-compile`, then
+4. **`compile_js`**, bundles `agent_src/js/agent.js` with `frida-compile`, then
    embeds it as a C byte array in `build/agent.h`.
-5. **`compile_agent`** — compiles `coyote.c` + `puppyc.c` + `puppyjs.c` against
+5. **`compile_agent`**, compiles `coyote.c` + `puppyc.c` + `puppyjs.c` against
    the devkit static lib with the NDK Clang toolchain into `build/libcoyote.so`,
    then strips it.
-6. **`launch_target_app`** — pushes the `.so`, fixes ownership/SELinux, sets the
+6. **`launch_target_app`**, pushes the `.so`, fixes ownership/SELinux, sets the
    `wrap` property, force-stops the package, and relaunches it.
 
 The three C sources: `coyote.c` is the entry point (constructor → background
@@ -226,9 +226,9 @@ macros as JS globals) and runs the embedded agent.
   copy and the `wrap` property). The AVD "Google APIs" images with root, or a
   rooted test device, both work.
 - **`adb`** on your `PATH`, with the device connected and authorized.
-- **Android NDK** — pointed to by `$ANDROID_NDK_HOME` or `--ndk`.
+- **Android NDK**, pointed to by `$ANDROID_NDK_HOME` or `--ndk`.
 - **Python 3.10+** (uses `str | None` typing).
-- **Node.js + npm** — for `frida-compile` (declared in `package.json`).
+- **Node.js + npm**, for `frida-compile` (declared in `package.json`).
 - Internet access on first run (to fetch the Frida GumJS devkit), unless the
   devkit is already in `agent_src/devkit/`.
 
@@ -284,7 +284,7 @@ This builds a `libcoyote.so` tailored to `<profile.json>`, injects it into
 | `--debug` | Build with logging enabled (native `LOGI`/`LOGE` + JS `console`). **Default (release) builds are silent** and carry fewer identifying strings. |
 | `--js-all-processes` | Run the JS/Java layer in **every** forked process of the package. Default runs it only in the main UI process (native hooks still apply everywhere). Use for a target that detects in a sub-process. |
 | `--recon` | Build in **recon mode**: log every intercepted probe (property reads, `getprop`, `ptrace`, installer, accounts, Wi-Fi, sensors) under the `[CoyoteRecon]` / `[RECON]` tags so you can see what the target checks. Independent of `--debug`. |
-| `--capture OUT.json` | Capture a **complete** profile from a connected **real** device via ADB — device facts read directly, non-readable sections (`bypass`, `attribution`, synthetic `identity` fields) auto-generated to plausible values — write it to `OUT.json`, then exit. It prints which fields were synthesized; review before use. |
+| `--capture OUT.json` | Capture a **complete** profile from a connected **real** device via ADB, device facts read directly, non-readable sections (`bypass`, `attribution`, synthetic `identity` fields) auto-generated to plausible values, write it to `OUT.json`, then exit. It prints which fields were synthesized; review before use. |
 | `--skip-adb` | Build the library but don't push writable `setprop`s to the device. |
 | `--skip-deploy` | Compile only; don't push or launch (implies `--skip-adb`). |
 
@@ -323,7 +323,7 @@ python coyote.py --capture my_device.json        # reads a connected real phone
 python coyote.py -p my_device.json -t com.suspicious.app
 ```
 
-**Capture from a physical phone, inject into an emulator** (both connected) —
+**Capture from a physical phone, inject into an emulator** (both connected),
 scope each step to a device with `--serial` (from `adb devices`):
 
 ```bash
@@ -337,19 +337,19 @@ emulator), so the `.so` matches where it runs.
 
 `--capture` produces a **complete** profile (all sections) in two ways:
 
-- **Read from the device** — `device_profile` (incl. `cpu_info`, GPU strings,
+- **Read from the device**, `device_profile` (incl. `cpu_info`, GPU strings,
   keyboard), `specs` (display/RAM/storage/battery/swap), `telecom`
   (MCC/MNC/operator/ISO, locale, timezone, SIM state), `network` (local IPs,
   active transport), Wi-Fi SSID / account email where available, the last-known
   GPS fix (`location`, from `dumpsys location`), and the detection-relevant
   `system_prop` keys present on the device.
 - **Auto-generated** (not readable off a device, so synthesized to plausible
-  values) — `bypass` (`flag_secure`), `attribution` (Play install source/
+  values), `bypass` (`flag_secure`), `attribution` (Play install source/
   referrer), `telecom.network_type`/`imei_prefix`, `specs.RAM_THRESHOLD`
   (derived), and `identity.wifi_bssid`/`wifi_mac` plus `wifi_ssid`/
   `account_email` when they can't be read. The command prints exactly which
   fields were synthesized so you can review them.
-- **Derived at build time** — if no `location` is captured or set,
+- **Derived at build time**, if no `location` is captured or set,
   `telecom.country_iso` picks a representative coordinate for that country.
 
 **See what a target probes (recon mode):**
@@ -366,7 +366,7 @@ python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --debu
 adb logcat -s "[Coyote]" "[PuppyC]" "[PuppyJS]"
 ```
 
-Release builds (the default) are **silent** — they emit no log lines and omit the
+Release builds (the default) are **silent**, they emit no log lines and omit the
 agent's log/tag strings from the binary. Use `--debug` when you need to observe
 the agent: you'll see the native hooks apply, then `gate armed …`, `gate fired
 …`, and `All hook blocks installed` before the app's UI appears. In a debug run
@@ -387,7 +387,7 @@ Each top-level section maps to a group of spoofed values. See
 `test/.../test_profile.json` used by the bundled test app is another.
 
 Every key you include is turned into a compile-time macro and consumed by the
-hooks. **Keys you omit are simply not spoofed** — the real device value shows
+hooks. **Keys you omit are simply not spoofed**, the real device value shows
 through. Start from an existing profile and change what you need.
 
 ### Profile structure
@@ -409,7 +409,7 @@ through. Start from an existing profile and change what you need.
 Each section is emitted with a macro prefix; the table shows representative keys
 drawn from the example profiles.
 
-**`telecom` → `TELECOM_*`** — SIM and carrier identity.
+**`telecom` → `TELECOM_*`**, SIM and carrier identity.
 
 | Key | Example | Meaning |
 | --- | --- | --- |
@@ -423,13 +423,13 @@ drawn from the example profiles.
 | `network_type` | `"LTE"` | Radio network type |
 | `timezone_id` | `"Europe/Andorra"` | IANA timezone |
 
-**`bypass` → `BYPASS_*`** — boolean feature toggles.
+**`bypass` → `BYPASS_*`**, boolean feature toggles.
 
 | Key | Example | Meaning |
 | --- | --- | --- |
 | `flag_secure` | `1` | Strip `FLAG_SECURE` so screenshots/recording work |
 
-**`device_profile` → `DEVICE_*`** — `android.os.Build` identity and hardware
+**`device_profile` → `DEVICE_*`**, `android.os.Build` identity and hardware
 metadata: `model`, `manufacturer`, `brand`, `device`, `board`, `product`,
 `hardware`, `fingerprint`, `bootloader`, `serial`, `display`/`display_id`,
 `security_patch`, `soc_model`, `gl_vendor`/`gl_renderer`/`gl_version`,
@@ -437,7 +437,7 @@ metadata: `model`, `manufacturer`, `brand`, `device`, `board`, `product`,
 GPU/CPU strings. (`cpu_info` is emitted as a C raw-string literal, so multi-line
 `/proc/cpuinfo` text is fine.)
 
-**`specs` → `SPECS_*`** — physical hardware metrics. Keys are UPPERCASE here.
+**`specs` → `SPECS_*`**, physical hardware metrics. Keys are UPPERCASE here.
 
 | Key | Example | Meaning |
 | --- | --- | --- |
@@ -450,7 +450,7 @@ GPU/CPU strings. (`cpu_info` is emitted as a C raw-string literal, so multi-line
 | `RAM_THRESHOLD` | `594331291` | Low-memory threshold |
 | `BATTERY_LEVEL` | `50` | Battery percentage |
 
-**`network` → `NETWORK_*`** — connectivity.
+**`network` → `NETWORK_*`**, connectivity.
 
 | Key | Example | Meaning |
 | --- | --- | --- |
@@ -458,7 +458,7 @@ GPU/CPU strings. (`cpu_info` is emitted as a C raw-string literal, so multi-line
 | `mobile_data_local_ip` | `"10.23.45.67"` | Fake mobile interface IP |
 | `wifi_local_ip` | `"192.168.1.211"` | Fake Wi-Fi interface IP |
 
-**`attribution` → `ATTRIBUTION_*`** — install/attribution data.
+**`attribution` → `ATTRIBUTION_*`**, install/attribution data.
 
 | Key | Example | Meaning |
 | --- | --- | --- |
@@ -466,7 +466,7 @@ GPU/CPU strings. (`cpu_info` is emitted as a C raw-string literal, so multi-line
 | `install_package` | `"com.android.vending"` | Expected installer package |
 | `campaign`, `af_status`, `facebook_app_id` | … | Attribution fields |
 
-**`identity` → `IDENTITY_*`** — Wi-Fi and account identity (a "lived-in" device).
+**`identity` → `IDENTITY_*`**, Wi-Fi and account identity (a "lived-in" device).
 All keys optional; omit one and that hook stays off.
 
 | Key | Example | Meaning |
@@ -477,7 +477,7 @@ All keys optional; omit one and that hook stays off.
 | `account_email` | `"jane.doe@gmail.com"` | Fake account name from `AccountManager` |
 | `account_type` | `"com.google"` | Account type (defaults to `com.google`) |
 
-**`location` → `LOCATION_*`** — a GPS fix. If omitted but `telecom.country_iso`
+**`location` → `LOCATION_*`**, a GPS fix. If omitted but `telecom.country_iso`
 is known, Coyote derives a representative coordinate for that country so the fix
 matches the SIM country automatically.
 
@@ -488,7 +488,7 @@ matches the SIM country automatically.
 | `accuracy` | `18.0` | meters, optional |
 | `altitude` | `1023.0` | meters, optional |
 
-**`system_prop`** — see below (handled specially).
+**`system_prop`**, see below (handled specially).
 
 ### Value typing rules
 
@@ -501,7 +501,7 @@ JSON type**:
   strings with a trailing `f`.
 - **Integer** → a plain `int`, **except** the size keys `TOTAL_SPACE`,
   `FREE_SPACE`, `TOTAL_RAM`, `AVAIL_RAM`, and `RAM_THRESHOLD`, which are emitted
-  as `unsigned long long` (`ULL`) — always give these as plain numbers (bytes),
+  as `unsigned long long` (`ULL`), always give these as plain numbers (bytes),
   not strings.
 - **`cpu_info`** is special-cased into a raw string literal so it can contain
   quotes and newlines.
@@ -532,7 +532,7 @@ These are handled in two ways:
   `__system_property_get` / `__system_property_read_callback` hooks inside the
   process. This covers both direct property reads and `getprop` shell calls.
 
-This is where you neutralize the classic emulator tells — set `ro.kernel.qemu`,
+This is where you neutralize the classic emulator tells, set `ro.kernel.qemu`,
 `ro.boot.qemu`, `ro.hardware`, the `qemu.*` keys, `ro.build.fingerprint`,
 `ro.serialno`, SELinux/verified-boot flags, etc. to realistic values. The example
 profiles cover a large, practical set (100+ keys) you can use as a baseline.
@@ -572,26 +572,26 @@ profiles cover a large, practical set (100+ keys) you can use as a baseline.
 
 ## Troubleshooting
 
-- **`[!] Error: Invalid NDK directory`** — set `$ANDROID_NDK_HOME` or pass
+- **`[!] Error: Invalid NDK directory`**, set `$ANDROID_NDK_HOME` or pass
   `--ndk /path/to/ndk`.
-- **Devkit missing / download fails** — run `python coyote.py --update-devkit`
+- **Devkit missing / download fails**, run `python coyote.py --update-devkit`
   (with the device connected for auto ABI detection), or specify the arch.
-- **`frida-compile failed`** — run `npm install` so `frida-compile` and
+- **`frida-compile failed`**, run `npm install` so `frida-compile` and
   `frida-java-bridge` are in `node_modules/`.
-- **Permission / SELinux errors during deploy** — the device must be rooted; the
+- **Permission / SELinux errors during deploy**, the device must be rooted; the
   copy step uses `su 0`. Verify `adb shell su 0 id` works.
-- **App still detects the emulator** — build with `--debug` and check `logcat`
+- **App still detects the emulator**, build with `--debug` and check `logcat`
   for the hook logs (release builds are silent). If you see `gate armed` but never
   `gate fired`, the app may not go through a standard activity launch; if a
   specific value is wrong, confirm the matching profile key (and run `--dry-run`
   to verify it made it into `config.h`). If the detection runs in a sub-process,
   rebuild with `--js-all-processes`.
-- **Multiple `[Coyote] Coyote loaded` lines with different PIDs** — expected. The
+- **Multiple `[Coyote] Coyote loaded` lines with different PIDs**, expected. The
   `wrap` property applies to every process Zygote forks for the package; each one
   loads the library and applies the native hooks. By default only the main
   process also runs the JS layer (auxiliary processes log `Auxiliary process;
   skipping JS layer.` in a `--debug` build).
-- **Wrong architecture** — the devkit ABI must match the device. Re-fetch with
+- **Wrong architecture**, the devkit ABI must match the device. Re-fetch with
   `--update-devkit <arch>` and rebuild.
 
 ---

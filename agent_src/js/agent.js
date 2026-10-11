@@ -1231,7 +1231,7 @@ function onJavaReady(Java) {
     }
 
     // NOTE: boot/uptime spoofing via SystemClock.elapsedRealtime/uptimeMillis
-    // was removed — those clocks are called constantly by the framework's
+    // was removed, those clocks are called constantly by the framework's
     // render/input loop, and a per-call Java hook freezes the app. If uptime
     // realism is needed, do it at the native layer (spoof reads of /proc/uptime)
     // instead of hooking the hot managed clocks.
@@ -1352,7 +1352,7 @@ function onJavaReady(Java) {
         try { probe = buildSensor(SENSORS[0], 0); } catch (e) { probe = null; }
 
         if (probe !== null && probe.getType() === 1) {
-            // Build fresh each call — Frida Java wrappers don't survive across
+            // Build fresh each call, Frida Java wrappers don't survive across
             // call frames, so caching them makes a later getType()/add() throw
             // (which would return null to Java and NPE the caller).
             SensorManager.getSensorList.overload('int').implementation = function (type) {
@@ -1376,7 +1376,7 @@ function onJavaReady(Java) {
             };
             console.log('[+] JSAgent fabricated SensorManager sensors (' + SENSORS.length + ')');
         } else {
-            // Fabrication not supported here — keep recon only, change nothing.
+            // Fabrication not supported here, keep recon only, change nothing.
             SensorManager.getSensorList.overload('int').implementation = function (type) {
                 recon('SensorManager.getSensorList', type);
                 return this.getSensorList(type);
@@ -1472,7 +1472,7 @@ function findGlobalSym(name) {
 // Version-proof readiness check: has the ART VM actually been created yet?
 // Queries the JNI invocation API (JNI_GetCreatedJavaVMs) via Gum. This depends
 // on no frida-java-bridge internals, and lets us defer the first Java.available
-// probe until it is guaranteed to succeed — so getApi() never faults early and
+// probe until it is guaranteed to succeed, so getApi() never faults early and
 // the bridge never caches a permanent init error (the reason the old code had
 // to poke the private _apiError field).
 let _jniGetCreatedVMs = null;
@@ -1499,7 +1499,7 @@ function waitForJava() {
         attempts++;
 
         try {
-            // Don't touch the bridge until the ART VM exists — see artVmReady().
+            // Don't touch the bridge until the ART VM exists, see artVmReady().
             if (!artVmReady()) {
                 if (attempts % 40 === 0) {
                     console.log('[+] JSAgent: waiting for ART VM... (attempt ' + attempts + ')');

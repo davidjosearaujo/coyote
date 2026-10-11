@@ -375,7 +375,7 @@ static int hook_posix_spawnp(pid_t *pid, const char *path,
     if (is_getprop_cmd(path, argv, &prop_name)) {
         const char *mock_val = get_mocked_prop_value(prop_name);
         if (mock_val) {
-            // Exec `echo <val>` directly (argv, not a shell) — no quoting needed.
+            // Exec `echo <val>` directly (argv, not a shell), no quoting needed.
             char *fake_argv[] = {"echo", (char *) mock_val, NULL};
             return orig_posix_spawnp(pid, "/system/bin/echo", file_actions, attrp, fake_argv, envp);
         }

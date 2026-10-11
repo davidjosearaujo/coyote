@@ -151,7 +151,7 @@ class Coyote:
                 if sysp["gsm.operator.numeric"] != expected:
                     warnings.append(
                         f"telecom mcc+mnc ('{expected}') != system_prop['gsm.operator.numeric'] "
-                        f"('{sysp['gsm.operator.numeric']}') — a detector comparing them would notice."
+                        f"('{sysp['gsm.operator.numeric']}'), a detector comparing them would notice."
                     )
 
         for w in warnings:
@@ -228,7 +228,7 @@ class Coyote:
             if isinstance(val, str):
                 return f'"{val}"'
             if isinstance(val, float):
-                # GPS coordinates need double precision — emit as a double (no
+                # GPS coordinates need double precision, emit as a double (no
                 # 'f' suffix) so latitude/longitude aren't truncated to float.
                 if key in ("LATITUDE", "LONGITUDE", "ACCURACY", "ALTITUDE"):
                     return repr(val)
@@ -602,7 +602,7 @@ def capture_profile(output_path: str):
     if sim_state in SIM_STATES:
         telecom["sim_state"] = sim_state
         telecom["sim_state_num"] = SIM_STATES[sim_state]
-    # Not device-readable without privileged APIs — synthesize plausible values.
+    # Not device-readable without privileged APIs, synthesize plausible values.
     if telecom:
         telecom.setdefault("network_type", "LTE")
         telecom.setdefault("imei_prefix", "35")
@@ -634,7 +634,7 @@ def capture_profile(output_path: str):
     else:
         identity["wifi_ssid"] = random.choice(["HomeWiFi", "NETGEAR", "TP-Link_", "Linksys"]) + str(random.randint(10, 99))
         generated.append("identity.wifi_ssid (synthesized)")
-    # BSSID/MAC are randomized/redacted on modern Android — synthesize.
+    # BSSID/MAC are randomized/redacted on modern Android, synthesize.
     identity["wifi_bssid"] = rand_mac()
     identity["wifi_mac"] = rand_mac()
     macc = re.search(r"name=([^\s,}]+@[^\s,}]+)", sh("dumpsys account"))
@@ -654,9 +654,9 @@ def capture_profile(output_path: str):
         location["longitude"] = float(mloc.group(2))
         macc = re.search(r"hAcc=([\d.]+)", sh("dumpsys location"))
         location["accuracy"] = float(macc.group(1)) if macc else 20.0
-    # else left empty — the build derives a fix from telecom.country_iso.
+    # else left empty, the build derives a fix from telecom.country_iso.
 
-    # --- bypass / attribution: policy & fabricated — auto-generated defaults ---
+    # --- bypass / attribution: policy & fabricated, auto-generated defaults ---
     bypass = {"flag_secure": 1}
     attribution = {
         "facebook_app_id": "",
@@ -714,7 +714,7 @@ def capture_profile(output_path: str):
     print(f"    Captured {len(system_prop)} system properties and "
           f"{len(device_profile)} device fields.")
     if generated:
-        print("    Auto-generated (review these — not read from the device):")
+        print("    Auto-generated (review these, not read from the device):")
         for g in generated:
             print(f"      - {g}")
 
@@ -829,7 +829,7 @@ def parse_args():
         "-s",
         "--serial",
         help="ADB device serial to target (from `adb devices`). Scopes every ADB "
-        "call to that device — useful when a physical phone and an emulator are "
+        "call to that device, useful when a physical phone and an emulator are "
         "both connected (e.g. --capture from the phone, deploy to the emulator).",
     )
     parser.add_argument(

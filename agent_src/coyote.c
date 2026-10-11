@@ -63,7 +63,7 @@ static void* coyote_master_thread(void* arg) {
     // 1. Apply C-level hooks immediately (cheap; every process).
     apply_native_gum_hooks();
 
-    // 2. Load JS hooks and block the thread with the event loop — but only in
+    // 2. Load JS hooks and block the thread with the event loop, but only in
     //    the main process. Auxiliary processes skip the heavy JS layer and this
     //    thread simply exits.
     if (coyote_should_run_js()) {
