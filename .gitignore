@@ -256,3 +256,6 @@ agent_src/devkit/*
 test/hound/local.properties
 test/local.properties
 *.gradle/
+# Local logcat dumps
+out.txt
+*.logcat
