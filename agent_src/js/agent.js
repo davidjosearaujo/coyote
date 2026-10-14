@@ -1511,10 +1511,23 @@ function waitForJava() {
                 return;
             }
 
-            const mod = require("frida-java-bridge");
-            const Java = (mod && mod.default) ? mod.default : mod;
+            // The frida-java-bridge Runtime is provided as the global `bridge`
+            // by the prebuilt bundle (frida-tools' bridges/java.js) that the
+            // build prepends to this agent — no `require`, no npm.
+            const Java = globalThis.__coyote_bridge;
+            if (!Java) {
+                if (attempts === 1) console.error('[!] JSAgent: bridge global missing');
+                return;
+            }
 
-            if (Java && Java.available === true) {
+            // The VM exists from the zygote fork before the app's ART is fully
+            // initialized, so an early getApi() probe can fault (access violation
+            // at 0x8). The bridge caches that fault in _apiError and re-throws it
+            // forever, so clear it to let a later probe succeed once ART settles.
+            // Defensive: tolerate the field being renamed in a future bridge.
+            try { if (Java._apiError) Java._apiError = null; } catch (e) {}
+
+            if (Java.available === true) {
                 clearInterval(interval);
                 console.log('[+] JSAgent: Java available at attempt ' + attempts);
                 installGate(Java);

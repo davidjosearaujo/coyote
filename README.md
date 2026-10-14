@@ -204,9 +204,12 @@ Running `coyote.py` with a profile performs, in order:
 2. **`generate_c_header`**, turns the JSON profile into `build/config.h`
    (`#define`s + a `SYSTEM_PROP_OVERRIDES[]` table).
 3. **`ensure_devkit`**, makes sure the Frida GumJS devkit for the target ABI is
-   present in `agent_src/devkit/` (auto-downloads the latest release if missing).
-4. **`compile_js`**, bundles `agent_src/js/agent.js` with `frida-compile`, then
-   embeds it as a C byte array in `build/agent.h`.
+   present in `agent_src/devkit/` (auto-downloads the version matching your
+   installed `frida-tools` if missing — see below).
+4. **`compile_js`**, concatenates the prebuilt `frida-java-bridge` bundle shipped
+   by `frida-tools` (`bridges/java.js`) with `agent_src/js/agent.js` and embeds
+   the result as a C byte array in `build/agent.h`. No Node/npm — `agent.js` has
+   no module imports and uses the bridge via the global it exposes.
 5. **`compile_agent`**, compiles `coyote.c` + `puppyc.c` + `puppyjs.c` against
    the devkit static lib with the NDK Clang toolchain into `build/libcoyote.so`,
    then strips it.
@@ -228,7 +231,8 @@ macros as JS globals) and runs the embedded agent.
 - **`adb`** on your `PATH`, with the device connected and authorized.
 - **Android NDK**, pointed to by `$ANDROID_NDK_HOME` or `--ndk`.
 - **Python 3.10+** (uses `str | None` typing).
-- **Node.js + npm**, for `frida-compile` (declared in `package.json`).
+- **`frida-tools`** (Python) — provides the prebuilt `frida-java-bridge` bundle
+  and determines which devkit version to fetch. No Node.js/npm required.
 - Internet access on first run (to fetch the Frida GumJS devkit), unless the
   devkit is already in `agent_src/devkit/`.
 
@@ -240,8 +244,9 @@ macros as JS globals) and runs the embedded agent.
 # 1. Clone and enter the repo
 git clone <your-fork-url> coyote && cd coyote
 
-# 2. Install the JS build dependencies (frida-compile, frida-java-bridge)
-npm install
+# 2. Install the Python dependencies (frida-tools) into a venv
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
 
 # 3. Point to your NDK (or pass --ndk each run)
 export ANDROID_NDK_HOME=/path/to/android-ndk
@@ -253,8 +258,11 @@ python coyote.py --update-devkit arm64      # or force one: arm | arm64 | x86 | 
 ```
 
 The devkit (`frida-gumjs.h` + `libfrida-gumjs.a`, ~180 MB) is large and
-git-ignored; `--update-devkit` downloads the matching release from GitHub and
-extracts it into `agent_src/devkit/`.
+git-ignored. `--update-devkit` downloads the release **matching your installed
+`frida-tools` version** (`frida.__version__`) from GitHub and extracts it into
+`agent_src/devkit/`. Pinning the devkit to `frida-tools` keeps the embedded
+GumJS runtime and the bridge JS in lockstep — if you upgrade `frida-tools`,
+re-run `--update-devkit` to match.
 
 ---
 
@@ -278,7 +286,7 @@ This builds a `libcoyote.so` tailored to `<profile.json>`, injects it into
 | `-s`, `--serial <id>` | ADB device serial (from `adb devices`) to scope **every** ADB call to. Use when a physical phone and an emulator are both connected. |
 | `--ndk <path>` | Android NDK directory. Defaults to `$ANDROID_NDK_HOME`. |
 | `--api-level <n>` | Target Android API level for NDK compilation (default `30`). |
-| `--update-devkit [arch]` | Fetch the latest Frida GumJS devkit (`auto`/`arm`/`arm64`/`x86`/`x86_64`), then exit. |
+| `--update-devkit [arch]` | Fetch the Frida GumJS devkit matching your `frida-tools` version (`auto`/`arm`/`arm64`/`x86`/`x86_64`), then exit. |
 | `--reset-target` | Remove the `wrap` property, force-stop, and `pm clear` the target, undoing injection. |
 | `--dry-run` | Print the generated `config.h` and all commands without compiling or changing the device. |
 | `--debug` | Build with logging enabled (native `LOGI`/`LOGE` + JS `console`). **Default (release) builds are silent** and carry fewer identifying strings. |
@@ -578,8 +586,12 @@ profiles cover a large, practical set (100+ keys) you can use as a baseline.
   `--ndk /path/to/ndk`.
 - **Devkit missing / download fails**, run `python coyote.py --update-devkit`
   (with the device connected for auto ABI detection), or specify the arch.
-- **`frida-compile failed`**, run `npm install` so `frida-compile` and
-  `frida-java-bridge` are in `node_modules/`.
+- **`frida-tools is not installed`**, create/activate the venv and
+  `pip install -r requirements.txt`. The build reads `frida-java-bridge` from
+  `frida-tools`' `bridges/java.js`.
+- **Devkit download 404 / bridge calls a missing runtime API**, your devkit and
+  `frida-tools` versions drifted. Re-run `--update-devkit` to fetch the devkit
+  matching the installed `frida-tools`.
 - **Permission / SELinux errors during deploy**, the device must be rooted; the
   copy step uses `su 0`. Verify `adb shell su 0 id` works.
 - **App still detects the emulator**, build with `--debug` and check `logcat`
@@ -603,7 +615,7 @@ profiles cover a large, practical set (100+ keys) you can use as a baseline.
 ```
 coyote/
 ├── coyote.py               # Orchestrator: profile → config.h → build → inject
-├── package.json            # frida-compile build script + JS deps
+├── requirements.txt        # Python deps (frida-tools)
 ├── profiles/               # Example device profiles
 │   └── pixel7_us_tmobile.json
 ├── agent_src/

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-14
+
+### Changed
+- Build no longer uses Node/npm. The JS agent is built by concatenating the
+  prebuilt `frida-java-bridge` bundle shipped with `frida-tools`
+  (`bridges/java.js`) with `agent.js` — `agent.js` uses the bridge via the
+  global it exposes instead of `require("frida-java-bridge")`.
+- `--update-devkit` now fetches the devkit matching the installed `frida-tools`
+  version (`frida.__version__`) instead of the latest release, keeping the
+  embedded GumJS runtime and the bridge JS on the same Frida version.
+
+### Removed
+- `package.json`, `package-lock.json`, and the `frida-compile`/`frida-java-bridge`
+  npm dependencies. Python deps are now in `requirements.txt` (`frida-tools`).
+
+### Fixed
+- JS agent recovers from the early-ART `getApi()` fault again: the VM exists from
+  the zygote fork before the app's ART is initialized, so the readiness gate can
+  pass too early — the bridge's cached `_apiError` is now cleared (defensively)
+  so a later probe succeeds.
+
 ## [1.1.0] - 2026-10-11
 
 ### Added
@@ -76,6 +97,7 @@ analysis, with no `frida-server` footprint.
 - **Test harness**: the "Border Patrol" validation app covering every spoofing
   vector.
 
-[Unreleased]: https://codeberg.org/davidjosearaujo/coyote/compare/v1.1.0...HEAD
+[Unreleased]: https://codeberg.org/davidjosearaujo/coyote/compare/v2.0.0...HEAD
+[2.0.0]: https://codeberg.org/davidjosearaujo/coyote/compare/v1.1.0...v2.0.0
 [1.1.0]: https://codeberg.org/davidjosearaujo/coyote/compare/v1.0.0...v1.1.0
 [1.0.0]: https://codeberg.org/davidjosearaujo/coyote/releases/tag/v1.0.0

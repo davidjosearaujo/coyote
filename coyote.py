@@ -308,48 +308,48 @@ class Coyote:
             print(f"  [+] Successfully generated {output_file} with {macro_count} dynamic macros.")
 
     def compile_js(self):
-            """Bundles agent.js using frida-compile and converts it to a C header."""
-            print("\n[+] Compiling JavaScript agent with frida-compile...")
+            """Builds the embedded JS agent: the prebuilt frida-java-bridge bundle
+            (shipped by frida-tools as bridges/java.js) concatenated with agent.js,
+            then emitted as a C header. No npm / Node / frida-compile — agent.js has
+            no module imports; it uses the bridge via the global it exposes."""
+            print("\n[+] Building JavaScript agent (frida-tools bridge + agent.js)...")
             src_js = AGENT_SRC / "js" / "agent.js"
-            bundled_js = BUILD_DIR / "_agent.js"
             agent_h = BUILD_DIR / "agent.h"
+            bundled_js = BUILD_DIR / "_agent.js"
 
             if not src_js.exists():
                 print(f"[!] Error: JavaScript source file not found at {src_js}")
                 sys.exit(1)
 
+            bridge_js = _find_frida_bridge_js()
             BUILD_DIR.mkdir(exist_ok=True)
 
-            build_cmd = ["frida-compile", "-c", "--no-source-maps", str(src_js), "-o", str(bundled_js),]
-            result = subprocess.run(build_cmd, cwd=str(BASE_DIR), capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"[!] frida-compile failed:\n{result.stderr.strip()}")
-                sys.exit(1)
-            print(f"  [+] frida-compile succeeded")
+            # java.js defines `var bridge = <Runtime>`; expose it under the name
+            # agent.js reads, then append the agent. All one script.
+            combined = (
+                bridge_js.read_text(encoding="utf-8").rstrip()
+                + "\nglobalThis.__coyote_bridge = bridge;\n"
+                + src_js.read_text(encoding="utf-8")
+            )
 
-            with open(bundled_js, "r", encoding="utf-8") as f_in:
-                js_content = f_in.read()
+            with open(bundled_js, "w", encoding="utf-8") as f:
+                f.write(combined)
 
-            if "✄" in js_content:
-                js_content = js_content.split("✄")[-1].lstrip()
-
-            content = js_content.encode("utf-8")
-
+            content = combined.encode("utf-8")
             hex_lines = [
                 f"  {', '.join(f'0x{b:02x}' for b in content[i:i+12])},"
                 for i in range(0, len(content), 12)
             ]
-
             header_content = (
                 f"unsigned int agent_js_len = {len(content)};\n"
                 f"unsigned char agent_js[] = {{\n"
                 + "\n".join(hex_lines)
-                + f"\n}};\n"
+                + "\n};\n"
             )
-
             with open(agent_h, "w") as f_out:
                 f_out.write(header_content)
 
+            print(f"  [+] Bridge: {bridge_js}")
             print(f"[+] Successfully generated {agent_h} ({len(content)} bytes)")
 
     def _get_llvm_prebuilt_path(self) -> Path:
@@ -719,53 +719,74 @@ def capture_profile(output_path: str):
             print(f"      - {g}")
 
 
+def _installed_frida_version() -> str | None:
+    """Version of the installed `frida` Python package (ships with frida-tools)."""
+    try:
+        import frida
+        return frida.__version__
+    except Exception:
+        return None
+
+
+def _find_frida_bridge_js() -> Path:
+    """Locate frida-tools' prebuilt frida-java-bridge bundle (bridges/java.js)."""
+    try:
+        import frida_tools
+    except ImportError:
+        print("[!] frida-tools is not installed. Install it first, e.g.:")
+        print("      python3 -m venv .venv && . .venv/bin/activate && pip install frida-tools")
+        sys.exit(1)
+    bridge = Path(frida_tools.__file__).resolve().parent / "bridges" / "java.js"
+    if not bridge.is_file():
+        print(f"[!] frida-java-bridge bundle not found at {bridge}")
+        print("    (expected it in frida-tools; try upgrading frida-tools)")
+        sys.exit(1)
+    return bridge
+
+
 def update_frida_devkit(arch: str | None = None):
-    """Fetches and extracts the latest Frida-GumJS DevKit for specified architecture (auto-detects via ADB if omitted)."""
+    """Fetches the Frida-GumJS DevKit matching the installed frida-tools version.
+
+    Pinning to the same Frida version keeps the embedded GumJS runtime (devkit)
+    in lockstep with the bridge JS from frida-tools, so the bridge never calls a
+    runtime API the devkit doesn't provide. Arch is auto-detected via ADB if
+    omitted."""
 
     if not arch or arch == "auto":
         device_info = detect_device_abi()
         arch = device_info["devkit"]
         print(f"[+] Auto-detected devkit architecture via ADB: {arch}")
 
+    version = _installed_frida_version()
+    if not version:
+        print("[!] frida not installed; cannot pin the devkit version. Install frida-tools.")
+        sys.exit(1)
+
     platform_target = f"android-{arch}" if not arch.startswith("android-") else arch
-    print(f"[+] Checking latest Frida release for platform: {platform_target}...")
-    
-    api_url = "https://api.github.com/repos/frida/frida/releases/latest"
-    req = urllib.request.Request(api_url, headers={"User-Agent": "Coyote-Provisioner"})
-    
-    with urllib.request.urlopen(req) as resp:
-        release_data = json.loads(resp.read().decode())
-    
-    tag_name = release_data["tag_name"]
-    print(f"[+] Latest Frida version identified: {tag_name}")
-    
-    target_asset = None
-    prefix = f"frida-gumjs-devkit-{tag_name}-{platform_target}.tar.xz"
-    
-    for asset in release_data.get("assets", []):
-        if asset["name"] == prefix:
-            target_asset = asset
-            break
-            
-    if not target_asset:
-        raise RuntimeError(f"Could not find matching release asset: {prefix}")
-        
-    archive_url = target_asset["browser_download_url"]
-    archive_path = DEVKIT_DIR / "devkit_latest.tar.xz"
+    asset = f"frida-gumjs-devkit-{version}-{platform_target}.tar.xz"
+    archive_url = f"https://github.com/frida/frida/releases/download/{version}/{asset}"
+    print(f"[+] Fetching devkit for frida {version} ({platform_target})...")
+
+    archive_path = DEVKIT_DIR / "devkit.tar.xz"
     DEVKIT_DIR.mkdir(parents=True, exist_ok=True)
-    
-    print(f"[+] Downloading: {target_asset['name']}...")
-    urllib.request.urlretrieve(archive_url, archive_path)
-    
+    try:
+        req = urllib.request.Request(archive_url, headers={"User-Agent": "Coyote-Provisioner"})
+        with urllib.request.urlopen(req) as resp, open(archive_path, "wb") as out:
+            out.write(resp.read())
+    except Exception as e:
+        print(f"[!] Failed to download {asset}: {e}")
+        print(f"    URL: {archive_url}")
+        sys.exit(1)
+
     print("[+] Extracting headers and static libraries into agent_src/devkit...")
     with tarfile.open(archive_path, "r:xz") as tar:
         if hasattr(tarfile, "data_filter"):
             tar.extractall(path=DEVKIT_DIR, filter="data")
         else:
             tar.extractall(path=DEVKIT_DIR)
-        
+
     archive_path.unlink()
-    print("[+] Frida-GumJS DevKit updated successfully.")
+    print(f"[+] Frida-GumJS DevKit {version} installed.")
 
 def ensure_devkit(requested_arch: str | None = None):
     """Verifies DevKit files exist. Downloads them if missing or explicitly requested."""

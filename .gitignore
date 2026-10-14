@@ -256,6 +256,3 @@ agent_src/devkit/*
 test/hound/local.properties
 test/local.properties
 *.gradle/
-
-# Node
-*node_modules/
