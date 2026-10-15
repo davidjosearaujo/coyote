@@ -1560,40 +1560,29 @@ function installGate(Java) {
         }
     };
 
-    // Arming (performNow + building the Instrumentation class model) can fault
-    // on early ART: the VM is up enough for Java.available but not yet for
-    // class resolution / all-thread suspend (seen as access violation 0x0 on
-    // some devices). Retry until it succeeds — it will before the first activity
-    // launches — and only fall back to the (later) waitForApplication path if
-    // arming never succeeds within the window.
-    let attempts = 0;
-    const interval = setInterval(function () {
-        attempts++;
-        try { if (Java._apiError) Java._apiError = null; } catch (e) {}
-        try {
-            Java.performNow(function () {
-                const Instrumentation = Java.use('android.app.Instrumentation');
-                const overloads = Instrumentation.callActivityOnCreate.overloads;
-                overloads.forEach(function (ov) {
-                    ov.implementation = function () {
-                        runOnce();
-                        return ov.apply(this, arguments);
-                    };
-                });
+    // Arm the gate with a single attempt. Do NOT retry: if performNow faults
+    // here, it's because this device's ART can't yet build the Instrumentation
+    // class model / deoptimize callActivityOnCreate from our background thread
+    // mid-bootstrap — retrying just lets a later attempt reach the all-thread
+    // suspend and deadlock the splash. Fall back to waitForApplication, which
+    // only reads currentApplication until the app is bound and then installs the
+    // hooks on the idle main thread (no mid-bootstrap deopt).
+    try {
+        Java.performNow(function () {
+            const Instrumentation = Java.use('android.app.Instrumentation');
+            const overloads = Instrumentation.callActivityOnCreate.overloads;
+            overloads.forEach(function (ov) {
+                ov.implementation = function () {
+                    runOnce();
+                    return ov.apply(this, arguments);
+                };
             });
-            clearInterval(interval);
-            console.log('[+] JSAgent: gate armed on Instrumentation.callActivityOnCreate (attempt ' + attempts + ')');
-        } catch (e) {
-            if (attempts === 1 || attempts % 40 === 0) {
-                console.error('[!] JSAgent: gate arm retry ' + attempts + ': ' + e.toString());
-            }
-            if (attempts > 400) { // ~10s at 25ms
-                clearInterval(interval);
-                console.error('[!] JSAgent: could not arm gate; falling back to waitForApplication');
-                waitForApplication(Java);
-            }
-        }
-    }, 25);
+            console.log('[+] JSAgent: gate armed on Instrumentation.callActivityOnCreate (' + overloads.length + ' overload(s))');
+        });
+    } catch (e) {
+        console.error('[!] JSAgent: failed to arm gate (' + e.toString() + '); falling back to waitForApplication');
+        waitForApplication(Java);
+    }
 }
 
 function waitForApplication(Java) {

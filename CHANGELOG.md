@@ -7,14 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- Spawn-gate arming now retries instead of falling back on the first fault. On
-  some devices' ART, building the `Instrumentation` class model via
-  `performNow()` faults early (access violation 0x0) even though the VM is up;
-  the gate is now retried until it succeeds (before the first activity launches),
-  so hooks still install before `onCreate` rather than via the later
-  `waitForApplication` fallback.
-
 ## [2.1.1] - 2026-10-15
 
 ### Fixed
