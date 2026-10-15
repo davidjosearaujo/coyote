@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `profiles/generate_profiles.py`: generates complete, validator-passing profiles
+  from `profile_database.json` (countries/carriers + real device profiles). Single
+  profile via `--country`/`--carrier`/`--device`, or `--full-collection` to write
+  one profile per carrier for every country under `<ISO>/` dirs. Location is
+  randomized within ~10 km of the country's capital; identity, attribution,
+  serial, build date and the full `system_prop` set are synthesized.
+- `profiles/profile_database.json`: capital coordinates per country, consumed by
+  the generator's location randomization.
+
 ## [2.0.0] - 2026-10-14
 
 ### Changed

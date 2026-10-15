@@ -398,6 +398,13 @@ Every key you include is turned into a compile-time macro and consumed by the
 hooks. **Keys you omit are simply not spoofed**, the real device value shows
 through. Start from an existing profile and change what you need.
 
+You can also **generate** complete profiles from a country/carrier/device
+database instead of writing them by hand — see
+[`profiles/generate_profiles.py`](profiles/README.md), e.g.
+`python profiles/generate_profiles.py --country US --device google-pixel-8-pro -o my.json`
+(location is randomized within ~10 km of the country's capital). `--full-collection`
+builds one profile per carrier for every country.
+
 ### Profile structure
 
 ```jsonc
@@ -616,8 +623,10 @@ profiles cover a large, practical set (100+ keys) you can use as a baseline.
 coyote/
 ├── coyote.py               # Orchestrator: profile → config.h → build → inject
 ├── requirements.txt        # Python deps (frida-tools)
-├── profiles/               # Example device profiles
-│   └── pixel7_us_tmobile.json
+├── profiles/               # Profiles + generator
+│   ├── pixel7_us_tmobile.json   # hand-written example
+│   ├── profile_database.json    # countries/carriers/devices + capital coords
+│   └── generate_profiles.py     # build full profiles (single or --full-collection)
 ├── agent_src/
 │   ├── coyote.c            # Library entry point (constructor, threads, gum init)
 │   ├── puppyc.c            # Native (libgum/C) hooks

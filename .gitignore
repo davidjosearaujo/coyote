@@ -259,3 +259,7 @@ test/local.properties
 # Local logcat dumps
 out.txt
 *.logcat
+
+# Generated profile collections
+collection/
+profiles/collection/
