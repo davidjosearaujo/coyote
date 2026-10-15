@@ -1,7 +1,8 @@
-colorama==0.4.6
-frida==17.23.3
-frida-tools==14.11.0
-prompt_toolkit==3.0.53
-Pygments==2.21.0
-wcwidth==0.9.2
-websockets==13.1
+# Coyote Python dependencies.
+#
+# frida-tools pulls in the `frida` package, which provides the prebuilt
+# frida-java-bridge bundle (bridges/java.js) used to build the JS agent.
+# Do NOT pin an exact frida version here: `--update-devkit` fetches the Frida
+# GumJS devkit matching whatever frida version this installs (frida.__version__),
+# so any frida-tools works and pinning only breaks installs on other platforms.
+frida-tools

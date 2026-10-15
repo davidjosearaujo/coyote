@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `requirements.txt` declared exact-pinned versions (a `pip freeze` snapshot,
+  incl. `frida==17.23.3`) that fail to install on other platforms/Python
+  versions. It now declares only `frida-tools`; the devkit still pins itself to
+  the installed frida version.
+
 ## [2.1.0] - 2026-10-15
 
 ### Added
