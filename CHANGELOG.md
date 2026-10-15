@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-10-15
+
 ### Fixed
 - `requirements.txt` declared exact-pinned versions (a `pip freeze` snapshot,
   incl. `frida==17.23.3`) that fail to install on other platforms/Python
@@ -115,7 +117,8 @@ analysis, with no `frida-server` footprint.
 - **Test harness**: the "Border Patrol" validation app covering every spoofing
   vector.
 
-[Unreleased]: https://codeberg.org/davidjosearaujo/coyote/compare/v2.1.0...HEAD
+[Unreleased]: https://codeberg.org/davidjosearaujo/coyote/compare/v2.1.1...HEAD
+[2.1.1]: https://codeberg.org/davidjosearaujo/coyote/compare/v2.1.0...v2.1.1
 [2.1.0]: https://codeberg.org/davidjosearaujo/coyote/compare/v2.0.0...v2.1.0
 [2.0.0]: https://codeberg.org/davidjosearaujo/coyote/compare/v1.1.0...v2.0.0
 [1.1.0]: https://codeberg.org/davidjosearaujo/coyote/compare/v1.0.0...v1.1.0
