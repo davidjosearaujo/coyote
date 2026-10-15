@@ -1591,6 +1591,8 @@ function waitForApplication(Java) {
     const interval = setInterval(function () {
         tries++;
 
+        try { if (Java._apiError) Java._apiError = null; } catch (e) {}
+
         let ready = false;
         try {
             Java.performNow(function () {
@@ -1598,8 +1600,10 @@ function waitForApplication(Java) {
                 ready = ActivityThread.currentApplication() !== null;
             });
         } catch (e) {
-            if (tries === 1) {
-                console.error('[!] JSAgent: waitForApplication error: ' + e.toString());
+            // Early-ART probes can fault (access violation); keep retrying. If
+            // this keeps logging up to the timeout, the fault is persistent.
+            if (tries === 1 || tries % 40 === 0) {
+                console.error('[!] JSAgent: waitForApplication probe error (try ' + tries + '): ' + e.toString());
             }
         }
 
