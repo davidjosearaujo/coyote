@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-23
+
+### Added
+- `pyproject.toml`: Coyote now installs as a Python package exposing two
+  console commands, `coyote` and `coyote-profiles`.
+- `assets/coyote-logo.svg` and a centered README header (logo, title, subtitle,
+  badges).
+
 ### Changed
 - Coyote is now an installable Python package. `pipx install .` (or
   `pip install .`) puts two commands on your `PATH`: `coyote` (the orchestrator,
@@ -17,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and per-build output (`config.h`, `agent.h`, `libcoyote.so`) are written to a
   user cache dir — `~/.cache/coyote/` — so the tool works installed read-only.
   Override with `$COYOTE_CACHE_DIR` (or `$XDG_CACHE_HOME`).
+- The `frida-tools` dependency is pinned to `>=14.11.0`.
 
 ### Removed
 - `requirements.txt`: the sole runtime dependency (`frida-tools`) is now
@@ -132,7 +141,8 @@ analysis, with no `frida-server` footprint.
 - **Test harness**: the "Border Patrol" validation app covering every spoofing
   vector.
 
-[Unreleased]: https://codeberg.org/davidjosearaujo/coyote/compare/v2.1.1...HEAD
+[Unreleased]: https://codeberg.org/davidjosearaujo/coyote/compare/v2.2.0...HEAD
+[2.2.0]: https://codeberg.org/davidjosearaujo/coyote/compare/v2.1.1...v2.2.0
 [2.1.1]: https://codeberg.org/davidjosearaujo/coyote/compare/v2.1.0...v2.1.1
 [2.1.0]: https://codeberg.org/davidjosearaujo/coyote/compare/v2.0.0...v2.1.0
 [2.0.0]: https://codeberg.org/davidjosearaujo/coyote/compare/v1.1.0...v2.0.0
