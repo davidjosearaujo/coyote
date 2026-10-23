@@ -1,6 +1,21 @@
-# Coyote
+<p align="center">
+  <img src="assets/coyote-logo.svg" alt="Coyote" width="128">
+</p>
 
-**A stealthy, in-process device-spoofing agent for Android malware analysis.**
+<h1 align="center">Coyote</h1>
+
+<p align="center">
+  <b>A stealthy, in-process device-spoofing agent for Android malware analysis.</b><br>
+  <sub>Make an emulator or test device look like a clean phone — no <code>frida-server</code>, no device footprint.</sub>
+</p>
+
+<p align="center">
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-E0923A">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3DDC84">
+  <img alt="frida-server not required" src="https://img.shields.io/badge/frida--server-not%20required-3a3f47">
+</p>
+
+---
 
 Coyote makes a real analysis device or emulator look like an arbitrary "clean"
 physical phone to the app under test. It compiles a native shared library

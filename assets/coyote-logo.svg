@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="8 2 104 116" width="208" height="232" role="img" aria-label="Coyote">
+  <title>Coyote</title>
+  <defs>
+    <linearGradient id="fur" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F8B957"/>
+      <stop offset="0.55" stop-color="#ED9636"/>
+      <stop offset="1" stop-color="#D2761F"/>
+    </linearGradient>
+    <linearGradient id="muzzle" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F9CE82"/>
+      <stop offset="1" stop-color="#E7A24A"/>
+    </linearGradient>
+    <filter id="eyeGlow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="2.6"/>
+    </filter>
+  </defs>
+
+  <!-- fur silhouette: two tall ears tapering to a muzzle -->
+  <path d="M22,12 L46,42 L60,50 L74,42 L98,12 L90,54 L73,84 L60,108 L47,84 L30,54 Z" fill="url(#fur)"/>
+  <!-- shaded (right) half for depth -->
+  <path d="M60,50 L74,42 L98,12 L90,54 L73,84 L60,108 Z" fill="#000000" fill-opacity="0.12"/>
+  <!-- center ridge highlight -->
+  <path d="M60,50 L63,61 L60,73 L57,61 Z" fill="#FBD98F" fill-opacity="0.55"/>
+  <!-- inner ears -->
+  <path d="M31,22 L45,43 L36,50 Z" fill="#7a3d12" fill-opacity="0.8"/>
+  <path d="M89,22 L75,43 L84,50 Z" fill="#7a3d12" fill-opacity="0.8"/>
+  <!-- muzzle -->
+  <path d="M47,84 L60,72 L73,84 L60,108 Z" fill="url(#muzzle)"/>
+  <!-- nose -->
+  <path d="M55,85 L65,85 Q66,90 60,93 Q54,90 55,85 Z" fill="#241a12"/>
+  <!-- eyes: Android-green glow -->
+  <g fill="#3DDC84">
+    <g filter="url(#eyeGlow)">
+      <path d="M40,57 L53,61 L51,67 L40,63 Z"/>
+      <path d="M80,57 L67,61 L69,67 L80,63 Z"/>
+    </g>
+    <path d="M40,57 L53,61 L51,67 L40,63 Z"/>
+    <path d="M80,57 L67,61 L69,67 L80,63 Z"/>
+  </g>
+</svg>
