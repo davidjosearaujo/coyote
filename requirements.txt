@@ -1,8 +1,0 @@
-# Coyote Python dependencies.
-#
-# frida-tools pulls in the `frida` package, which provides the prebuilt
-# frida-java-bridge bundle (bridges/java.js) used to build the JS agent.
-# Do NOT pin an exact frida version here: `--update-devkit` fetches the Frida
-# GumJS devkit matching whatever frida version this installs (frida.__version__),
-# so any frida-tools works and pinning only breaks installs on other platforms.
-frida-tools

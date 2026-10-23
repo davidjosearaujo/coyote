@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coyote"
+version = "2.2.0"
+description = "In-process Android device-spoofing agent for malware analysis, with no frida-server footprint."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "davidjosearaujo" }]
+keywords = [
+    "android",
+    "malware-analysis",
+    "frida",
+    "anti-detection",
+    "emulator",
+    "spoofing",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Information Technology",
+    "Operating System :: Android",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+dependencies = [
+    "frida-tools",
+]
+
+[project.scripts]
+coyote = "coyote.cli:main"
+coyote-profiles = "coyote.coyote_profiles:main"
+
+[project.urls]
+Homepage = "https://codeberg.org/davidjosearaujo/coyote"
+Source = "https://codeberg.org/davidjosearaujo/coyote"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Ship the C sources, the JS agent, the profile database and the example
+# profiles as package data. The Frida devkit is NOT shipped: it is fetched
+# per-architecture at runtime into the user cache dir (see coyote/paths.py).
+[tool.setuptools.package-data]
+coyote = [
+    "agent_src/*.c",
+    "agent_src/js/*.js",
+    "profiles/*.json",
+    "profiles/*.md",
+]

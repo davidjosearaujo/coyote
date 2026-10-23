@@ -5,17 +5,17 @@ Each profile has the full schema Coyote consumes (telecom, bypass, device_profil
 specs, network, attribution, identity, location, system_prop) — the same shape as
 test/src/main/assets/test_profile.json — built from a country + carrier + a real
 device profile. Location is randomized within ~10 km of the country's capital, and
-identity/attribution/serial/etc. are synthesized the way coyote.py does.
+identity/attribution/serial/etc. are synthesized the way coyote does.
 
 Examples:
   # one random profile
-  python generate_profiles.py -o out.json
+  coyote-profiles -o out.json
 
   # a specific country/carrier/device
-  python generate_profiles.py --country US --carrier 260 --device google-pixel-8-pro -o pixel_tmobile.json
+  coyote-profiles --country US --carrier 260 --device google-pixel-8-pro -o pixel_tmobile.json
 
   # the whole matrix: collection/<ISO>/<mcc><mnc>_<carrier>.json for every carrier
-  python generate_profiles.py --full-collection collection
+  coyote-profiles --full-collection collection
 """
 import argparse
 import json
@@ -26,7 +26,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent / "profile_database.json"
+DB_PATH = Path(__file__).resolve().parent / "profiles" / "profile_database.json"
 
 SIM_STATES = {"READY": 5}
 NETWORK_TYPES = ["LTE", "5G"]

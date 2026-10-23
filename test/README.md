@@ -18,8 +18,8 @@ adb install build/outputs/apk/debug/borderpatrol-debug.apk
 
 ## Usage
 
-From the project root directory, run `coyote.py` to apply a profile and pass Border Patrol as the target check app:
+Once Coyote is installed, run the `coyote` command to apply a profile and pass Border Patrol as the target check app:
 
 ```bash
-python3 coyote.py -p test/src/main/assets/test_profile.json -t com.border.patrol
+coyote -p test/src/main/assets/test_profile.json -t com.border.patrol
 ```

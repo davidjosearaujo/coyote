@@ -177,7 +177,7 @@ static int prop_override_cmp(const void *key, const void *elem) {
     return strcmp((const char *)key, ((const prop_override_t *)elem)->key);
 }
 
-// SYSTEM_PROP_OVERRIDES is emitted sorted by key (see coyote.py), so this is an
+// SYSTEM_PROP_OVERRIDES is emitted sorted by key (see cli.py), so this is an
 // O(log n) binary search instead of a linear strcmp scan. __system_property_get
 // is called constantly during an app's life, so this is the one genuinely hot
 // native hook worth optimizing.

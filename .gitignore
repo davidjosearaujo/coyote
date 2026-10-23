@@ -251,8 +251,10 @@ dkms.conf
 *.out
 *.app
 
-# Frida devkit
+# Frida devkit + per-build output now live in the user cache dir
+# (~/.cache/coyote), not in the tree. These remain for any stale checkouts.
 agent_src/devkit/*
+src/coyote/agent_src/devkit/*
 test/hound/local.properties
 test/local.properties
 *.gradle/
@@ -263,3 +265,4 @@ out.txt
 # Generated profile collections
 collection/
 profiles/collection/
+src/coyote/profiles/collection/

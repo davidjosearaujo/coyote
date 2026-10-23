@@ -10,10 +10,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-BASE_DIR = Path(__file__).parent.resolve()
-DEVKIT_DIR = Path(__file__).parent / "agent_src" / "devkit"
-AGENT_SRC = BASE_DIR / "agent_src"
-BUILD_DIR = BASE_DIR / "build"
+from .paths import AGENT_SRC, BUILD_DIR, DEVKIT_DIR
 
 ABI_MAP = {
     "arm64-v8a": {"compiler": "aarch64-linux-android", "devkit": "arm64"},
@@ -90,7 +87,7 @@ class Coyote:
         self.profile = self._load_profile(profile_path) if profile_path else {}
 
         if not dry_run and profile_path:
-            BUILD_DIR.mkdir(exist_ok=True)
+            BUILD_DIR.mkdir(parents=True, exist_ok=True)
 
     def _load_profile(self, path: str) -> dict:
         profile_file = Path(path)
@@ -217,8 +214,8 @@ class Coyote:
 
     def generate_c_header(self):
         """Dynamically generates config.h from the JSON profile without a template."""
-        print("\n[+] Generating agent_src/config.h header file...")
         output_file = BUILD_DIR / "config.h"
+        print(f"\n[+] Generating {output_file} ...")
         self._resolve_location()
 
         def format_value(key: str, val) -> str:
@@ -322,7 +319,7 @@ class Coyote:
                 sys.exit(1)
 
             bridge_js = _find_frida_bridge_js()
-            BUILD_DIR.mkdir(exist_ok=True)
+            BUILD_DIR.mkdir(parents=True, exist_ok=True)
 
             # java.js defines `var bridge = <Runtime>`; expose it under the name
             # agent.js reads, then append the agent. All one script.
@@ -404,11 +401,11 @@ class Coyote:
             *(["-DCOYOTE_RECON"] if self.recon else []),
             f"-I{AGENT_SRC}",
             f"-I{BUILD_DIR}",
-            f"-I{AGENT_SRC / 'devkit'}",
+            f"-I{DEVKIT_DIR}",
             str(AGENT_SRC / "coyote.c"),
             str(AGENT_SRC / "puppyc.c"),
             str(AGENT_SRC / "puppyjs.c"),
-            str(AGENT_SRC / "devkit" / "libfrida-gumjs.a"),
+            str(DEVKIT_DIR / "libfrida-gumjs.a"),
             "-o",
             str(output_so),
             "-Wl,--gc-sections",
@@ -778,7 +775,7 @@ def update_frida_devkit(arch: str | None = None):
         print(f"    URL: {archive_url}")
         sys.exit(1)
 
-    print("[+] Extracting headers and static libraries into agent_src/devkit...")
+    print(f"[+] Extracting headers and static libraries into {DEVKIT_DIR}...")
     with tarfile.open(archive_path, "r:xz") as tar:
         if hasattr(tarfile, "data_filter"):
             tar.extractall(path=DEVKIT_DIR, filter="data")
@@ -801,7 +798,7 @@ def ensure_devkit(requested_arch: str | None = None):
     if header_file.is_file() and lib_file.is_file():
         return
 
-    print("\n[!] Frida-GumJS DevKit missing from agent_src/devkit/")
+    print(f"\n[!] Frida-GumJS DevKit missing from {DEVKIT_DIR}")
 
     print("[+] Attempting to auto-detect target device ABI via ADB...")
     try:
@@ -827,6 +824,7 @@ def ensure_devkit(requested_arch: str | None = None):
 
 def parse_args():
     parser = argparse.ArgumentParser(
+        prog="coyote",
         description="Coyote - Autonomous Anti-Analysis Environment Provisioner",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )

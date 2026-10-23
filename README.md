@@ -15,6 +15,12 @@ on the device. There is no extra daemon process and no Frida binaries left on th
 device. The agent lives entirely inside the target process, which keeps its
 footprint minimal and hard to attribute.
 
+Coyote installs as a Python package (`pipx install …`) that provides two
+command-line tools: **`coyote`** — build a tailored spoofing library and inject
+it into a target — and **`coyote-profiles`** — generate device profiles from a
+built-in country/carrier/device database. See [Setup](#setup) to install and
+[Usage](#usage) to run.
+
 > ⚠️ **Scope / intent.** Coyote is a defensive tool for authorized malware
 > analysis and security research on devices you own or are authorized to test.
 > See [Legal & Ethical Use](#legal--ethical-use).
@@ -91,7 +97,7 @@ allowed to map it under SELinux.
 ### The two spoofing layers
 
 Coyote spoofs at two levels because detection happens at two levels. Everything
-is driven by the compiled-in profile (`build/config.h`).
+is driven by the compiled-in profile (the generated `config.h`).
 
 **1. Native layer, `agent_src/puppyc.c` (libgum / C).**
 Installs inline hooks (via Frida's GumJS devkit, used as a plain C library, no
@@ -196,25 +202,30 @@ first checks) with zero added device footprint.
 
 ### The build pipeline
 
-Running `coyote.py` with a profile performs, in order:
+Running `coyote` with a profile performs, in order:
 
 1. **`configure_adb_properties`**, `setprop`s the writable (`non-ro.*`) keys from
    `system_prop` over ADB. `ro.*` keys are skipped here and handled by the native
    property hook instead.
-2. **`generate_c_header`**, turns the JSON profile into `build/config.h`
+2. **`generate_c_header`**, turns the JSON profile into `config.h`
    (`#define`s + a `SYSTEM_PROP_OVERRIDES[]` table).
 3. **`ensure_devkit`**, makes sure the Frida GumJS devkit for the target ABI is
-   present in `agent_src/devkit/` (auto-downloads the version matching your
-   installed `frida-tools` if missing — see below).
+   present in the cache (auto-downloads the version matching your installed
+   `frida-tools` if missing — see below).
 4. **`compile_js`**, concatenates the prebuilt `frida-java-bridge` bundle shipped
-   by `frida-tools` (`bridges/java.js`) with `agent_src/js/agent.js` and embeds
-   the result as a C byte array in `build/agent.h`. No Node/npm — `agent.js` has
+   by `frida-tools` (`bridges/java.js`) with the bundled `agent.js` and embeds
+   the result as a C byte array in `agent.h`. No Node/npm — `agent.js` has
    no module imports and uses the bridge via the global it exposes.
 5. **`compile_agent`**, compiles `coyote.c` + `puppyc.c` + `puppyjs.c` against
-   the devkit static lib with the NDK Clang toolchain into `build/libcoyote.so`,
+   the devkit static lib with the NDK Clang toolchain into `libcoyote.so`,
    then strips it.
 6. **`launch_target_app`**, pushes the `.so`, fixes ownership/SELinux, sets the
    `wrap` property, force-stops the package, and relaunches it.
+
+Generated artifacts (`config.h`, `agent.h`, `libcoyote.so`) and the downloaded
+devkit are written under a user cache directory — `~/.cache/coyote/build/` and
+`~/.cache/coyote/devkit/` (override with `$COYOTE_CACHE_DIR`, or `$XDG_CACHE_HOME`)
+— so nothing is written inside the installed package.
 
 The three C sources: `coyote.c` is the entry point (constructor → background
 thread → `gum_init_embedded` → native hooks → GumJS runtime); `puppyc.c` holds
@@ -231,38 +242,43 @@ macros as JS globals) and runs the embedded agent.
 - **`adb`** on your `PATH`, with the device connected and authorized.
 - **Android NDK**, pointed to by `$ANDROID_NDK_HOME` or `--ndk`.
 - **Python 3.10+** (uses `str | None` typing).
-- **`frida-tools`** (Python) — provides the prebuilt `frida-java-bridge` bundle
-  and determines which devkit version to fetch. No Node.js/npm required.
+- **`frida-tools`** (Python) — installed automatically as a dependency when you
+  install Coyote; provides the prebuilt `frida-java-bridge` bundle and
+  determines which devkit version to fetch. No Node.js/npm required.
 - Internet access on first run (to fetch the Frida GumJS devkit), unless the
-  devkit is already in `agent_src/devkit/`.
+  devkit is already cached in `~/.cache/coyote/devkit/`.
 
 ---
 
 ## Setup
 
+Coyote installs as a Python package exposing two commands, `coyote` and
+`coyote-profiles`. The recommended install is [`pipx`](https://pipx.pypa.io/),
+which puts them on your `PATH` in an isolated environment:
+
 ```bash
-# 1. Clone and enter the repo
-git clone <your-fork-url> coyote && cd coyote
+# 1. Install from the repo (pipx isolates frida-tools in its own venv)
+pipx install git+https://codeberg.org/davidjosearaujo/coyote.git
+#   or from a local checkout:  git clone … coyote && pipx install ./coyote
 
-# 2. Install the Python dependencies (frida-tools) into a venv
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-
-# 3. Point to your NDK (or pass --ndk each run)
+# 2. Point to your NDK (or pass --ndk each run)
 export ANDROID_NDK_HOME=/path/to/android-ndk
 
-# 4. (Optional) pre-fetch the Frida GumJS devkit for your device ABI.
+# 3. (Optional) pre-fetch the Frida GumJS devkit for your device ABI.
 #    Auto-detected from the connected device if you omit the arch.
-python coyote.py --update-devkit            # auto-detect via ADB
-python coyote.py --update-devkit arm64      # or force one: arm | arm64 | x86 | x86_64
+coyote --update-devkit            # auto-detect via ADB
+coyote --update-devkit arm64      # or force one: arm | arm64 | x86 | x86_64
 ```
 
-The devkit (`frida-gumjs.h` + `libfrida-gumjs.a`, ~180 MB) is large and
-git-ignored. `--update-devkit` downloads the release **matching your installed
-`frida-tools` version** (`frida.__version__`) from GitHub and extracts it into
-`agent_src/devkit/`. Pinning the devkit to `frida-tools` keeps the embedded
-GumJS runtime and the bridge JS in lockstep — if you upgrade `frida-tools`,
-re-run `--update-devkit` to match.
+Prefer `pip`? `pip install .` (or `pip install -e .` for a hacking checkout)
+works the same; the only runtime dependency is `frida-tools`.
+
+The devkit (`frida-gumjs.h` + `libfrida-gumjs.a`, ~180 MB) is large and is
+**not** shipped with the package. `--update-devkit` downloads the release
+**matching your installed `frida-tools` version** (`frida.__version__`) from
+GitHub and extracts it into `~/.cache/coyote/devkit/`. Pinning the devkit to
+`frida-tools` keeps the embedded GumJS runtime and the bridge JS in lockstep —
+if you upgrade `frida-tools`, re-run `--update-devkit` to match.
 
 ---
 
@@ -271,7 +287,7 @@ re-run `--update-devkit` to match.
 The general form is:
 
 ```bash
-python coyote.py -p <profile.json> -t <target.package.name>
+coyote -p <profile.json> -t <target.package.name>
 ```
 
 This builds a `libcoyote.so` tailored to `<profile.json>`, injects it into
@@ -301,34 +317,34 @@ This builds a `libcoyote.so` tailored to `<profile.json>`, injects it into
 **Build, inject, and run against a target:**
 
 ```bash
-python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app
+coyote -p profiles/pixel7_us_tmobile.json -t com.suspicious.app
 ```
 
 **Preview exactly what would happen (no device changes, no compile):**
 
 ```bash
-python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --dry-run
+coyote -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --dry-run
 ```
 
 **Compile the `.so` without touching the device (e.g. CI / offline build):**
 
 ```bash
-python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --skip-deploy
-# artifact: build/libcoyote.so
+coyote -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --skip-deploy
+# artifact: ~/.cache/coyote/build/libcoyote.so
 ```
 
 **Remove Coyote from a target and reset its state:**
 
 ```bash
-python coyote.py -t com.suspicious.app --reset-target
+coyote -t com.suspicious.app --reset-target
 ```
 
 **Capture a profile from a real device, then use it:**
 
 ```bash
-python coyote.py --capture my_device.json        # reads a connected real phone
+coyote --capture my_device.json        # reads a connected real phone
 # review my_device.json (esp. auto-generated fields), then:
-python coyote.py -p my_device.json -t com.suspicious.app
+coyote -p my_device.json -t com.suspicious.app
 ```
 
 **Capture from a physical phone, inject into an emulator** (both connected),
@@ -336,8 +352,8 @@ scope each step to a device with `--serial` (from `adb devices`):
 
 ```bash
 adb devices -l                                   # find the serials
-python coyote.py -s TA9990XYZ    --capture phone.json          # read the phone
-python coyote.py -s emulator-5554 -p phone.json -t com.suspicious.app   # build/inject into the emulator
+coyote -s TA9990XYZ    --capture phone.json          # read the phone
+coyote -s emulator-5554 -p phone.json -t com.suspicious.app   # build/inject into the emulator
 ```
 
 The deploy step's ABI/devkit are resolved from the `--serial` target (the
@@ -363,14 +379,14 @@ emulator), so the `.so` matches where it runs.
 **See what a target probes (recon mode):**
 
 ```bash
-python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --recon
+coyote -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --recon
 adb logcat -s "[CoyoteRecon]" "[PuppyJS]" | grep -E 'RECON|prop_get|ptrace'
 ```
 
 **Build a verbose (debug) agent and watch it work:**
 
 ```bash
-python coyote.py -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --debug
+coyote -p profiles/pixel7_us_tmobile.json -t com.suspicious.app --debug
 adb logcat -s "[Coyote]" "[PuppyC]" "[PuppyJS]"
 ```
 
@@ -399,9 +415,9 @@ hooks. **Keys you omit are simply not spoofed**, the real device value shows
 through. Start from an existing profile and change what you need.
 
 You can also **generate** complete profiles from a country/carrier/device
-database instead of writing them by hand — see
-[`profiles/generate_profiles.py`](profiles/README.md), e.g.
-`python profiles/generate_profiles.py --country US --device google-pixel-8-pro -o my.json`
+database instead of writing them by hand with the `coyote-profiles` command
+(see [its README](src/coyote/profiles/README.md)), e.g.
+`coyote-profiles --country US --device google-pixel-8-pro -o my.json`
 (location is randomized within ~10 km of the country's capital). `--full-collection`
 builds one profile per carrier for every country.
 
@@ -591,11 +607,11 @@ profiles cover a large, practical set (100+ keys) you can use as a baseline.
 
 - **`[!] Error: Invalid NDK directory`**, set `$ANDROID_NDK_HOME` or pass
   `--ndk /path/to/ndk`.
-- **Devkit missing / download fails**, run `python coyote.py --update-devkit`
+- **Devkit missing / download fails**, run `coyote --update-devkit`
   (with the device connected for auto ABI detection), or specify the arch.
-- **`frida-tools is not installed`**, create/activate the venv and
-  `pip install -r requirements.txt`. The build reads `frida-java-bridge` from
-  `frida-tools`' `bridges/java.js`.
+- **`frida-tools is not installed`**, reinstall Coyote (`pipx install …` /
+  `pip install .`) so its `frida-tools` dependency is present. The build reads
+  `frida-java-bridge` from `frida-tools`' `bridges/java.js`.
 - **Devkit download 404 / bridge calls a missing runtime API**, your devkit and
   `frida-tools` versions drifted. Re-run `--update-devkit` to fetch the devkit
   matching the installed `frida-tools`.
@@ -621,21 +637,24 @@ profiles cover a large, practical set (100+ keys) you can use as a baseline.
 
 ```
 coyote/
-├── coyote.py               # Orchestrator: profile → config.h → build → inject
-├── requirements.txt        # Python deps (frida-tools)
-├── profiles/               # Profiles + generator
-│   ├── pixel7_us_tmobile.json   # hand-written example
-│   ├── profile_database.json    # countries/carriers/devices + capital coords
-│   └── generate_profiles.py     # build full profiles (single or --full-collection)
-├── agent_src/
-│   ├── coyote.c            # Library entry point (constructor, threads, gum init)
-│   ├── puppyc.c            # Native (libgum/C) hooks
-│   ├── puppyjs.c           # Embedded GumJS runtime + macro injection + agent loader
-│   ├── js/
-│   │   └── agent.js        # Managed (Java/ART) hooks + in-process spawn-gating
-│   └── devkit/             # Frida GumJS devkit (git-ignored; via --update-devkit)
-├── build/                  # Generated: config.h, _agent.js, agent.h, libcoyote.so
+├── pyproject.toml          # Packaging: deps (frida-tools), `coyote` + `coyote-profiles` entry points
+├── src/coyote/             # The installable package
+│   ├── cli.py              # `coyote`: profile → config.h → build → inject
+│   ├── coyote_profiles.py  # `coyote-profiles`: generate full profiles (single or --full-collection)
+│   ├── paths.py            # Package-data vs. user-cache path resolution
+│   ├── agent_src/
+│   │   ├── coyote.c        # Library entry point (constructor, threads, gum init)
+│   │   ├── puppyc.c        # Native (libgum/C) hooks
+│   │   ├── puppyjs.c       # Embedded GumJS runtime + macro injection + agent loader
+│   │   └── js/agent.js     # Managed (Java/ART) hooks + in-process spawn-gating
+│   └── profiles/           # Shipped data
+│       ├── pixel7_us_tmobile.json   # hand-written example
+│       └── profile_database.json    # countries/carriers/devices + capital coords
 └── test/                   # "Border Patrol" validation app (~314 detection checks)
+
+~/.cache/coyote/            # Writable, created at runtime (override: $COYOTE_CACHE_DIR)
+├── devkit/                 # Frida GumJS devkit (fetched via --update-devkit)
+└── build/                  # Generated: config.h, _agent.js, agent.h, libcoyote.so
 ```
 
 ---

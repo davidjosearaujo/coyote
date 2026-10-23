@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Coyote is now an installable Python package. `pipx install .` (or
+  `pip install .`) puts two commands on your `PATH`: `coyote` (the orchestrator,
+  was `python coyote.py`) and `coyote-profiles` (the profile generator, was
+  `python profiles/generate_profiles.py`). Source moved under `src/coyote/`;
+  the C sources, JS agent and profile database ship as package data.
+- Writable artifacts no longer live in the repo. The downloaded Frida devkit
+  and per-build output (`config.h`, `agent.h`, `libcoyote.so`) are written to a
+  user cache dir — `~/.cache/coyote/` — so the tool works installed read-only.
+  Override with `$COYOTE_CACHE_DIR` (or `$XDG_CACHE_HOME`).
+
+### Removed
+- `requirements.txt`: the sole runtime dependency (`frida-tools`) is now
+  declared in `pyproject.toml`.
+
 ## [2.1.1] - 2026-10-15
 
 ### Fixed
