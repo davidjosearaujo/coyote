@@ -27,7 +27,7 @@ classifiers = [
     "Topic :: Security",
 ]
 dependencies = [
-    "frida-tools",
+    "frida-tools>=14.11.0",
 ]
 
 [project.scripts]
