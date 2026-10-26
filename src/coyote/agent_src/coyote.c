@@ -67,7 +67,15 @@ static void* coyote_master_thread(void* arg) {
     //    the main process. Auxiliary processes skip the heavy JS layer and this
     //    thread simply exits.
     if (coyote_should_run_js()) {
+#ifdef COYOTE_NATIVE_ONLY
+        // Debug/diagnostic build: run only the native (C) Gum hooks, never the
+        // GumJS runtime. Used to isolate crashes to the native interceptor vs.
+        // the JS/Java layer (e.g. frida-gum stability under native-bridge
+        // binary translation).
+        LOGI("COYOTE_NATIVE_ONLY: skipping JS layer.");
+#else
         apply_gumjs_hooks();
+#endif
     } else {
         LOGI("Auxiliary process; skipping JS layer.");
     }

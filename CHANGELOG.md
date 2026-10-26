@@ -25,10 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--nb-shim` (experimental).** Opt-in path to instrument a native-bridge
   app: installs a shim that re-execs the *guest* `app_process` and hands the
   agent to the guest linker via the translator's `NDK_TRANSLATION_GUEST_LD_PRELOAD`
-  channel. The agent loads and the native (PuppyC) hooks run inside the guest,
-  but frida-gum is currently unstable under translation (a secondary thread may
-  crash before the JS/Java layer comes up), and it requires SELinux permissive.
-  Off by default.
+  channel. The agent reliably loads into the translated guest, but frida-gum
+  itself cannot initialize there: `gum_init_embedded()` segfaults (null deref)
+  inside the ndk_translation guest, consistently, before any hooks apply — so
+  both the native and GumJS layers are blocked under translation, not just the
+  JS runtime. This is a frida-under-binary-translation limitation below Coyote's
+  level. `--nb-shim` also requires SELinux permissive. Off by default; the
+  `COYOTE_NATIVE_ONLY` compile flag (native hooks only, no GumJS) is available
+  for isolating translation crashes.
 
 ### Changed
 - Narrowed the hottest JS agent hooks so their per-call cost is minimal (they
