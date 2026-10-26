@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Narrowed the hottest JS agent hooks so their per-call cost is minimal (they
+  run on methods the framework calls thousands of times during startup, the
+  likely cause of real-app splash hangs). All changes are behaviour-preserving
+  — verified against Border Patrol (same pass set as unmodified `main`):
+  - `Settings.$Global/$Secure/$System.getString/getInt`: precompute a per-class
+    O(1) lookup map once instead of an `Array.indexOf` scan (+ `parseInt`) per
+    call.
+  - `BatteryManager` `Intent.getIntExtra` / `Bundle.getInt`: allocation-free —
+    the old code built a fresh object literal on every call; pure-spoof keys now
+    return a constant without invoking the original getter at all.
+  - Install-referrer `Bundle.getString/getLong`: check the key before touching
+    the original and hoist the timestamp map out of the per-call path.
+  - `System.getProperty`: hook only the single-`String` overload (the one that
+    carries `http.agent`) instead of every overload.
 - JS agent hook install is now **staged** to stop real-world apps from hanging
   on the splash screen. Previously all ~70 Java method replacements were
   installed in one synchronous burst inside `callActivityOnCreate`; each

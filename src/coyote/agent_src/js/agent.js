@@ -221,15 +221,26 @@ function onJavaReady(Java) {
 
         Object.keys(classConfigs).forEach(function(className) {
             const clazz = Java.use(className);
-            const allowedKeys = classConfigs[className];
+
+            // Settings.get* is read constantly during startup. Precompute this
+            // class's spoofed string/int values once so the hot hook is a single
+            // O(1) object lookup instead of an Array.indexOf scan (+ parseInt)
+            // per call. Membership in these maps is exactly the old
+            // `indexOf(name) !== -1 && settingsMap[name] !== undefined` test.
+            const strMap = {};
+            const intMap = {};
+            classConfigs[className].forEach(function(k) {
+                if (settingsMap[k] !== undefined) {
+                    strMap[k] = settingsMap[k];
+                    intMap[k] = parseInt(settingsMap[k], 10);
+                }
+            });
 
             if (clazz.getString) {
                 clazz.getString.overloads.forEach(function(overload) {
                     overload.implementation = function() {
-                        const name = arguments[1];
-                        if (allowedKeys.indexOf(name) !== -1 && settingsMap[name] !== undefined) {
-                            return settingsMap[name];
-                        }
+                        const v = strMap[arguments[1]];
+                        if (v !== undefined) return v;
                         return this.getString.apply(this, arguments);
                     };
                 });
@@ -238,10 +249,8 @@ function onJavaReady(Java) {
             if (clazz.getInt) {
                 clazz.getInt.overloads.forEach(function(overload) {
                     overload.implementation = function() {
-                        const name = arguments[1];
-                        if (allowedKeys.indexOf(name) !== -1 && settingsMap[name] !== undefined) {
-                            return parseInt(settingsMap[name], 10);
-                        }
+                        const v = intMap[arguments[1]];
+                        if (v !== undefined) return v;
                         return this.getInt.apply(this, arguments);
                     };
                 });
@@ -912,15 +921,19 @@ function onJavaReady(Java) {
             const UA = ' (' + baseOS + ')';
             const UAW = ' (' + baseOS + '; wv) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.200 Mobile Safari/537.36';
 
+            // System.getProperty is one of the hottest methods in the VM. Only
+            // the single-String overload carries 'http.agent', so hook just that
+            // one (not the (String,String) overload) to halve the footprint.
             const System = Java.use('java.lang.System');
-            for (let i = 0; i < System.getProperty.overloads.length; i++) {
-                System.getProperty.overloads[i].implementation = function () {
-                    const key = arguments[0];
-                    if (key === 'http.agent') {
+            try {
+                System.getProperty.overload('java.lang.String').implementation = function (name) {
+                    if (name === 'http.agent') {
                         return nativePrefix + UA;
                     }
                     return System.getProperty.apply(this, arguments);
                 };
+            } catch (e) {
+                console.log('[-] Error hooking System.getProperty: ' + e);
             }
 
             try {
@@ -1189,37 +1202,33 @@ function onJavaReady(Java) {
                 };
             }
 
+            // Intent.getIntExtra and Bundle.getInt fire on every intent/bundle
+            // read in the process, so this must be allocation-free: the old code
+            // built a fresh object literal on each call. Pure-spoof keys return a
+            // constant without even calling the original (getIntExtra/getInt are
+            // side-effect-free getters); only the ret-dependent keys defer to it.
+            const spoofBatteryInt = function(self, args, overload) {
+                switch (args[0]) {
+                    case 'plugged': return 0;
+                    case 'status': return 3;
+                    case 'level': return battery_level;
+                    case 'health': return 2;
+                    case 'scale': { const r = overload.apply(self, args); return r === 0 ? 100 : r; }
+                    case 'voltage': { const r = overload.apply(self, args); return r === 0 ? spoof_voltage : r; }
+                    case 'temperature': { const r = overload.apply(self, args); return r === 0 ? spoof_temp : r; }
+                    default: return overload.apply(self, args);
+                }
+            };
+
             Intent.getIntExtra.overloads.forEach(function(overload) {
                 overload.implementation = function() {
-                    const ret = overload.apply(this, arguments);
-                    const key = arguments[0];
-                    const map = {
-                        'plugged': 0,
-                        'status': 3,
-                        'level': battery_level,
-                        'scale': ret === 0 ? 100 : ret,
-                        'health': 2,
-                        'voltage': ret === 0 ? spoof_voltage : ret,
-                        'temperature': ret === 0 ? spoof_temp : ret
-                    };
-                    return map[key] !== undefined ? map[key] : ret;
+                    return spoofBatteryInt(this, arguments, overload);
                 };
             });
 
             Bundle.getInt.overloads.forEach(function(overload) {
                 overload.implementation = function() {
-                    const ret = overload.apply(this, arguments);
-                    const key = arguments[0];
-                    const map = {
-                        'plugged': 0,
-                        'status': 3,
-                        'level': battery_level,
-                        'scale': ret === 0 ? 100 : ret,
-                        'health': 2,
-                        'voltage': ret === 0 ? spoof_voltage : ret,
-                        'temperature': ret === 0 ? spoof_temp : ret
-                    };
-                    return map[key] !== undefined ? map[key] : ret;
+                    return spoofBatteryInt(this, arguments, overload);
                 };
             });
 
@@ -1364,27 +1373,28 @@ function onJavaReady(Java) {
 
             const Bundle = Java.use('android.os.Bundle');
 
+            // Bundle.get* is hot; check the key before touching the original and
+            // hoist the timestamp map out of the per-call path (it was rebuilt on
+            // every getLong before).
             Bundle.getString.overloads.forEach(function(overload) {
                 overload.implementation = function() {
-                    const key = arguments[0];
-                    const ret = overload.apply(this, arguments);
-                    return key === 'install_referrer' ? installReferrer : ret;
+                    if (arguments[0] === 'install_referrer') return installReferrer;
+                    return overload.apply(this, arguments);
                 };
             });
 
+            const timeMap = {
+                'install_begin_timestamp_seconds': cachedInstallTime,
+                'install_begin_timestamp_server_seconds': cachedInstallTime,
+                'referrer_click_timestamp_seconds': cachedClickTime,
+                'referrer_click_timestamp_server_seconds': cachedClickTime
+            };
+
             Bundle.getLong.overloads.forEach(function(overload) {
                 overload.implementation = function() {
-                    const key = arguments[0];
-                    const ret = overload.apply(this, arguments);
-
-                    const timeMap = {
-                        'install_begin_timestamp_seconds': cachedInstallTime,
-                        'install_begin_timestamp_server_seconds': cachedInstallTime,
-                        'referrer_click_timestamp_seconds': cachedClickTime,
-                        'referrer_click_timestamp_server_seconds': cachedClickTime
-                    };
-
-                    return timeMap[key] !== undefined ? timeMap[key] : ret;
+                    const v = timeMap[arguments[0]];
+                    if (v !== undefined) return v;
+                    return overload.apply(this, arguments);
                 };
             });
 
