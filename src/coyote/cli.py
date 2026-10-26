@@ -42,16 +42,16 @@ COUNTRY_COORDS = {
 }
 
 def detect_device_abi() -> dict:
-    """Queries target device via ADB, defaulting to the host's architecture if unavailable."""
-    try:
-        cmd = ["adb", "shell", "getprop", "ro.product.cpu.abi"]
-        raw_abi = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
-        if raw_abi in ABI_MAP:
-            return ABI_MAP[raw_abi]
+    """Maps the device's primary ABI to its compiler/devkit, defaulting to the
+    host's architecture when ADB is unavailable or the ABI is unknown."""
+    raw_abi = detect_device_primary_abi()
+    if raw_abi in ABI_MAP:
+        return ABI_MAP[raw_abi]
+    if raw_abi:
         print(f"[!] Unknown ABI '{raw_abi}'. Defaulting to host architecture.")
-    except Exception:
+    else:
         print("[!] ADB query failed. Defaulting compiler to host architecture.")
-    
+
     machine = platform.machine().lower()
     if machine in ["x86_64", "amd64"]:
         return ABI_MAP["x86_64"]
@@ -922,11 +922,10 @@ def ensure_devkit(requested_arch: str | None = None):
     header_file = DEVKIT_DIR / "frida-gumjs.h"
     lib_file = DEVKIT_DIR / "libfrida-gumjs.a"
 
-    arch_marker = DEVKIT_DIR / ".devkit_arch"
-    cached_arch = arch_marker.read_text().strip() if arch_marker.is_file() else None
-
     if requested_arch and requested_arch not in ("auto", None):
-        # Already have exactly this arch? Don't re-download.
+        # Already have exactly this arch cached? Don't re-download.
+        arch_marker = DEVKIT_DIR / ".devkit_arch"
+        cached_arch = arch_marker.read_text().strip() if arch_marker.is_file() else None
         if header_file.is_file() and lib_file.is_file() and cached_arch == requested_arch:
             return
         update_frida_devkit(requested_arch)

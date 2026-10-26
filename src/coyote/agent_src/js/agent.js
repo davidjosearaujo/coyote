@@ -1120,25 +1120,6 @@ function onJavaReady(Java) {
         }
     }
         },
-        'network_info': function () {
-    // ============================================
-    // BLOCK 12: Network Info Spoofing Hooks
-    // ============================================
-    if (typeof global.NETWORK_NET_TYPE !== 'undefined') {
-        try {
-            const NetworkInfo = Java.use('android.net.NetworkInfo');
-
-            const netType = global.NETWORK_NET_TYPE;
-            const typeName = (netType === 1) ? 'WIFI' : 'MOBILE';
-            const subType = (netType === 1) ? '' : 'LTE';
-            const fakeNetInfo = NetworkInfo.$new(netType, 0, typeName, subType);
-
-            console.log('[+] JSAgent hooked network info successfully');
-        } catch (e) {
-            console.log('[-] Error hooking network info: ' + e);
-        }
-    }
-        },
         'proxy': function () {
     // ============================================
     // BLOCK 14: Proxy Bypass Hook
@@ -1547,7 +1528,7 @@ function onJavaReady(Java) {
 
     // Everything else: only matters once the app is actually running (TLS, UA,
     // battery, location, ...). Order is roughly soonest-needed first.
-    var DEFERRED = ['ssl', 'user_agent', 'network_vpn', 'network_info', 'proxy', 'battery', 'time', 'keyguard', 'flag_secure', 'usb', 'install_referrer', 'accounts', 'wifi', 'location'];
+    var DEFERRED = ['ssl', 'user_agent', 'network_vpn', 'proxy', 'battery', 'time', 'keyguard', 'flag_secure', 'usb', 'install_referrer', 'accounts', 'wifi', 'location'];
 
     installStaged(Java, BLOCKS, CRITICAL, DEFERRED);
 }

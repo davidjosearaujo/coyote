@@ -30,9 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside the ndk_translation guest, consistently, before any hooks apply — so
   both the native and GumJS layers are blocked under translation, not just the
   JS runtime. This is a frida-under-binary-translation limitation below Coyote's
-  level. `--nb-shim` also requires SELinux permissive. Off by default; the
-  `COYOTE_NATIVE_ONLY` compile flag (native hooks only, no GumJS) is available
-  for isolating translation crashes.
+  level. `--nb-shim` also requires SELinux permissive. Off by default.
 
 ### Changed
 - Narrowed the hottest JS agent hooks so their per-call cost is minimal (they
