@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **ABI-aware builds.** Coyote now detects the *target app's* `primaryCpuAbi`
+  (via `dumpsys package`) and compiles `libcoyote.so` for the ABI the app's
+  process actually runs as, instead of always building for the device's primary
+  ABI. The Frida devkit is fetched/cached per-arch (tracked by a
+  `.devkit_arch` marker) and auto-switched when the build target changes. This
+  makes 32-bit apps on 64-bit devices (and other native secondary-ABI cases)
+  work correctly.
+- **Native-bridge guard.** When the target app runs only through native-bridge
+  translation (e.g. an arm64-only app on an x86_64 emulator), the plain
+  `wrap`+`LD_PRELOAD` injection cannot cross into the translated process — the
+  app would hang on its splash because its own native libraries fail to load in
+  the forced non-native process. Coyote now detects this up front and stops
+  with a clear message (build for a matching-ABI target, or use `--nb-shim`)
+  instead of producing a silent splash hang.
+- **`--nb-shim` (experimental).** Opt-in path to instrument a native-bridge
+  app: installs a shim that re-execs the *guest* `app_process` and hands the
+  agent to the guest linker via the translator's `NDK_TRANSLATION_GUEST_LD_PRELOAD`
+  channel. The agent loads and the native (PuppyC) hooks run inside the guest,
+  but frida-gum is currently unstable under translation (a secondary thread may
+  crash before the JS/Java layer comes up), and it requires SELinux permissive.
+  Off by default.
+
 ### Changed
 - Narrowed the hottest JS agent hooks so their per-call cost is minimal (they
   run on methods the framework calls thousands of times during startup, the

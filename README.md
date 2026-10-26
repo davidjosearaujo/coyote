@@ -273,6 +273,18 @@ macros as JS globals) and runs the embedded agent.
   determines which devkit version to fetch. No Node.js/npm required.
 - Internet access on first run (to fetch the Frida GumJS devkit), unless the
   devkit is already cached in `~/.cache/coyote/devkit/`.
+- **A target whose ABI the device runs natively.** Coyote builds `libcoyote.so`
+  for the target app's own ABI and injects via `wrap`+`LD_PRELOAD`. This works
+  when the app runs as a *native* ABI of the device (including 32-bit apps on a
+  64-bit device). It does **not** work for apps that only run through
+  native-bridge translation — e.g. an **arm64-only app on an x86_64 emulator**:
+  the translator never sees the preload, the app is forced into a non-native
+  process, and its own native libraries fail to load (it hangs on the splash).
+  Coyote detects this and stops with guidance rather than hanging. For such
+  apps, use a **matching-ABI target** (an arm64 system image or a real arm64
+  device). There is also an experimental `--nb-shim` path (see
+  [Command-line options](#command-line-options)); it currently only gets the
+  native layer running and needs SELinux permissive.
 
 ---
 

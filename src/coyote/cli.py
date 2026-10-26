@@ -63,6 +63,72 @@ def detect_device_abi() -> dict:
     # Safe fallback
     return ABI_MAP["x86_64"]
 
+# Broad CPU family per ABI. An app whose ABI is a different family than the
+# device's primary ABI only runs through a native-bridge translator (e.g.
+# arm64 apps on an x86_64 emulator via libndk_translation), which the plain
+# wrap+LD_PRELOAD inject can't cross — see resolve_target_abi().
+ARCH_FAMILY = {
+    "arm64-v8a": "arm", "armeabi-v7a": "arm",
+    "x86_64": "x86", "x86": "x86",
+}
+
+# Translated-guest app_process launched by the native-bridge shim, keyed by the
+# guest app's primary ABI (used only on the experimental --nb-shim path).
+GUEST_APP_PROCESS = {
+    "arm64-v8a": "/system/bin/arm64/app_process64",
+    "armeabi-v7a": "/system/bin/arm/app_process32",
+}
+
+def detect_app_abi(package: str) -> str | None:
+    """The installed target app's primaryCpuAbi (what ABI its process runs as),
+    or None if unknown / not installed. This is what the agent must match, and
+    it may differ from the device's primary ABI (then the app is translated)."""
+    try:
+        out = subprocess.check_output(
+            ["adb", "shell", "dumpsys", "package", package],
+            stderr=subprocess.DEVNULL,
+        ).decode(errors="replace")
+    except Exception:
+        return None
+    m = re.search(r"primaryCpuAbi=(\S+)", out)
+    if m and m.group(1) not in ("null", ""):
+        return m.group(1).strip()
+    return None
+
+def detect_device_primary_abi() -> str | None:
+    try:
+        abi = subprocess.check_output(
+            ["adb", "shell", "getprop", "ro.product.cpu.abi"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return abi or None
+    except Exception:
+        return None
+
+def resolve_target_abi(package: str) -> dict:
+    """Decide which ABI to build the agent for, and whether the target app only
+    runs under native-bridge translation (which wrap injection can't reach).
+
+    Returns {app_abi, device_abi, build_abi, translated}. On any detection
+    failure it falls back to the device's primary ABI with translated=False, so
+    behaviour is unchanged when ADB/dumpsys can't answer."""
+    app_abi = detect_app_abi(package) if package else None
+    device_abi = detect_device_primary_abi()
+
+    if not app_abi or app_abi not in ABI_MAP:
+        # Unknown app ABI: keep the historical behaviour (build for the device).
+        build_abi = device_abi if device_abi in ABI_MAP else None
+        return {"app_abi": app_abi, "device_abi": device_abi,
+                "build_abi": build_abi, "translated": False}
+
+    translated = bool(
+        device_abi
+        and ARCH_FAMILY.get(app_abi) != ARCH_FAMILY.get(device_abi)
+    )
+    # Build for the ABI the app's process actually runs as, not the device's.
+    return {"app_abi": app_abi, "device_abi": device_abi,
+            "build_abi": app_abi, "translated": translated}
+
 class Coyote:
 
     def __init__(
@@ -361,7 +427,7 @@ class Coyote:
 
         return host_dirs[0] / "bin"
 
-    def compile_agent(self) -> Path:
+    def compile_agent(self, target_abi: str | None = None) -> Path:
         """Invokes Android NDK Clang compiler to birth puppy."""
         print("\n[+] Releasing the puppy...")
 
@@ -371,7 +437,10 @@ class Coyote:
             )
             sys.exit(1)
 
-        target_info = detect_device_abi()
+        # Build for the target app's ABI when known (it may run under
+        # native-bridge translation, i.e. a different arch than the device's
+        # primary ABI); otherwise fall back to the device's ABI.
+        target_info = ABI_MAP[target_abi] if target_abi in ABI_MAP else detect_device_abi()
         compiler_prefix = target_info["compiler"]
         bin_dir = self._get_llvm_prebuilt_path()
         compiler = bin_dir / f"{compiler_prefix}{self.api_level}-clang"
@@ -425,8 +494,17 @@ class Coyote:
         print(f"[+] Puppy target: {output_so}")
         return output_so
 
-    def launch_target_app(self, so_path: Path):
-        """Pushes libcoyote.so and libc++_shared.so into target app private data directory and launches package via wrap property."""
+    def launch_target_app(self, so_path: Path, nb_shim_guest_abi: str | None = None):
+        """Pushes libcoyote.so into the target app's private data dir and launches
+        it via the wrap property.
+
+        Normally the wrap is `env LD_PRELOAD=<lib>`, which the OS runs through the
+        device-native app_process. For a translated app (nb_shim_guest_abi set,
+        the experimental --nb-shim path) that native process can't load the app's
+        own libraries, so instead we drop a tiny shim that re-execs the *guest*
+        (translated) app_process and hands the agent to the guest linker via
+        NDK_TRANSLATION_GUEST_LD_PRELOAD — the one env channel the translator
+        forwards into the guest. See docs: native-bridge injection."""
 
         temp_so = "/data/local/tmp/libcoyote.so"
         app_dir = f"/data/data/{self.package_name}"
@@ -448,11 +526,58 @@ class Coyote:
 
         print(f"[+] Injecting Puppy into target package: {self.package_name}")
 
-        wrap_cmd = f"setprop wrap.{self.package_name} 'env LD_PRELOAD={target_so}'"
-        self._exec(["adb", "shell", wrap_cmd], desc=f"Set wrap hook for {self.package_name}")
+        if nb_shim_guest_abi:
+            self._set_native_bridge_wrap(app_dir, target_so, nb_shim_guest_abi)
+        else:
+            wrap_cmd = f"setprop wrap.{self.package_name} 'env LD_PRELOAD={target_so}'"
+            self._exec(["adb", "shell", wrap_cmd], desc=f"Set wrap hook for {self.package_name}")
 
         self._exec(["adb", "shell", f"am force-stop {self.package_name}"])
         self._exec(["adb", "shell", f"monkey -p {self.package_name} -c android.intent.category.LAUNCHER 1"])
+
+    def _set_native_bridge_wrap(self, app_dir: str, target_so: str, guest_abi: str):
+        """Experimental: inject into a native-bridge-translated app. Installs a
+        shim that re-execs the guest app_process with the agent preloaded via the
+        translator's guest-env channel. Requires a guest app_process for the ABI
+        and (today) SELinux permissive, since apps can't execute_no_trans a file
+        in their own data dir under enforcing policy."""
+        guest_app_process = GUEST_APP_PROCESS.get(guest_abi)
+        if not guest_app_process:
+            print(f"[!] No known guest app_process for ABI '{guest_abi}'; cannot use --nb-shim.")
+            sys.exit(1)
+
+        enforce = self._exec(["adb", "shell", "su 0 getenforce"]).strip()
+        if enforce.lower() == "enforcing":
+            print("[!] --nb-shim needs SELinux permissive (apps can't exec a shim in their")
+            print("    data dir under enforcing policy). Run: adb shell su 0 setenforce 0")
+
+        shim_path = f"{app_dir}/coyote_nb.sh"
+        # The wrap prefix is invoked as `exec <wrap> <host_app_process> <args...>`,
+        # so $1 is the host app_process path we drop; the rest are the real args.
+        # Write locally and `adb push` it so "$@" survives (embedding it in an
+        # adb-shell command line gets mangled by the intermediate shells).
+        shim = (
+            "#!/system/bin/sh\n"
+            f"export NDK_TRANSLATION_GUEST_LD_PRELOAD={target_so}\n"
+            "shift\n"
+            f'exec {guest_app_process} "$@"\n'
+        )
+        local_shim = BUILD_DIR / "coyote_nb.sh"
+        local_shim.write_text(shim)
+        # Push the shim via a staging file, then place + label it. system_file is
+        # the type apps are allowed to execute_no_trans (how they exec /system/bin/*).
+        tmp_shim = "/data/local/tmp/coyote_nb.sh"
+        self._exec(["adb", "push", str(local_shim), tmp_shim], desc="Stage NB shim")
+        self._exec(["adb", "shell", f"su 0 cp {tmp_shim} {shim_path}"], desc="Copy NB shim")
+        self._exec(
+            ["adb", "shell",
+             f"su 0 sh -c 'APP_UID=$(stat -c %u {app_dir}); chown $APP_UID:$APP_UID {shim_path}; "
+             f"chmod 755 {shim_path}; chcon u:object_r:system_file:s0 {shim_path}'"],
+            desc="Label NB shim",
+        )
+        print(f"[+] [nb-shim] guest app_process: {guest_app_process}")
+        wrap_cmd = f"setprop wrap.{self.package_name} '{shim_path}'"
+        self._exec(["adb", "shell", wrap_cmd], desc=f"Set native-bridge wrap for {self.package_name}")
 
     def reset_target_app(self):
         """Removes wrap property, stops target package, and clears app state."""
@@ -783,7 +908,13 @@ def update_frida_devkit(arch: str | None = None):
             tar.extractall(path=DEVKIT_DIR)
 
     archive_path.unlink()
-    print(f"[+] Frida-GumJS DevKit {version} installed.")
+    # Record which arch is cached so ensure_devkit() can refetch when the build
+    # target changes (e.g. switching from an x86_64 device to an arm64 app).
+    try:
+        (DEVKIT_DIR / ".devkit_arch").write_text(arch)
+    except Exception:
+        pass
+    print(f"[+] Frida-GumJS DevKit {version} ({platform_target}) installed.")
 
 def ensure_devkit(requested_arch: str | None = None):
     """Verifies DevKit files exist. Downloads them if missing or explicitly requested."""
@@ -791,7 +922,13 @@ def ensure_devkit(requested_arch: str | None = None):
     header_file = DEVKIT_DIR / "frida-gumjs.h"
     lib_file = DEVKIT_DIR / "libfrida-gumjs.a"
 
-    if requested_arch:
+    arch_marker = DEVKIT_DIR / ".devkit_arch"
+    cached_arch = arch_marker.read_text().strip() if arch_marker.is_file() else None
+
+    if requested_arch and requested_arch not in ("auto", None):
+        # Already have exactly this arch? Don't re-download.
+        if header_file.is_file() and lib_file.is_file() and cached_arch == requested_arch:
+            return
         update_frida_devkit(requested_arch)
         return
 
@@ -910,6 +1047,15 @@ def parse_args():
         const="auto",
         help="Fetch latest Frida-GumJS DevKit for specified architecture (auto-detects via ADB if omitted).",
     )
+    parser.add_argument(
+        "--nb-shim",
+        action="store_true",
+        help="EXPERIMENTAL: instrument a native-bridge-translated app (e.g. an "
+        "arm64-only app on an x86_64 emulator) by re-execing the guest "
+        "app_process and preloading the agent via the translator's guest-env "
+        "channel. Requires SELinux permissive. Known unstable (frida-gum under "
+        "translation may crash); without it, a translated target is refused.",
+    )
 
     return parser.parse_args()
 
@@ -962,12 +1108,42 @@ def main():
     if args.profile:
         orchestrator.validate_profile()
         orchestrator.generate_c_header()
-        ensure_devkit()
+
+        # Decide which ABI to build for and whether the target only runs under
+        # native-bridge translation. Skip when we can't query the device (dry
+        # run / no ADB / no target) — then the build falls back to device ABI.
+        target_abi = None
+        nb_shim_guest_abi = None
+        if args.target and not args.dry_run and not args.skip_adb:
+            info = resolve_target_abi(args.target)
+            target_abi = info["build_abi"]
+            if info["app_abi"]:
+                print(f"\n[+] Target ABI: app={info['app_abi']} device={info['device_abi']}"
+                      + (" (translated via native bridge)" if info["translated"] else ""))
+            if info["translated"]:
+                if args.nb_shim:
+                    print("[!] --nb-shim: using EXPERIMENTAL native-bridge injection (unstable).")
+                    nb_shim_guest_abi = info["app_abi"]
+                else:
+                    print(
+                        f"\n[!] '{args.target}' runs as {info['app_abi']} but this device is "
+                        f"{info['device_abi']} — it only runs through native-bridge "
+                        "translation, which Coyote's wrap+LD_PRELOAD injection cannot cross.\n"
+                        "    The app would hang on its splash (its own native libs fail to "
+                        "load in the forced non-native process).\n"
+                        "    Fix: run this app on a matching-ABI target (an arm64 system image "
+                        "or a real arm64 device), where injection works natively.\n"
+                        "    Or try the experimental --nb-shim path (requires SELinux permissive; "
+                        "currently unstable)."
+                    )
+                    sys.exit(2)
+
+        ensure_devkit(ABI_MAP[target_abi]["devkit"] if target_abi in ABI_MAP else None)
         orchestrator.compile_js()
-        agent_so = orchestrator.compile_agent()
+        agent_so = orchestrator.compile_agent(target_abi=target_abi)
 
         if not args.skip_deploy:
-            orchestrator.launch_target_app(agent_so)
+            orchestrator.launch_target_app(agent_so, nb_shim_guest_abi=nb_shim_guest_abi)
 
 if __name__ == "__main__":
     main()
