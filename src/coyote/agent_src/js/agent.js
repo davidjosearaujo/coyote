@@ -19,341 +19,255 @@ function recon(vector, detail) {
 
 console.log('[+] JSAgent: Starting...');
 
+// Pure helper (hoisted from the old BLOCK 2) so staged hook blocks in
+// either phase can use it without sharing closure scope.
+function getRealisticJitter(baseValue, variancePercent) {
+    const variance = baseValue * variancePercent;
+    const offset = (Math.random() * variance * 2) - variance;
+    return Math.floor(baseValue + offset);
+}
+
+// Run one hook family, isolating its failure so a single bad block can never
+// abort the rest of the install.
+function installBlock(label, fn) {
+    try {
+        fn();
+    } catch (e) {
+        console.error('[!] JSAgent: hook block "' + label + '" failed: ' + e);
+    }
+}
+
+// Staged install. Installing all ~70 Java method replacements at once inside
+// callActivityOnCreate ran ~70 ART deoptimizations back-to-back on the splash's
+// critical path; each deopt suspends every thread in the process. On a trivial
+// test app (few threads) that was merely slow; on real apps doing heavy work on
+// background threads during the splash it ANR'd or deadlocked, so they never got
+// past the splash screen. We now install only the detection-critical families
+// synchronously, then drain the rest one-per-main-thread-tick once the splash is
+// already up, so the remaining suspends are spread across frames off the
+// critical path.
+function installStaged(Java, blocks, critical, deferred) {
+    var t0 = Date.now();
+    for (var i = 0; i < critical.length; i++) {
+        var name = critical[i];
+        if (blocks[name]) installBlock(name, blocks[name]);
+    }
+    console.log('[+] JSAgent: ' + critical.length + ' critical hook block(s) installed in ' + (Date.now() - t0) + 'ms');
+
+    var queue = deferred.slice();
+    var canSchedule = (typeof Java.scheduleOnMainThread === 'function');
+
+    var pump = function () {
+        if (queue.length === 0) {
+            console.log('[+] JSAgent: all deferred hook blocks installed');
+            return;
+        }
+        var name = queue.shift();
+        if (blocks[name]) installBlock(name, blocks[name]);
+        // Re-post as a fresh main-loop message so the UI and the app's own
+        // bootstrap run between blocks instead of one long main-thread stall.
+        if (canSchedule) Java.scheduleOnMainThread(pump);
+        else pump();
+    };
+
+    if (canSchedule) {
+        Java.scheduleOnMainThread(pump);
+    } else {
+        console.log('[!] JSAgent: scheduleOnMainThread unavailable; draining deferred blocks synchronously');
+        pump();
+    }
+}
+
 function onJavaReady(Java) {
     console.log('[+] JSAgent: Java is ready! Attaching Java hooks...');
 
+    // Each hook family is wrapped so the installer can stage it. The closures
+    // capture `Java` and run exactly the original block code when invoked.
+    var BLOCKS = {
+        'build': function () {
     // ============================================
-    // BLOCK 2: Jitter Utility Function
-    // ============================================
-    function getRealisticJitter(baseValue, variancePercent) {
-        const variance = baseValue * variancePercent;
-        const offset = (Math.random() * variance * 2) - variance;
-        return Math.floor(baseValue + offset);
-    }
-
-    // ============================================
-    // BLOCK 1: Display Metrics Hooks
+    // BLOCK 19: android.os.Build static field spoofing
     // ============================================
     try {
-        const Display = Java.use('android.view.Display');
-
-        const patchMetrics = function(metrics) {
-            if (metrics !== null) {
-                if (typeof global.SPECS_WIDTH !== 'undefined') {
-                    metrics.widthPixels.value = global.SPECS_WIDTH;
-                }
-                if (typeof global.SPECS_HEIGHT !== 'undefined') {
-                    metrics.heightPixels.value = global.SPECS_HEIGHT;
-                }
-                if (typeof global.SPECS_DENSITY !== 'undefined') {
-                    metrics.density.value = global.SPECS_DENSITY;
-                }
-                if (typeof global.SPECS_DENSITY_DPI !== 'undefined') {
-                    metrics.densityDpi.value = global.SPECS_DENSITY_DPI;
-                }
-                if (typeof global.SPECS_XDPI !== 'undefined') {
-                    metrics.xdpi.value = global.SPECS_XDPI;
-                }
-                if (typeof global.SPECS_YDPI !== 'undefined') {
-                    metrics.ydpi.value = global.SPECS_YDPI;
-                }
-            }
-        };
-
-        if (typeof global.SPECS_WIDTH !== 'undefined' ||
-            typeof global.SPECS_HEIGHT !== 'undefined' ||
-            typeof global.SPECS_DENSITY !== 'undefined' ||
-            typeof global.SPECS_DENSITY_DPI !== 'undefined' ||
-            typeof global.SPECS_XDPI !== 'undefined' ||
-            typeof global.SPECS_YDPI !== 'undefined') {
-
-            Display.getRealMetrics.overload('android.util.DisplayMetrics').implementation = function(metrics) {
-                this.getRealMetrics(metrics);
-                patchMetrics(metrics);
-            };
-
-            Display.getMetrics.overload('android.util.DisplayMetrics').implementation = function(metrics) {
-                this.getMetrics(metrics);
-                patchMetrics(metrics);
-            };
-
+        const Build = Java.use('android.os.Build');
+        const setBuildField = function (name, val) {
+            if (typeof val === 'undefined') return;
             try {
-                const Resources = Java.use('android.content.res.Resources');
-                Resources.getDisplayMetrics.implementation = function() {
-                    const metrics = this.getDisplayMetrics();
-                    patchMetrics(metrics);
-                    return metrics;
-                };
-                console.log('[+] JSAgent hooked Resources.getDisplayMetrics successfully');
+                Build[name].value = val;
             } catch (e) {
-                console.log('[-] Error hooking Resources.getDisplayMetrics: ' + e);
+                console.log('[-] Build.' + name + ': ' + e);
             }
-
-            console.log('[+] JSAgent hooked display metrics successfully');
-        }
+        };
+        setBuildField('SERIAL', global.DEVICE_SERIAL);
+        setBuildField('FINGERPRINT', global.DEVICE_FINGERPRINT);
+        setBuildField('MANUFACTURER', global.DEVICE_MANUFACTURER);
+        setBuildField('BRAND', global.DEVICE_BRAND);
+        setBuildField('MODEL', global.DEVICE_MODEL);
+        setBuildField('DEVICE', global.DEVICE_DEVICE);
+        setBuildField('BOARD', global.DEVICE_BOARD);
+        setBuildField('HARDWARE', global.DEVICE_HARDWARE);
+        console.log('[+] JSAgent spoofed android.os.Build static fields');
     } catch (e) {
-        console.log('[-] Error hooking Display metrics: ' + e);
+        console.log('[-] Error spoofing Build fields: ' + e);
     }
 
+    // NOTE: boot/uptime spoofing via SystemClock.elapsedRealtime/uptimeMillis
+    // was removed, those clocks are called constantly by the framework's
+    // render/input loop, and a per-call Java hook freezes the app. If uptime
+    // realism is needed, do it at the native layer (spoof reads of /proc/uptime)
+    // instead of hooking the hot managed clocks.
+        },
+        'getprop': function () {
     // ============================================
-    // BLOCK 3: RAM Memory Hooks
-    // ============================================
-    if (typeof global.SPECS_TOTAL_RAM !== 'undefined' ||
-        typeof global.SPECS_RAM_THRESHOLD !== 'undefined' ||
-        typeof global.SPECS_AVAIL_RAM !== 'undefined') {
-        try {
-            const ActivityManager = Java.use('android.app.ActivityManager');
-            ActivityManager.getMemoryInfo.implementation = function(mem) {
-                this.getMemoryInfo(mem);
-
-                if (mem !== null) {
-                    if (typeof global.SPECS_TOTAL_RAM !== 'undefined') {
-                        mem.totalMem.value = global.SPECS_TOTAL_RAM;
-                    }
-
-                    if (typeof global.SPECS_RAM_THRESHOLD !== 'undefined') {
-                        mem.threshold.value = global.SPECS_RAM_THRESHOLD;
-                    }
-
-                    if (typeof global.SPECS_AVAIL_RAM !== 'undefined') {
-                        mem.availMem.value = getRealisticJitter(global.SPECS_AVAIL_RAM, 0.03);
-                    }
-
-                    mem.lowMemory.value = false;
-                }
-            };
-            console.log('[+] JSAgent hooked ActivityManager MemoryInfo successfully');
-        } catch (e) {
-            console.log('[-] Error hooking ActivityManager MemoryInfo: ' + e);
-        }
-    }
-
-    // ============================================
-    // BLOCK 4: Battery Cloaking Hooks
-    // ============================================
-    if (typeof global.SPECS_BATTERY_LEVEL !== 'undefined') {
-        try {
-            const BatteryManager = Java.use('android.os.BatteryManager');
-            const Intent = Java.use('android.content.Intent');
-            const Bundle = Java.use('android.os.Bundle');
-
-            const battery_level = global.SPECS_BATTERY_LEVEL;
-
-            const jitter = Math.floor(Math.random() * 50) - 25;
-            const spoof_voltage = Math.floor(3500 + (battery_level * 8.5) + jitter);
-            const spoof_temp = Math.floor(Math.random() * 81) + 260;
-
-            const getSpoofedBattery = function(id, val) {
-                if (id === 4) return battery_level;
-                if (id === 6) return 3;
-                if (id === 2 || id === 3) return -450000;
-                if ((id === 1 || id === 5) && val == 0) return (id === 1) ? 2000000 : 7000000000;
-                return val;
-            };
-
-            if (BatteryManager.getIntProperty) {
-                BatteryManager.getIntProperty.overload('int').implementation = function(id) {
-                    return Number(getSpoofedBattery(id, this.getIntProperty(id)));
-                };
-            }
-
-            if (BatteryManager.getLongProperty) {
-                BatteryManager.getLongProperty.overload('int').implementation = function(id) {
-                    return Number(getSpoofedBattery(id, this.getLongProperty(id)));
-                };
-            }
-
-            if (BatteryManager.isCharging) {
-                BatteryManager.isCharging.implementation = function() {
-                    return false;
-                };
-            }
-
-            if (BatteryManager.computeChargeTimeRemaining) {
-                BatteryManager.computeChargeTimeRemaining.implementation = function() {
-                    return -1;
-                };
-            }
-
-            Intent.getIntExtra.overloads.forEach(function(overload) {
-                overload.implementation = function() {
-                    const ret = overload.apply(this, arguments);
-                    const key = arguments[0];
-                    const map = {
-                        'plugged': 0,
-                        'status': 3,
-                        'level': battery_level,
-                        'scale': ret === 0 ? 100 : ret,
-                        'health': 2,
-                        'voltage': ret === 0 ? spoof_voltage : ret,
-                        'temperature': ret === 0 ? spoof_temp : ret
-                    };
-                    return map[key] !== undefined ? map[key] : ret;
-                };
-            });
-
-            Bundle.getInt.overloads.forEach(function(overload) {
-                overload.implementation = function() {
-                    const ret = overload.apply(this, arguments);
-                    const key = arguments[0];
-                    const map = {
-                        'plugged': 0,
-                        'status': 3,
-                        'level': battery_level,
-                        'scale': ret === 0 ? 100 : ret,
-                        'health': 2,
-                        'voltage': ret === 0 ? spoof_voltage : ret,
-                        'temperature': ret === 0 ? spoof_temp : ret
-                    };
-                    return map[key] !== undefined ? map[key] : ret;
-                };
-            });
-
-            console.log('[+] JSAgent hooked battery info successfully');
-        } catch (e) {
-            console.log('[-] Error hooking battery info: ' + e);
-        }
-    }
-
-    // ============================================
-    // BLOCK 5: Time Cloaking Hooks
-    // ============================================
-    if (typeof global.SYS_PROP_PERSIST_SYS_TIMEZONE !== 'undefined') {
-        try {
-            const Date = Java.use('java.util.Date');
-            const Calendar = Java.use('java.util.Calendar');
-            const TimeZone = Java.use('java.util.TimeZone');
-            const timeZoneID = global.SYS_PROP_PERSIST_SYS_TIMEZONE;
-
-            Date.after.overload('java.util.Date').implementation = function(date) {
-                return true;
-            };
-
-            Calendar.getInstance.overload().implementation = function() {
-                const cal = this.getInstance();
-                cal.setTimeZone(TimeZone.getTimeZone(timeZoneID));
-                return cal;
-            };
-
-            console.log('[+] JSAgent hooked time cloaking successfully');
-        } catch (e) {
-            console.log('[-] Error hooking time cloaking: ' + e);
-        }
-    }
-
-    // ============================================
-    // BLOCK 6: Install Referrer Bypass Hooks
-    // ============================================
-    if (typeof global.ATTRIBUTION_INSTALL_REFERRER !== 'undefined') {
-        try {
-            const installReferrer = global.ATTRIBUTION_INSTALL_REFERRER;
-
-            const cachedInstallTime = 1609459200;
-            const cachedClickTime = 1609459200;
-
-            try {
-                const ReferrerDetails = Java.use('com.android.installreferrer.api.ReferrerDetails');
-                if (ReferrerDetails && ReferrerDetails.getInstallReferrer) {
-                    ReferrerDetails.getInstallReferrer.implementation = function() {
-                        return installReferrer;
-                    };
-                }
-            } catch (e) {}
-
-            const Bundle = Java.use('android.os.Bundle');
-
-            Bundle.getString.overloads.forEach(function(overload) {
-                overload.implementation = function() {
-                    const key = arguments[0];
-                    const ret = overload.apply(this, arguments);
-                    return key === 'install_referrer' ? installReferrer : ret;
-                };
-            });
-
-            Bundle.getLong.overloads.forEach(function(overload) {
-                overload.implementation = function() {
-                    const key = arguments[0];
-                    const ret = overload.apply(this, arguments);
-
-                    const timeMap = {
-                        'install_begin_timestamp_seconds': cachedInstallTime,
-                        'install_begin_timestamp_server_seconds': cachedInstallTime,
-                        'referrer_click_timestamp_seconds': cachedClickTime,
-                        'referrer_click_timestamp_server_seconds': cachedClickTime
-                    };
-
-                    return timeMap[key] !== undefined ? timeMap[key] : ret;
-                };
-            });
-
-            console.log('[+] JSAgent hooked install referrer successfully');
-        } catch (e) {
-            console.log('[-] Error hooking install referrer: ' + e);
-        }
-    }
-
-    // ============================================
-    // BLOCK 7: USB Action Bypass Hooks
+    // BLOCK 20: Shell getprop interception (Java layer)
     // ============================================
     try {
-        const Intent = Java.use('android.content.Intent');
-        const usbAction = 'android.hardware.usb.action.USB_STATE';
-        const usbKeys = {
-            'connected': true,
-            'adb': true,
-            'configured': true
-        };
+        const ProcessBuilder = Java.use('java.lang.ProcessBuilder');
+        const SystemProperties = Java.use('android.os.SystemProperties');
+        const ArrayList = Java.use('java.util.ArrayList');
 
-        Intent.getExtras.overload().implementation = function() {
-            const bundle = this.getExtras();
-
-            if (this.getAction() === usbAction && bundle !== null) {
-                bundle.putBoolean('connected', false);
-                bundle.putBoolean('adb', false);
-                bundle.putBoolean('configured', false);
+        const extractGetpropKey = function (cmdList) {
+            const n = cmdList.size();
+            if (n === 0) return null;
+            const c0 = cmdList.get(0).toString();
+            const base0 = c0.substring(c0.lastIndexOf('/') + 1);
+            if (base0 === 'getprop' && n >= 2) {
+                return cmdList.get(1).toString();
             }
-
-            return bundle;
-        };
-
-        Intent.getBooleanExtra.overload('java.lang.String', 'boolean').implementation = function(key, defaultVal) {
-            if (this.getAction() === usbAction && usbKeys[key]) {
-                return false;
+            for (let i = 0; i < n; i++) {
+                const ci = cmdList.get(i).toString();
+                const idx = ci.indexOf('getprop ');
+                if (idx !== -1) {
+                    let rest = ci.substring(idx + 8).trim();
+                    const sp = rest.search(/[\s"'|&;>]/);
+                    if (sp !== -1) rest = rest.substring(0, sp);
+                    if (rest.length > 0) return rest;
+                }
             }
-
-            return this.getBooleanExtra(key, defaultVal);
+            return null;
         };
 
-        console.log('[+] JSAgent hooked USB action successfully');
+        ProcessBuilder.start.implementation = function () {
+            try {
+                const key = extractGetpropKey(this.command());
+                if (key !== null) {
+                    recon('exec getprop', key);
+                    const val = SystemProperties.get(key);
+                    const newCmd = ArrayList.$new();
+                    newCmd.add('/system/bin/echo');
+                    newCmd.add(val !== null ? val : '');
+                    this.command(newCmd);
+                }
+            } catch (e) {
+                console.log('[-] getprop rewrite error: ' + e);
+            }
+            return this.start();
+        };
+
+        console.log('[+] JSAgent hooked ProcessBuilder getprop interception');
     } catch (e) {
-        console.log('[-] Error hooking USB action: ' + e);
+        console.log('[-] Error hooking ProcessBuilder: ' + e);
     }
-
+        },
+        'debug_settings': function () {
     // ============================================
-    // BLOCK 8: FLAG_SECURE Bypass Hooks
+    // BLOCK 10: Development & Debug Settings Bypass
     // ============================================
-    if (typeof global.BYPASS_FLAG_SECURE !== 'undefined') {
-        try {
-            const Window = Java.use('android.view.Window');
-            const LayoutParams = Java.use('android.view.WindowManager$LayoutParams');
-            const FLAG_SECURE = 8192;
+    try {
+        const genHex = function(len) {
+            let hex = '';
+            for (let i = 0; i < len; i++) {
+                hex += Math.floor(Math.random() * 16).toString(16);
+            }
+            return hex;
+        };
 
-            Window.addFlags.overload('int').implementation = function(flag) {
-                if (flag === FLAG_SECURE) return;
-                this.addFlags(flag);
-            };
+        const fakeId = genHex(16);
+        const settingsMap = {
+            'android_id': fakeId,
+            'mobile_data_always_on': '0',
+            'adb_enabled': '0',
+            'adb_wifi_enabled': '0',
+            'development_settings_enabled': '0',
+            'install_non_market_apps': '0'
+        };
 
-            Window.setFlags.overload('int', 'int').implementation = function(flags, mask) {
-                flags = flags & ~LayoutParams.FLAG_SECURE.value;
-                this.setFlags(flags, mask);
-            };
-
-            console.log('[+] JSAgent hooked FLAG_SECURE successfully');
-        } catch (e) {
-            console.log('[-] Error hooking FLAG_SECURE: ' + e);
+        if (typeof global.SYS_PROP_RO_PRODUCT_MODEL !== 'undefined') {
+            settingsMap['device_name'] = global.SYS_PROP_RO_PRODUCT_MODEL;
         }
-    }
 
+        if (typeof global.SYS_PROP_RO_BUILD_DISPLAY_ID !== 'undefined') {
+            settingsMap['database_creation_buildid'] = global.SYS_PROP_RO_BUILD_DISPLAY_ID;
+        }
+
+        if (typeof global.SYS_PROP_PERSIST_SYS_LOCALE !== 'undefined') {
+            settingsMap['system_locales'] = global.SYS_PROP_PERSIST_SYS_LOCALE;
+        }
+
+        if (typeof global.NETWORK_NET_TYPE !== 'undefined') {
+            settingsMap['wifi_on'] = (global.NETWORK_NET_TYPE === 1) ? '1' : '0';
+            settingsMap['mobile_data'] = (global.NETWORK_NET_TYPE === 0) ? '1' : '0';
+        }
+
+        if (typeof global.DEVICE_KEYBOARD !== 'undefined') {
+            settingsMap['default_input_method'] = global.DEVICE_KEYBOARD;
+        }
+
+        const classConfigs = {
+            'android.provider.Settings$Global': ['device_name', 'mobile_data', 'mobile_data_always_on', 'database_creation_buildid', 'adb_wifi_enabled', 'development_settings_enabled', 'adb_enabled', 'install_non_market_apps', 'wifi_on'],
+            'android.provider.Settings$Secure': ['android_id', 'mobile_data', 'development_settings_enabled', 'adb_enabled', 'install_non_market_apps', 'wifi_on', 'default_input_method'],
+            'android.provider.Settings$System': ['system_locales', 'android_id', 'adb_enabled', 'install_non_market_apps', 'wifi_on']
+        };
+
+        Object.keys(classConfigs).forEach(function(className) {
+            const clazz = Java.use(className);
+            const allowedKeys = classConfigs[className];
+
+            if (clazz.getString) {
+                clazz.getString.overloads.forEach(function(overload) {
+                    overload.implementation = function() {
+                        const name = arguments[1];
+                        if (allowedKeys.indexOf(name) !== -1 && settingsMap[name] !== undefined) {
+                            return settingsMap[name];
+                        }
+                        return this.getString.apply(this, arguments);
+                    };
+                });
+            }
+
+            if (clazz.getInt) {
+                clazz.getInt.overloads.forEach(function(overload) {
+                    overload.implementation = function() {
+                        const name = arguments[1];
+                        if (allowedKeys.indexOf(name) !== -1 && settingsMap[name] !== undefined) {
+                            return parseInt(settingsMap[name], 10);
+                        }
+                        return this.getInt.apply(this, arguments);
+                    };
+                });
+            }
+        });
+
+        const VMDebug = Java.use('dalvik.system.VMDebug');
+        if (VMDebug.lastDebuggerActivity) {
+            VMDebug.lastDebuggerActivity.overload().implementation = function() {
+                return -1;
+            };
+        }
+
+        const Debug = Java.use('android.os.Debug');
+        if (Debug.isDebuggerConnected) {
+            Debug.isDebuggerConnected.implementation = function() {
+                return false;
+            };
+        }
+
+        console.log('[+] JSAgent hooked debug settings successfully');
+    } catch (e) {
+        console.log('[-] Error hooking debug settings: ' + e);
+    }
+        },
+        'telephony': function () {
     // ============================================
     // BLOCK 9: Telephony Carrier Cloaking Hooks
     // ============================================
@@ -463,104 +377,107 @@ function onJavaReady(Java) {
             console.log('[-] Error hooking telephony carrier: ' + e);
         }
     }
-
+        },
+        'ram': function () {
     // ============================================
-    // BLOCK 10: Development & Debug Settings Bypass
+    // BLOCK 3: RAM Memory Hooks
+    // ============================================
+    if (typeof global.SPECS_TOTAL_RAM !== 'undefined' ||
+        typeof global.SPECS_RAM_THRESHOLD !== 'undefined' ||
+        typeof global.SPECS_AVAIL_RAM !== 'undefined') {
+        try {
+            const ActivityManager = Java.use('android.app.ActivityManager');
+            ActivityManager.getMemoryInfo.implementation = function(mem) {
+                this.getMemoryInfo(mem);
+
+                if (mem !== null) {
+                    if (typeof global.SPECS_TOTAL_RAM !== 'undefined') {
+                        mem.totalMem.value = global.SPECS_TOTAL_RAM;
+                    }
+
+                    if (typeof global.SPECS_RAM_THRESHOLD !== 'undefined') {
+                        mem.threshold.value = global.SPECS_RAM_THRESHOLD;
+                    }
+
+                    if (typeof global.SPECS_AVAIL_RAM !== 'undefined') {
+                        mem.availMem.value = getRealisticJitter(global.SPECS_AVAIL_RAM, 0.03);
+                    }
+
+                    mem.lowMemory.value = false;
+                }
+            };
+            console.log('[+] JSAgent hooked ActivityManager MemoryInfo successfully');
+        } catch (e) {
+            console.log('[-] Error hooking ActivityManager MemoryInfo: ' + e);
+        }
+    }
+        },
+        'display': function () {
+    // ============================================
+    // BLOCK 1: Display Metrics Hooks
     // ============================================
     try {
-        const genHex = function(len) {
-            let hex = '';
-            for (let i = 0; i < len; i++) {
-                hex += Math.floor(Math.random() * 16).toString(16);
+        const Display = Java.use('android.view.Display');
+
+        const patchMetrics = function(metrics) {
+            if (metrics !== null) {
+                if (typeof global.SPECS_WIDTH !== 'undefined') {
+                    metrics.widthPixels.value = global.SPECS_WIDTH;
+                }
+                if (typeof global.SPECS_HEIGHT !== 'undefined') {
+                    metrics.heightPixels.value = global.SPECS_HEIGHT;
+                }
+                if (typeof global.SPECS_DENSITY !== 'undefined') {
+                    metrics.density.value = global.SPECS_DENSITY;
+                }
+                if (typeof global.SPECS_DENSITY_DPI !== 'undefined') {
+                    metrics.densityDpi.value = global.SPECS_DENSITY_DPI;
+                }
+                if (typeof global.SPECS_XDPI !== 'undefined') {
+                    metrics.xdpi.value = global.SPECS_XDPI;
+                }
+                if (typeof global.SPECS_YDPI !== 'undefined') {
+                    metrics.ydpi.value = global.SPECS_YDPI;
+                }
             }
-            return hex;
         };
 
-        const fakeId = genHex(16);
-        const settingsMap = {
-            'android_id': fakeId,
-            'mobile_data_always_on': '0',
-            'adb_enabled': '0',
-            'adb_wifi_enabled': '0',
-            'development_settings_enabled': '0',
-            'install_non_market_apps': '0'
-        };
+        if (typeof global.SPECS_WIDTH !== 'undefined' ||
+            typeof global.SPECS_HEIGHT !== 'undefined' ||
+            typeof global.SPECS_DENSITY !== 'undefined' ||
+            typeof global.SPECS_DENSITY_DPI !== 'undefined' ||
+            typeof global.SPECS_XDPI !== 'undefined' ||
+            typeof global.SPECS_YDPI !== 'undefined') {
 
-        if (typeof global.SYS_PROP_RO_PRODUCT_MODEL !== 'undefined') {
-            settingsMap['device_name'] = global.SYS_PROP_RO_PRODUCT_MODEL;
-        }
-
-        if (typeof global.SYS_PROP_RO_BUILD_DISPLAY_ID !== 'undefined') {
-            settingsMap['database_creation_buildid'] = global.SYS_PROP_RO_BUILD_DISPLAY_ID;
-        }
-
-        if (typeof global.SYS_PROP_PERSIST_SYS_LOCALE !== 'undefined') {
-            settingsMap['system_locales'] = global.SYS_PROP_PERSIST_SYS_LOCALE;
-        }
-
-        if (typeof global.NETWORK_NET_TYPE !== 'undefined') {
-            settingsMap['wifi_on'] = (global.NETWORK_NET_TYPE === 1) ? '1' : '0';
-            settingsMap['mobile_data'] = (global.NETWORK_NET_TYPE === 0) ? '1' : '0';
-        }
-
-        if (typeof global.DEVICE_KEYBOARD !== 'undefined') {
-            settingsMap['default_input_method'] = global.DEVICE_KEYBOARD;
-        }
-
-        const classConfigs = {
-            'android.provider.Settings$Global': ['device_name', 'mobile_data', 'mobile_data_always_on', 'database_creation_buildid', 'adb_wifi_enabled', 'development_settings_enabled', 'adb_enabled', 'install_non_market_apps', 'wifi_on'],
-            'android.provider.Settings$Secure': ['android_id', 'mobile_data', 'development_settings_enabled', 'adb_enabled', 'install_non_market_apps', 'wifi_on', 'default_input_method'],
-            'android.provider.Settings$System': ['system_locales', 'android_id', 'adb_enabled', 'install_non_market_apps', 'wifi_on']
-        };
-
-        Object.keys(classConfigs).forEach(function(className) {
-            const clazz = Java.use(className);
-            const allowedKeys = classConfigs[className];
-
-            if (clazz.getString) {
-                clazz.getString.overloads.forEach(function(overload) {
-                    overload.implementation = function() {
-                        const name = arguments[1];
-                        if (allowedKeys.indexOf(name) !== -1 && settingsMap[name] !== undefined) {
-                            return settingsMap[name];
-                        }
-                        return this.getString.apply(this, arguments);
-                    };
-                });
-            }
-
-            if (clazz.getInt) {
-                clazz.getInt.overloads.forEach(function(overload) {
-                    overload.implementation = function() {
-                        const name = arguments[1];
-                        if (allowedKeys.indexOf(name) !== -1 && settingsMap[name] !== undefined) {
-                            return parseInt(settingsMap[name], 10);
-                        }
-                        return this.getInt.apply(this, arguments);
-                    };
-                });
-            }
-        });
-
-        const VMDebug = Java.use('dalvik.system.VMDebug');
-        if (VMDebug.lastDebuggerActivity) {
-            VMDebug.lastDebuggerActivity.overload().implementation = function() {
-                return -1;
+            Display.getRealMetrics.overload('android.util.DisplayMetrics').implementation = function(metrics) {
+                this.getRealMetrics(metrics);
+                patchMetrics(metrics);
             };
-        }
 
-        const Debug = Java.use('android.os.Debug');
-        if (Debug.isDebuggerConnected) {
-            Debug.isDebuggerConnected.implementation = function() {
-                return false;
+            Display.getMetrics.overload('android.util.DisplayMetrics').implementation = function(metrics) {
+                this.getMetrics(metrics);
+                patchMetrics(metrics);
             };
-        }
 
-        console.log('[+] JSAgent hooked debug settings successfully');
+            try {
+                const Resources = Java.use('android.content.res.Resources');
+                Resources.getDisplayMetrics.implementation = function() {
+                    const metrics = this.getDisplayMetrics();
+                    patchMetrics(metrics);
+                    return metrics;
+                };
+                console.log('[+] JSAgent hooked Resources.getDisplayMetrics successfully');
+            } catch (e) {
+                console.log('[-] Error hooking Resources.getDisplayMetrics: ' + e);
+            }
+
+            console.log('[+] JSAgent hooked display metrics successfully');
+        }
     } catch (e) {
-        console.log('[-] Error hooking debug settings: ' + e);
+        console.log('[-] Error hooking Display metrics: ' + e);
     }
-
+        },
+        'locale_tz': function () {
     // ============================================
     // BLOCK 11: Locale & Timezone Cloaking Hooks
     // ============================================
@@ -605,297 +522,94 @@ function onJavaReady(Java) {
             console.log('[-] Error hooking locale/timezone: ' + e);
         }
     }
-
+        },
+        'sensors': function () {
     // ============================================
-    // BLOCK 12: Network Info Spoofing Hooks
-    // ============================================
-    if (typeof global.NETWORK_NET_TYPE !== 'undefined') {
-        try {
-            const NetworkInfo = Java.use('android.net.NetworkInfo');
-
-            const netType = global.NETWORK_NET_TYPE;
-            const typeName = (netType === 1) ? 'WIFI' : 'MOBILE';
-            const subType = (netType === 1) ? '' : 'LTE';
-            const fakeNetInfo = NetworkInfo.$new(netType, 0, typeName, subType);
-
-            console.log('[+] JSAgent hooked network info successfully');
-        } catch (e) {
-            console.log('[-] Error hooking network info: ' + e);
-        }
-    }
-
-    // ============================================
-    // BLOCK 13: Network & VPN Bypass Hooks
-    // ============================================
-    if (typeof global.NETWORK_NET_TYPE !== 'undefined' ||
-        typeof global.NETWORK_MOBILE_DATA_LOCAL_IP !== 'undefined' ||
-        typeof global.NETWORK_WIFI_LOCAL_IP !== 'undefined') {
-
-        try {
-            if (typeof global.NETWORK_NET_TYPE !== 'undefined') {
-                const TRANSPORT_CELLULAR = 0, TRANSPORT_WIFI = 1, TRANSPORT_VPN = 4;
-                const CAP_INTERNET = 12, CAP_NOT_VPN = 15, CAP_VALIDATED = 16;
-
-                const NetworkInfo = Java.use('android.net.NetworkInfo');
-                const NetworkInfoState = Java.use('android.net.NetworkInfo$State');
-                const NetworkInfoDetailedState = Java.use('android.net.NetworkInfo$DetailedState');
-                const ConnectivityManager = Java.use('android.net.ConnectivityManager');
-                const NetworkCapabilities = Java.use('android.net.NetworkCapabilities');
-                const Builder = Java.use('android.net.NetworkCapabilities$Builder');
-                const TelephonyManager = Java.use('android.telephony.TelephonyManager');
-
-                const netType = global.NETWORK_NET_TYPE;
-
-                const createFakeNetInfo = function() {
-                    const type = netType === 1 ? 'WIFI' : 'MOBILE';
-                    const sub = netType === 1 ? '' : 'LTE';
-                    return NetworkInfo.$new(netType, 0, type, sub);
-                };
-
-                NetworkCapabilities.hasTransport.implementation = function(t) {
-                    if (t === TRANSPORT_VPN) return false;
-                    if (t === TRANSPORT_WIFI && netType === 0) return false;
-                    if (t === TRANSPORT_CELLULAR && netType === 1) return false;
-                    return this.hasTransport(t);
-                };
-
-                ConnectivityManager.isActiveNetworkMetered.implementation = function() {
-                    return netType === 0;
-                };
-
-                NetworkInfo.isConnected.implementation = function() {
-                    return netType === this.getType();
-                };
-
-                NetworkInfo.isConnectedOrConnecting.implementation = function() {
-                    return netType === this.getType();
-                };
-
-                NetworkInfo.getState.implementation = function() {
-                    return netType === this.getType() ? NetworkInfoState.CONNECTED.value : NetworkInfoState.DISCONNECTED.value;
-                };
-
-                NetworkInfo.getDetailedState.implementation = function() {
-                    return netType === this.getType() ? NetworkInfoDetailedState.CONNECTED.value : NetworkInfoDetailedState.DISCONNECTED.value;
-                };
-
-                ConnectivityManager.getActiveNetworkInfo.implementation = function() {
-                    return createFakeNetInfo();
-                };
-
-                TelephonyManager.isDataEnabled.implementation = function() {
-                    return netType === 0;
-                };
-
-                TelephonyManager.getDataState.implementation = function() {
-                    return netType === 0 ? 2 : this.getDataState();
-                };
-
-                ConnectivityManager.getAllNetworks.implementation = function() {
-                    const active = this.getActiveNetwork();
-                    return active != null ? Java.array('android.net.Network', [active]) : this.getAllNetworks();
-                };
-
-                ConnectivityManager.getNetworkCapabilities.implementation = function(network) {
-                    const builder = Builder.$new();
-                    if (netType === 0) {
-                        builder.addTransportType(TRANSPORT_CELLULAR);
-                        builder.removeTransportType(TRANSPORT_WIFI);
-                    } else {
-                        builder.addTransportType(TRANSPORT_WIFI);
-                        builder.removeTransportType(TRANSPORT_CELLULAR);
-                    }
-                    builder.removeTransportType(TRANSPORT_VPN);
-                    builder.addCapability(CAP_INTERNET);
-                    builder.addCapability(CAP_NOT_VPN);
-                    builder.addCapability(CAP_VALIDATED);
-                    return builder.build();
-                };
-            }
-
-            if (typeof global.NETWORK_MOBILE_DATA_LOCAL_IP !== 'undefined' ||
-                typeof global.NETWORK_WIFI_LOCAL_IP !== 'undefined') {
-
-                const NetworkInterface = Java.use('java.net.NetworkInterface');
-                const InetAddress = Java.use('java.net.InetAddress');
-                const Vector = Java.use('java.util.Vector');
-
-                const mobileIp = global.NETWORK_MOBILE_DATA_LOCAL_IP || null;
-                const wifiIp = global.NETWORK_WIFI_LOCAL_IP || null;
-
-                const isMobileActive = (typeof global.NETWORK_NET_TYPE !== 'undefined' && global.NETWORK_NET_TYPE === 0);
-                const isWifiActive = (typeof global.NETWORK_NET_TYPE !== 'undefined' && global.NETWORK_NET_TYPE === 1);
-
-                const createInterface = function(name, id, ip, hasIp) {
-                    return hasIp ? NetworkInterface.$new(name, id, [InetAddress.getByName(ip)]) : NetworkInterface.$new(name, id, []);
-                };
-
-                NetworkInterface.getNetworkInterfaces.implementation = function() {
-                    const realEnum = this.getNetworkInterfaces();
-                    const list = Vector.$new();
-                    let mobileFound = false, wifiFound = false;
-
-                    while (realEnum.hasMoreElements()) {
-                        const iface = Java.cast(realEnum.nextElement(), NetworkInterface);
-                        const name = iface.getName();
-
-                        if (name && (name.indexOf('tun') < 0 && name.indexOf('ppp') < 0)) {
-                            if (name.startsWith('rmnet_data0')) {
-                                mobileFound = true;
-                                if (mobileIp !== null) list.add(createInterface(name, 100, mobileIp, isMobileActive));
-                                else list.add(iface);
-                            } else if (name.startsWith('wlan0')) {
-                                wifiFound = true;
-                                if (wifiIp !== null) list.add(createInterface(name, 102, wifiIp, isWifiActive));
-                                else list.add(iface);
-                            } else {
-                                list.add(iface);
-                            }
-                        }
-                    }
-
-                    if (!mobileFound && mobileIp !== null) list.add(createInterface('rmnet_data0', 100, mobileIp, isMobileActive));
-                    if (!wifiFound && wifiIp !== null) list.add(createInterface('wlan0', 102, wifiIp, isWifiActive));
-
-                    return list.elements();
-                };
-            }
-
-            console.log('[+] JSAgent hooked network/VPN successfully');
-        } catch (e) {
-            console.log('[-] Error hooking network/VPN: ' + e);
-        }
-    }
-
-    // ============================================
-    // BLOCK 14: Proxy Bypass Hook
+    // BLOCK 24: Sensor fabrication
+    // Emulators expose few/no sensors, which is a strong tell. Fabricate a
+    // plausible set of android.hardware.Sensor objects via the package-private
+    // no-arg constructor + private field writes. All of it is defensive: if the
+    // ART build doesn't allow the construction, we fall back to recon-only so we
+    // never crash a getSensorList() call.
     // ============================================
     try {
-        const Proxy = Java.use('android.net.Proxy');
-        Proxy.getDefaultHost.implementation = function () {
-            return null;
+        const SensorManager = Java.use('android.hardware.SensorManager');
+        const Sensor = Java.use('android.hardware.Sensor');
+        const ArrayList = Java.use('java.util.ArrayList');
+
+        // type, name, vendor, maxRange, resolution, power(mA), minDelay(us)
+        const SENSORS = [
+            {type: 1,  name: 'LSM6DSO Accelerometer', vendor: 'STMicroelectronics', max: 78.4532,   res: 0.0023956, power: 0.15,   minDelay: 2404},
+            {type: 4,  name: 'LSM6DSO Gyroscope',     vendor: 'STMicroelectronics', max: 34.906586, res: 0.0010653, power: 0.65,   minDelay: 2404},
+            {type: 2,  name: 'AK09918 Magnetometer',  vendor: 'AKM',                max: 4912.0,     res: 0.15,      power: 0.1,    minDelay: 10000},
+            {type: 5,  name: 'TMD4906 Light',         vendor: 'AMS',                max: 60000.0,    res: 1.0,       power: 0.12,   minDelay: 0},
+            {type: 8,  name: 'TMD4906 Proximity',     vendor: 'AMS',                max: 5.0,        res: 1.0,       power: 0.12,   minDelay: 0},
+            {type: 6,  name: 'LPS22HH Pressure',      vendor: 'STMicroelectronics', max: 1260.0,     res: 0.0002,    power: 0.0017, minDelay: 40000},
+        ];
+
+        const setField = function (obj, field, val) {
+            try { obj[field].value = val; } catch (e) {}
+        };
+        const buildSensor = function (spec, handle) {
+            const s = Sensor.$new(); // package-private Sensor()
+            setField(s, 'mType', spec.type);
+            setField(s, 'mName', spec.name);
+            setField(s, 'mVendor', spec.vendor);
+            setField(s, 'mVersion', 1);
+            setField(s, 'mHandle', handle);
+            setField(s, 'mMaxRange', spec.max);
+            setField(s, 'mResolution', spec.res);
+            setField(s, 'mPower', spec.power);
+            setField(s, 'mMinDelay', spec.minDelay);
+            setField(s, 'mMaxDelay', 1000000);
+            setField(s, 'mFifoReservedEventCount', 0);
+            setField(s, 'mFifoMaxEventCount', 0);
+            setField(s, 'mRequiredPermission', '');
+            setField(s, 'mFlags', 0);
+            return s;
         };
 
-        console.log('[+] JSAgent hooked proxy successfully');
+        // Probe once; only install fabricating hooks if construction works.
+        let probe = null;
+        try { probe = buildSensor(SENSORS[0], 0); } catch (e) { probe = null; }
+
+        if (probe !== null && probe.getType() === 1) {
+            // Build fresh each call, Frida Java wrappers don't survive across
+            // call frames, so caching them makes a later getType()/add() throw
+            // (which would return null to Java and NPE the caller).
+            SensorManager.getSensorList.overload('int').implementation = function (type) {
+                recon('SensorManager.getSensorList', type);
+                const list = ArrayList.$new();
+                for (let i = 0; i < SENSORS.length; i++) {
+                    if (type === -1 /* TYPE_ALL */ || SENSORS[i].type === type) {
+                        try { list.add(buildSensor(SENSORS[i], i + 1)); } catch (e) {}
+                    }
+                }
+                return list;
+            };
+            SensorManager.getDefaultSensor.overload('int').implementation = function (type) {
+                recon('SensorManager.getDefaultSensor', type);
+                for (let i = 0; i < SENSORS.length; i++) {
+                    if (SENSORS[i].type === type) {
+                        try { return buildSensor(SENSORS[i], i + 1); } catch (e) {}
+                    }
+                }
+                return this.getDefaultSensor(type);
+            };
+            console.log('[+] JSAgent fabricated SensorManager sensors (' + SENSORS.length + ')');
+        } else {
+            // Fabrication not supported here, keep recon only, change nothing.
+            SensorManager.getSensorList.overload('int').implementation = function (type) {
+                recon('SensorManager.getSensorList', type);
+                return this.getSensorList(type);
+            };
+            console.log('[-] Sensor fabrication unavailable on this ART; recon-only');
+        }
     } catch (e) {
-        console.log('[-] Error hooking proxy: ' + e);
+        console.log('[-] Error hooking SensorManager: ' + e);
     }
-
-    // ============================================
-    // BLOCK 15: SSL Pinning Bypass Hooks
-    // ============================================
-    const optionalClass = function (name) {
-        try {
-            return Java.use(name);
-        } catch (e) {
-            if (('' + e).indexOf('ClassNotFound') === -1) {
-                console.log('[-] Unexpected error loading ' + name + ': ' + e);
-            }
-            return null;
-        }
-    };
-
-    const hookSsl = function (className, label, fn) {
-        const clazz = optionalClass(className);
-        if (!clazz) return;
-        try {
-            fn(clazz);
-            console.log('[+] JSAgent hooked ' + label + ' successfully');
-        } catch (e) {
-            console.log('[-] Error hooking ' + label + ': ' + e);
-        }
-    };
-
-    hookSsl('okhttp3.CertificatePinner', 'okhttp3', function (CertificatePinner) {
-        CertificatePinner.check.overload('java.lang.String', 'java.util.List').implementation = function (str) {
-            return;
-        };
-    });
-
-    hookSsl('com.datatheorem.android.trustkit.pinning.OkHostnameVerifier', 'trustkit', function (OkHostnameVerifier) {
-        OkHostnameVerifier.verify.overload('java.lang.String', 'javax.net.ssl.SSLSession').implementation = function () {
-            return true;
-        };
-        OkHostnameVerifier.verify.overload('java.lang.String', 'java.security.cert.X509Certificate').implementation = function () {
-            return true;
-        };
-    });
-
-    hookSsl('com.android.org.conscrypt.TrustManagerImpl', 'TrustManagerImpl', function (TrustManagerImpl) {
-        TrustManagerImpl.verifyChain.implementation = function (untrustedChain) {
-            return untrustedChain;
-        };
-    });
-
-    hookSsl('appcelerator.https.PinningTrustManager', 'Appcelerator', function (PinningTrustManager) {
-        PinningTrustManager.checkServerTrusted.implementation = function () {
-            return;
-        };
-    });
-
-    // ============================================
-    // BLOCK 16: User-Agent Spoofing Hooks
-    // ============================================
-    if (typeof global.DEVICE_MODEL !== 'undefined' && typeof global.DEVICE_DISPLAY_ID !== 'undefined') {
-        try {
-            const webViewPrefix = 'Mozilla/5.0';
-            const nativePrefix = 'Dalvik/2.1.0';
-
-            const baseOS = 'Linux; Android 16; ' + global.DEVICE_MODEL + ' Build/' + global.DEVICE_DISPLAY_ID;
-            const UA = ' (' + baseOS + ')';
-            const UAW = ' (' + baseOS + '; wv) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.200 Mobile Safari/537.36';
-
-            const System = Java.use('java.lang.System');
-            for (let i = 0; i < System.getProperty.overloads.length; i++) {
-                System.getProperty.overloads[i].implementation = function () {
-                    const key = arguments[0];
-                    if (key === 'http.agent') {
-                        return nativePrefix + UA;
-                    }
-                    return System.getProperty.apply(this, arguments);
-                };
-            }
-
-            try {
-                const WebView = Java.use('android.webkit.WebView');
-                WebView.getSettings.implementation = function () {
-                    const settings = this.getSettings();
-                    settings.setUserAgentString(webViewPrefix + UAW);
-                    return settings;
-                };
-            } catch (e) {
-                console.log('[-] Error hooking WebView: ' + e);
-            }
-
-            try {
-                const URL = Java.use('java.net.URL');
-                const HttpURLConnection = Java.use('java.net.HttpURLConnection');
-
-                URL.openConnection.overload().implementation = function () {
-                    const conn = this.openConnection();
-                    if (HttpURLConnection.class.isInstance(conn)) {
-                        Java.cast(conn, HttpURLConnection).setRequestProperty('User-Agent', nativePrefix + UA);
-                    }
-                    return conn;
-                };
-
-                URL.openConnection.overload('java.net.Proxy').implementation = function (proxy) {
-                    const conn = this.openConnection(proxy);
-                    if (HttpURLConnection.class.isInstance(conn)) {
-                        Java.cast(conn, HttpURLConnection).setRequestProperty('User-Agent', nativePrefix + UA);
-                    }
-                    return conn;
-                };
-            } catch (e) {
-                console.log('[-] Error hooking URL: ' + e);
-            }
-
-            console.log('[+] JSAgent spoofing User-Agent successfully');
-        } catch (e) {
-            console.log('[-] Error in User-Agent spoofing block: ' + e);
-        }
-    }
-
+        },
+        'package_manager': function () {
     // ============================================
     // BLOCK 17: Package Manager Spoofing & App Hiding
     // ============================================
@@ -1131,7 +845,418 @@ function onJavaReady(Java) {
     } catch (e) {
         console.log('[-] Error in package manager spoofing block: ' + e);
     }
+        },
+        'ssl': function () {
+    // ============================================
+    // BLOCK 15: SSL Pinning Bypass Hooks
+    // ============================================
+    const optionalClass = function (name) {
+        try {
+            return Java.use(name);
+        } catch (e) {
+            if (('' + e).indexOf('ClassNotFound') === -1) {
+                console.log('[-] Unexpected error loading ' + name + ': ' + e);
+            }
+            return null;
+        }
+    };
 
+    const hookSsl = function (className, label, fn) {
+        const clazz = optionalClass(className);
+        if (!clazz) return;
+        try {
+            fn(clazz);
+            console.log('[+] JSAgent hooked ' + label + ' successfully');
+        } catch (e) {
+            console.log('[-] Error hooking ' + label + ': ' + e);
+        }
+    };
+
+    hookSsl('okhttp3.CertificatePinner', 'okhttp3', function (CertificatePinner) {
+        CertificatePinner.check.overload('java.lang.String', 'java.util.List').implementation = function (str) {
+            return;
+        };
+    });
+
+    hookSsl('com.datatheorem.android.trustkit.pinning.OkHostnameVerifier', 'trustkit', function (OkHostnameVerifier) {
+        OkHostnameVerifier.verify.overload('java.lang.String', 'javax.net.ssl.SSLSession').implementation = function () {
+            return true;
+        };
+        OkHostnameVerifier.verify.overload('java.lang.String', 'java.security.cert.X509Certificate').implementation = function () {
+            return true;
+        };
+    });
+
+    hookSsl('com.android.org.conscrypt.TrustManagerImpl', 'TrustManagerImpl', function (TrustManagerImpl) {
+        TrustManagerImpl.verifyChain.implementation = function (untrustedChain) {
+            return untrustedChain;
+        };
+    });
+
+    hookSsl('appcelerator.https.PinningTrustManager', 'Appcelerator', function (PinningTrustManager) {
+        PinningTrustManager.checkServerTrusted.implementation = function () {
+            return;
+        };
+    });
+        },
+        'user_agent': function () {
+    // ============================================
+    // BLOCK 16: User-Agent Spoofing Hooks
+    // ============================================
+    if (typeof global.DEVICE_MODEL !== 'undefined' && typeof global.DEVICE_DISPLAY_ID !== 'undefined') {
+        try {
+            const webViewPrefix = 'Mozilla/5.0';
+            const nativePrefix = 'Dalvik/2.1.0';
+
+            const baseOS = 'Linux; Android 16; ' + global.DEVICE_MODEL + ' Build/' + global.DEVICE_DISPLAY_ID;
+            const UA = ' (' + baseOS + ')';
+            const UAW = ' (' + baseOS + '; wv) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.200 Mobile Safari/537.36';
+
+            const System = Java.use('java.lang.System');
+            for (let i = 0; i < System.getProperty.overloads.length; i++) {
+                System.getProperty.overloads[i].implementation = function () {
+                    const key = arguments[0];
+                    if (key === 'http.agent') {
+                        return nativePrefix + UA;
+                    }
+                    return System.getProperty.apply(this, arguments);
+                };
+            }
+
+            try {
+                const WebView = Java.use('android.webkit.WebView');
+                WebView.getSettings.implementation = function () {
+                    const settings = this.getSettings();
+                    settings.setUserAgentString(webViewPrefix + UAW);
+                    return settings;
+                };
+            } catch (e) {
+                console.log('[-] Error hooking WebView: ' + e);
+            }
+
+            try {
+                const URL = Java.use('java.net.URL');
+                const HttpURLConnection = Java.use('java.net.HttpURLConnection');
+
+                URL.openConnection.overload().implementation = function () {
+                    const conn = this.openConnection();
+                    if (HttpURLConnection.class.isInstance(conn)) {
+                        Java.cast(conn, HttpURLConnection).setRequestProperty('User-Agent', nativePrefix + UA);
+                    }
+                    return conn;
+                };
+
+                URL.openConnection.overload('java.net.Proxy').implementation = function (proxy) {
+                    const conn = this.openConnection(proxy);
+                    if (HttpURLConnection.class.isInstance(conn)) {
+                        Java.cast(conn, HttpURLConnection).setRequestProperty('User-Agent', nativePrefix + UA);
+                    }
+                    return conn;
+                };
+            } catch (e) {
+                console.log('[-] Error hooking URL: ' + e);
+            }
+
+            console.log('[+] JSAgent spoofing User-Agent successfully');
+        } catch (e) {
+            console.log('[-] Error in User-Agent spoofing block: ' + e);
+        }
+    }
+        },
+        'network_vpn': function () {
+    // ============================================
+    // BLOCK 13: Network & VPN Bypass Hooks
+    // ============================================
+    if (typeof global.NETWORK_NET_TYPE !== 'undefined' ||
+        typeof global.NETWORK_MOBILE_DATA_LOCAL_IP !== 'undefined' ||
+        typeof global.NETWORK_WIFI_LOCAL_IP !== 'undefined') {
+
+        try {
+            if (typeof global.NETWORK_NET_TYPE !== 'undefined') {
+                const TRANSPORT_CELLULAR = 0, TRANSPORT_WIFI = 1, TRANSPORT_VPN = 4;
+                const CAP_INTERNET = 12, CAP_NOT_VPN = 15, CAP_VALIDATED = 16;
+
+                const NetworkInfo = Java.use('android.net.NetworkInfo');
+                const NetworkInfoState = Java.use('android.net.NetworkInfo$State');
+                const NetworkInfoDetailedState = Java.use('android.net.NetworkInfo$DetailedState');
+                const ConnectivityManager = Java.use('android.net.ConnectivityManager');
+                const NetworkCapabilities = Java.use('android.net.NetworkCapabilities');
+                const Builder = Java.use('android.net.NetworkCapabilities$Builder');
+                const TelephonyManager = Java.use('android.telephony.TelephonyManager');
+
+                const netType = global.NETWORK_NET_TYPE;
+
+                const createFakeNetInfo = function() {
+                    const type = netType === 1 ? 'WIFI' : 'MOBILE';
+                    const sub = netType === 1 ? '' : 'LTE';
+                    return NetworkInfo.$new(netType, 0, type, sub);
+                };
+
+                NetworkCapabilities.hasTransport.implementation = function(t) {
+                    if (t === TRANSPORT_VPN) return false;
+                    if (t === TRANSPORT_WIFI && netType === 0) return false;
+                    if (t === TRANSPORT_CELLULAR && netType === 1) return false;
+                    return this.hasTransport(t);
+                };
+
+                ConnectivityManager.isActiveNetworkMetered.implementation = function() {
+                    return netType === 0;
+                };
+
+                NetworkInfo.isConnected.implementation = function() {
+                    return netType === this.getType();
+                };
+
+                NetworkInfo.isConnectedOrConnecting.implementation = function() {
+                    return netType === this.getType();
+                };
+
+                NetworkInfo.getState.implementation = function() {
+                    return netType === this.getType() ? NetworkInfoState.CONNECTED.value : NetworkInfoState.DISCONNECTED.value;
+                };
+
+                NetworkInfo.getDetailedState.implementation = function() {
+                    return netType === this.getType() ? NetworkInfoDetailedState.CONNECTED.value : NetworkInfoDetailedState.DISCONNECTED.value;
+                };
+
+                ConnectivityManager.getActiveNetworkInfo.implementation = function() {
+                    return createFakeNetInfo();
+                };
+
+                TelephonyManager.isDataEnabled.implementation = function() {
+                    return netType === 0;
+                };
+
+                TelephonyManager.getDataState.implementation = function() {
+                    return netType === 0 ? 2 : this.getDataState();
+                };
+
+                ConnectivityManager.getAllNetworks.implementation = function() {
+                    const active = this.getActiveNetwork();
+                    return active != null ? Java.array('android.net.Network', [active]) : this.getAllNetworks();
+                };
+
+                ConnectivityManager.getNetworkCapabilities.implementation = function(network) {
+                    const builder = Builder.$new();
+                    if (netType === 0) {
+                        builder.addTransportType(TRANSPORT_CELLULAR);
+                        builder.removeTransportType(TRANSPORT_WIFI);
+                    } else {
+                        builder.addTransportType(TRANSPORT_WIFI);
+                        builder.removeTransportType(TRANSPORT_CELLULAR);
+                    }
+                    builder.removeTransportType(TRANSPORT_VPN);
+                    builder.addCapability(CAP_INTERNET);
+                    builder.addCapability(CAP_NOT_VPN);
+                    builder.addCapability(CAP_VALIDATED);
+                    return builder.build();
+                };
+            }
+
+            if (typeof global.NETWORK_MOBILE_DATA_LOCAL_IP !== 'undefined' ||
+                typeof global.NETWORK_WIFI_LOCAL_IP !== 'undefined') {
+
+                const NetworkInterface = Java.use('java.net.NetworkInterface');
+                const InetAddress = Java.use('java.net.InetAddress');
+                const Vector = Java.use('java.util.Vector');
+
+                const mobileIp = global.NETWORK_MOBILE_DATA_LOCAL_IP || null;
+                const wifiIp = global.NETWORK_WIFI_LOCAL_IP || null;
+
+                const isMobileActive = (typeof global.NETWORK_NET_TYPE !== 'undefined' && global.NETWORK_NET_TYPE === 0);
+                const isWifiActive = (typeof global.NETWORK_NET_TYPE !== 'undefined' && global.NETWORK_NET_TYPE === 1);
+
+                const createInterface = function(name, id, ip, hasIp) {
+                    return hasIp ? NetworkInterface.$new(name, id, [InetAddress.getByName(ip)]) : NetworkInterface.$new(name, id, []);
+                };
+
+                NetworkInterface.getNetworkInterfaces.implementation = function() {
+                    const realEnum = this.getNetworkInterfaces();
+                    const list = Vector.$new();
+                    let mobileFound = false, wifiFound = false;
+
+                    while (realEnum.hasMoreElements()) {
+                        const iface = Java.cast(realEnum.nextElement(), NetworkInterface);
+                        const name = iface.getName();
+
+                        if (name && (name.indexOf('tun') < 0 && name.indexOf('ppp') < 0)) {
+                            if (name.startsWith('rmnet_data0')) {
+                                mobileFound = true;
+                                if (mobileIp !== null) list.add(createInterface(name, 100, mobileIp, isMobileActive));
+                                else list.add(iface);
+                            } else if (name.startsWith('wlan0')) {
+                                wifiFound = true;
+                                if (wifiIp !== null) list.add(createInterface(name, 102, wifiIp, isWifiActive));
+                                else list.add(iface);
+                            } else {
+                                list.add(iface);
+                            }
+                        }
+                    }
+
+                    if (!mobileFound && mobileIp !== null) list.add(createInterface('rmnet_data0', 100, mobileIp, isMobileActive));
+                    if (!wifiFound && wifiIp !== null) list.add(createInterface('wlan0', 102, wifiIp, isWifiActive));
+
+                    return list.elements();
+                };
+            }
+
+            console.log('[+] JSAgent hooked network/VPN successfully');
+        } catch (e) {
+            console.log('[-] Error hooking network/VPN: ' + e);
+        }
+    }
+        },
+        'network_info': function () {
+    // ============================================
+    // BLOCK 12: Network Info Spoofing Hooks
+    // ============================================
+    if (typeof global.NETWORK_NET_TYPE !== 'undefined') {
+        try {
+            const NetworkInfo = Java.use('android.net.NetworkInfo');
+
+            const netType = global.NETWORK_NET_TYPE;
+            const typeName = (netType === 1) ? 'WIFI' : 'MOBILE';
+            const subType = (netType === 1) ? '' : 'LTE';
+            const fakeNetInfo = NetworkInfo.$new(netType, 0, typeName, subType);
+
+            console.log('[+] JSAgent hooked network info successfully');
+        } catch (e) {
+            console.log('[-] Error hooking network info: ' + e);
+        }
+    }
+        },
+        'proxy': function () {
+    // ============================================
+    // BLOCK 14: Proxy Bypass Hook
+    // ============================================
+    try {
+        const Proxy = Java.use('android.net.Proxy');
+        Proxy.getDefaultHost.implementation = function () {
+            return null;
+        };
+
+        console.log('[+] JSAgent hooked proxy successfully');
+    } catch (e) {
+        console.log('[-] Error hooking proxy: ' + e);
+    }
+        },
+        'battery': function () {
+    // ============================================
+    // BLOCK 4: Battery Cloaking Hooks
+    // ============================================
+    if (typeof global.SPECS_BATTERY_LEVEL !== 'undefined') {
+        try {
+            const BatteryManager = Java.use('android.os.BatteryManager');
+            const Intent = Java.use('android.content.Intent');
+            const Bundle = Java.use('android.os.Bundle');
+
+            const battery_level = global.SPECS_BATTERY_LEVEL;
+
+            const jitter = Math.floor(Math.random() * 50) - 25;
+            const spoof_voltage = Math.floor(3500 + (battery_level * 8.5) + jitter);
+            const spoof_temp = Math.floor(Math.random() * 81) + 260;
+
+            const getSpoofedBattery = function(id, val) {
+                if (id === 4) return battery_level;
+                if (id === 6) return 3;
+                if (id === 2 || id === 3) return -450000;
+                if ((id === 1 || id === 5) && val == 0) return (id === 1) ? 2000000 : 7000000000;
+                return val;
+            };
+
+            if (BatteryManager.getIntProperty) {
+                BatteryManager.getIntProperty.overload('int').implementation = function(id) {
+                    return Number(getSpoofedBattery(id, this.getIntProperty(id)));
+                };
+            }
+
+            if (BatteryManager.getLongProperty) {
+                BatteryManager.getLongProperty.overload('int').implementation = function(id) {
+                    return Number(getSpoofedBattery(id, this.getLongProperty(id)));
+                };
+            }
+
+            if (BatteryManager.isCharging) {
+                BatteryManager.isCharging.implementation = function() {
+                    return false;
+                };
+            }
+
+            if (BatteryManager.computeChargeTimeRemaining) {
+                BatteryManager.computeChargeTimeRemaining.implementation = function() {
+                    return -1;
+                };
+            }
+
+            Intent.getIntExtra.overloads.forEach(function(overload) {
+                overload.implementation = function() {
+                    const ret = overload.apply(this, arguments);
+                    const key = arguments[0];
+                    const map = {
+                        'plugged': 0,
+                        'status': 3,
+                        'level': battery_level,
+                        'scale': ret === 0 ? 100 : ret,
+                        'health': 2,
+                        'voltage': ret === 0 ? spoof_voltage : ret,
+                        'temperature': ret === 0 ? spoof_temp : ret
+                    };
+                    return map[key] !== undefined ? map[key] : ret;
+                };
+            });
+
+            Bundle.getInt.overloads.forEach(function(overload) {
+                overload.implementation = function() {
+                    const ret = overload.apply(this, arguments);
+                    const key = arguments[0];
+                    const map = {
+                        'plugged': 0,
+                        'status': 3,
+                        'level': battery_level,
+                        'scale': ret === 0 ? 100 : ret,
+                        'health': 2,
+                        'voltage': ret === 0 ? spoof_voltage : ret,
+                        'temperature': ret === 0 ? spoof_temp : ret
+                    };
+                    return map[key] !== undefined ? map[key] : ret;
+                };
+            });
+
+            console.log('[+] JSAgent hooked battery info successfully');
+        } catch (e) {
+            console.log('[-] Error hooking battery info: ' + e);
+        }
+    }
+        },
+        'time': function () {
+    // ============================================
+    // BLOCK 5: Time Cloaking Hooks
+    // ============================================
+    if (typeof global.SYS_PROP_PERSIST_SYS_TIMEZONE !== 'undefined') {
+        try {
+            const Date = Java.use('java.util.Date');
+            const Calendar = Java.use('java.util.Calendar');
+            const TimeZone = Java.use('java.util.TimeZone');
+            const timeZoneID = global.SYS_PROP_PERSIST_SYS_TIMEZONE;
+
+            Date.after.overload('java.util.Date').implementation = function(date) {
+                return true;
+            };
+
+            Calendar.getInstance.overload().implementation = function() {
+                const cal = this.getInstance();
+                cal.setTimeZone(TimeZone.getTimeZone(timeZoneID));
+                return cal;
+            };
+
+            console.log('[+] JSAgent hooked time cloaking successfully');
+        } catch (e) {
+            console.log('[-] Error hooking time cloaking: ' + e);
+        }
+    }
+        },
+        'keyguard': function () {
     // ============================================
     // BLOCK 18: Keyguard Bypass
     // ============================================
@@ -1152,90 +1277,124 @@ function onJavaReady(Java) {
     } catch (e) {
         console.log('[-] Error hooking KeyguardManager: ' + e);
     }
-
+        },
+        'flag_secure': function () {
     // ============================================
-    // BLOCK 20: Shell getprop interception (Java layer)
+    // BLOCK 8: FLAG_SECURE Bypass Hooks
+    // ============================================
+    if (typeof global.BYPASS_FLAG_SECURE !== 'undefined') {
+        try {
+            const Window = Java.use('android.view.Window');
+            const LayoutParams = Java.use('android.view.WindowManager$LayoutParams');
+            const FLAG_SECURE = 8192;
+
+            Window.addFlags.overload('int').implementation = function(flag) {
+                if (flag === FLAG_SECURE) return;
+                this.addFlags(flag);
+            };
+
+            Window.setFlags.overload('int', 'int').implementation = function(flags, mask) {
+                flags = flags & ~LayoutParams.FLAG_SECURE.value;
+                this.setFlags(flags, mask);
+            };
+
+            console.log('[+] JSAgent hooked FLAG_SECURE successfully');
+        } catch (e) {
+            console.log('[-] Error hooking FLAG_SECURE: ' + e);
+        }
+    }
+        },
+        'usb': function () {
+    // ============================================
+    // BLOCK 7: USB Action Bypass Hooks
     // ============================================
     try {
-        const ProcessBuilder = Java.use('java.lang.ProcessBuilder');
-        const SystemProperties = Java.use('android.os.SystemProperties');
-        const ArrayList = Java.use('java.util.ArrayList');
-
-        const extractGetpropKey = function (cmdList) {
-            const n = cmdList.size();
-            if (n === 0) return null;
-            const c0 = cmdList.get(0).toString();
-            const base0 = c0.substring(c0.lastIndexOf('/') + 1);
-            if (base0 === 'getprop' && n >= 2) {
-                return cmdList.get(1).toString();
-            }
-            for (let i = 0; i < n; i++) {
-                const ci = cmdList.get(i).toString();
-                const idx = ci.indexOf('getprop ');
-                if (idx !== -1) {
-                    let rest = ci.substring(idx + 8).trim();
-                    const sp = rest.search(/[\s"'|&;>]/);
-                    if (sp !== -1) rest = rest.substring(0, sp);
-                    if (rest.length > 0) return rest;
-                }
-            }
-            return null;
+        const Intent = Java.use('android.content.Intent');
+        const usbAction = 'android.hardware.usb.action.USB_STATE';
+        const usbKeys = {
+            'connected': true,
+            'adb': true,
+            'configured': true
         };
 
-        ProcessBuilder.start.implementation = function () {
-            try {
-                const key = extractGetpropKey(this.command());
-                if (key !== null) {
-                    recon('exec getprop', key);
-                    const val = SystemProperties.get(key);
-                    const newCmd = ArrayList.$new();
-                    newCmd.add('/system/bin/echo');
-                    newCmd.add(val !== null ? val : '');
-                    this.command(newCmd);
-                }
-            } catch (e) {
-                console.log('[-] getprop rewrite error: ' + e);
+        Intent.getExtras.overload().implementation = function() {
+            const bundle = this.getExtras();
+
+            if (this.getAction() === usbAction && bundle !== null) {
+                bundle.putBoolean('connected', false);
+                bundle.putBoolean('adb', false);
+                bundle.putBoolean('configured', false);
             }
-            return this.start();
+
+            return bundle;
         };
 
-        console.log('[+] JSAgent hooked ProcessBuilder getprop interception');
+        Intent.getBooleanExtra.overload('java.lang.String', 'boolean').implementation = function(key, defaultVal) {
+            if (this.getAction() === usbAction && usbKeys[key]) {
+                return false;
+            }
+
+            return this.getBooleanExtra(key, defaultVal);
+        };
+
+        console.log('[+] JSAgent hooked USB action successfully');
     } catch (e) {
-        console.log('[-] Error hooking ProcessBuilder: ' + e);
+        console.log('[-] Error hooking USB action: ' + e);
     }
+        },
+        'install_referrer': function () {
+    // ============================================
+    // BLOCK 6: Install Referrer Bypass Hooks
+    // ============================================
+    if (typeof global.ATTRIBUTION_INSTALL_REFERRER !== 'undefined') {
+        try {
+            const installReferrer = global.ATTRIBUTION_INSTALL_REFERRER;
 
-    // ============================================
-    // BLOCK 19: android.os.Build static field spoofing
-    // ============================================
-    try {
-        const Build = Java.use('android.os.Build');
-        const setBuildField = function (name, val) {
-            if (typeof val === 'undefined') return;
+            const cachedInstallTime = 1609459200;
+            const cachedClickTime = 1609459200;
+
             try {
-                Build[name].value = val;
-            } catch (e) {
-                console.log('[-] Build.' + name + ': ' + e);
-            }
-        };
-        setBuildField('SERIAL', global.DEVICE_SERIAL);
-        setBuildField('FINGERPRINT', global.DEVICE_FINGERPRINT);
-        setBuildField('MANUFACTURER', global.DEVICE_MANUFACTURER);
-        setBuildField('BRAND', global.DEVICE_BRAND);
-        setBuildField('MODEL', global.DEVICE_MODEL);
-        setBuildField('DEVICE', global.DEVICE_DEVICE);
-        setBuildField('BOARD', global.DEVICE_BOARD);
-        setBuildField('HARDWARE', global.DEVICE_HARDWARE);
-        console.log('[+] JSAgent spoofed android.os.Build static fields');
-    } catch (e) {
-        console.log('[-] Error spoofing Build fields: ' + e);
+                const ReferrerDetails = Java.use('com.android.installreferrer.api.ReferrerDetails');
+                if (ReferrerDetails && ReferrerDetails.getInstallReferrer) {
+                    ReferrerDetails.getInstallReferrer.implementation = function() {
+                        return installReferrer;
+                    };
+                }
+            } catch (e) {}
+
+            const Bundle = Java.use('android.os.Bundle');
+
+            Bundle.getString.overloads.forEach(function(overload) {
+                overload.implementation = function() {
+                    const key = arguments[0];
+                    const ret = overload.apply(this, arguments);
+                    return key === 'install_referrer' ? installReferrer : ret;
+                };
+            });
+
+            Bundle.getLong.overloads.forEach(function(overload) {
+                overload.implementation = function() {
+                    const key = arguments[0];
+                    const ret = overload.apply(this, arguments);
+
+                    const timeMap = {
+                        'install_begin_timestamp_seconds': cachedInstallTime,
+                        'install_begin_timestamp_server_seconds': cachedInstallTime,
+                        'referrer_click_timestamp_seconds': cachedClickTime,
+                        'referrer_click_timestamp_server_seconds': cachedClickTime
+                    };
+
+                    return timeMap[key] !== undefined ? timeMap[key] : ret;
+                };
+            });
+
+            console.log('[+] JSAgent hooked install referrer successfully');
+        } catch (e) {
+            console.log('[-] Error hooking install referrer: ' + e);
+        }
     }
-
-    // NOTE: boot/uptime spoofing via SystemClock.elapsedRealtime/uptimeMillis
-    // was removed, those clocks are called constantly by the framework's
-    // render/input loop, and a per-call Java hook freezes the app. If uptime
-    // realism is needed, do it at the native layer (spoof reads of /proc/uptime)
-    // instead of hooking the hot managed clocks.
-
+        },
+        'accounts': function () {
     // ============================================
     // BLOCK 22: Accounts (a "lived-in" device has a Google account)
     // ============================================
@@ -1268,7 +1427,8 @@ function onJavaReady(Java) {
             console.log('[-] Error hooking AccountManager: ' + e);
         }
     }
-
+        },
+        'wifi': function () {
     // ============================================
     // BLOCK 23: Wi-Fi identity (SSID / BSSID / MAC)
     // ============================================
@@ -1301,92 +1461,8 @@ function onJavaReady(Java) {
             console.log('[-] Error hooking WifiInfo: ' + e);
         }
     }
-
-    // ============================================
-    // BLOCK 24: Sensor fabrication
-    // Emulators expose few/no sensors, which is a strong tell. Fabricate a
-    // plausible set of android.hardware.Sensor objects via the package-private
-    // no-arg constructor + private field writes. All of it is defensive: if the
-    // ART build doesn't allow the construction, we fall back to recon-only so we
-    // never crash a getSensorList() call.
-    // ============================================
-    try {
-        const SensorManager = Java.use('android.hardware.SensorManager');
-        const Sensor = Java.use('android.hardware.Sensor');
-        const ArrayList = Java.use('java.util.ArrayList');
-
-        // type, name, vendor, maxRange, resolution, power(mA), minDelay(us)
-        const SENSORS = [
-            {type: 1,  name: 'LSM6DSO Accelerometer', vendor: 'STMicroelectronics', max: 78.4532,   res: 0.0023956, power: 0.15,   minDelay: 2404},
-            {type: 4,  name: 'LSM6DSO Gyroscope',     vendor: 'STMicroelectronics', max: 34.906586, res: 0.0010653, power: 0.65,   minDelay: 2404},
-            {type: 2,  name: 'AK09918 Magnetometer',  vendor: 'AKM',                max: 4912.0,     res: 0.15,      power: 0.1,    minDelay: 10000},
-            {type: 5,  name: 'TMD4906 Light',         vendor: 'AMS',                max: 60000.0,    res: 1.0,       power: 0.12,   minDelay: 0},
-            {type: 8,  name: 'TMD4906 Proximity',     vendor: 'AMS',                max: 5.0,        res: 1.0,       power: 0.12,   minDelay: 0},
-            {type: 6,  name: 'LPS22HH Pressure',      vendor: 'STMicroelectronics', max: 1260.0,     res: 0.0002,    power: 0.0017, minDelay: 40000},
-        ];
-
-        const setField = function (obj, field, val) {
-            try { obj[field].value = val; } catch (e) {}
-        };
-        const buildSensor = function (spec, handle) {
-            const s = Sensor.$new(); // package-private Sensor()
-            setField(s, 'mType', spec.type);
-            setField(s, 'mName', spec.name);
-            setField(s, 'mVendor', spec.vendor);
-            setField(s, 'mVersion', 1);
-            setField(s, 'mHandle', handle);
-            setField(s, 'mMaxRange', spec.max);
-            setField(s, 'mResolution', spec.res);
-            setField(s, 'mPower', spec.power);
-            setField(s, 'mMinDelay', spec.minDelay);
-            setField(s, 'mMaxDelay', 1000000);
-            setField(s, 'mFifoReservedEventCount', 0);
-            setField(s, 'mFifoMaxEventCount', 0);
-            setField(s, 'mRequiredPermission', '');
-            setField(s, 'mFlags', 0);
-            return s;
-        };
-
-        // Probe once; only install fabricating hooks if construction works.
-        let probe = null;
-        try { probe = buildSensor(SENSORS[0], 0); } catch (e) { probe = null; }
-
-        if (probe !== null && probe.getType() === 1) {
-            // Build fresh each call, Frida Java wrappers don't survive across
-            // call frames, so caching them makes a later getType()/add() throw
-            // (which would return null to Java and NPE the caller).
-            SensorManager.getSensorList.overload('int').implementation = function (type) {
-                recon('SensorManager.getSensorList', type);
-                const list = ArrayList.$new();
-                for (let i = 0; i < SENSORS.length; i++) {
-                    if (type === -1 /* TYPE_ALL */ || SENSORS[i].type === type) {
-                        try { list.add(buildSensor(SENSORS[i], i + 1)); } catch (e) {}
-                    }
-                }
-                return list;
-            };
-            SensorManager.getDefaultSensor.overload('int').implementation = function (type) {
-                recon('SensorManager.getDefaultSensor', type);
-                for (let i = 0; i < SENSORS.length; i++) {
-                    if (SENSORS[i].type === type) {
-                        try { return buildSensor(SENSORS[i], i + 1); } catch (e) {}
-                    }
-                }
-                return this.getDefaultSensor(type);
-            };
-            console.log('[+] JSAgent fabricated SensorManager sensors (' + SENSORS.length + ')');
-        } else {
-            // Fabrication not supported here, keep recon only, change nothing.
-            SensorManager.getSensorList.overload('int').implementation = function (type) {
-                recon('SensorManager.getSensorList', type);
-                return this.getSensorList(type);
-            };
-            console.log('[-] Sensor fabrication unavailable on this ART; recon-only');
-        }
-    } catch (e) {
-        console.log('[-] Error hooking SensorManager: ' + e);
-    }
-
+        },
+        'location': function () {
     // ============================================
     // BLOCK 25: Location spoofing (GPS fix matching the profile)
     // Coordinates come from the profile's `location` section (explicit or
@@ -1450,8 +1526,20 @@ function onJavaReady(Java) {
             console.log('[-] Error hooking location: ' + e);
         }
     }
+        },
+    };
 
-    console.log('[+] JSAgent: All hook blocks installed');
+    // Detection-critical: an evasive app reads these synchronously while deciding
+    // whether it's in a sandbox/emulator and whether to run at all, so they must be
+    // in place before the first activity's onCreate. Move a name between these two
+    // lists to trade up-front cost against how early that spoof takes effect.
+    var CRITICAL = ['build', 'getprop', 'debug_settings', 'telephony', 'ram', 'display', 'locale_tz', 'sensors', 'package_manager'];
+
+    // Everything else: only matters once the app is actually running (TLS, UA,
+    // battery, location, ...). Order is roughly soonest-needed first.
+    var DEFERRED = ['ssl', 'user_agent', 'network_vpn', 'network_info', 'proxy', 'battery', 'time', 'keyguard', 'flag_secure', 'usb', 'install_referrer', 'accounts', 'wifi', 'location'];
+
+    installStaged(Java, BLOCKS, CRITICAL, DEFERRED);
 }
 
 // Resolve a global native export across Gum API versions (newer builds expose

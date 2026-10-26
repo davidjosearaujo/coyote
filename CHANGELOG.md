@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- JS agent hook install is now **staged** to stop real-world apps from hanging
+  on the splash screen. Previously all ~70 Java method replacements were
+  installed in one synchronous burst inside `callActivityOnCreate`; each
+  replacement triggers an ART deoptimization that suspends every thread in the
+  process. On a trivial test app that was only slow, but on real apps doing
+  heavy work on background threads during the splash the back-to-back
+  all-thread suspends caused ANRs/deadlocks, so they never got past the splash.
+  `onJavaReady` now installs only the detection-critical hook families
+  (`build`, `getprop`, `debug_settings`, `telephony`, `ram`, `display`,
+  `locale_tz`, `sensors`, `package_manager`) synchronously before the first
+  activity's `onCreate`, then drains the rest one family per main-thread tick
+  (via `Java.scheduleOnMainThread`) once the splash is already up, spreading the
+  remaining deopts across frames off the critical path. The `CRITICAL` /
+  `DEFERRED` lists in `agent.js` are the tuning knobs; deferred TLS-pinning
+  bypass (`ssl`) installs on the first idle tick, so move it to `CRITICAL` if a
+  target pins during its splash network calls.
+
 ## [2.2.0] - 2026-10-23
 
 ### Added
