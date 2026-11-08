@@ -5,6 +5,8 @@
 #include <android/log.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <dlfcn.h>
+#include <jni.h>
 
 #define LOG_TAG "[PuppyJS]"
 // Surface JS console/recon output in debug OR recon builds (the JS agent's
@@ -51,7 +53,93 @@ static gboolean on_script_loaded(gpointer user_data) {
     return G_SOURCE_REMOVE;
 }
 
+// ---------------------------------------------------------------------------
+// Wait until ART's runtime is fully started before the JS/Java layer touches it.
+//
+// Our `wrap` + LD_PRELOAD injection fires at the very start of a fresh
+// app_process, which then re-creates ART from scratch via JNI_CreateJavaVM().
+// If the frida-java-bridge probes the VM before Runtime::Start() finishes, ART
+// aborts the whole process with `Check failed: runtime->IsStarted()`. On a slow
+// emulator the race was usually won; on a fast physical device it is lost every
+// time, so we gate explicitly.
+//
+// JNI_CreateJavaVM() returns exactly when Runtime::Start() has completed, so we
+// hook its return. If a VM already exists when we get here (ART was created
+// before we could install the hook, or a VM was inherited rather than created),
+// we fall back to a short settle and proceed.
+// ---------------------------------------------------------------------------
+typedef jint (*CreateJavaVM_t)(JavaVM **, void **, void *);
+typedef jint (*GetCreatedJavaVMs_t)(JavaVM **, jsize, jsize *);
+
+static volatile int g_art_started = 0;
+static CreateJavaVM_t orig_JNI_CreateJavaVM = NULL;
+
+static jint hook_JNI_CreateJavaVM(JavaVM **pvm, void **penv, void *args) {
+    jint res = orig_JNI_CreateJavaVM(pvm, penv, args);
+    g_art_started = 1; // Runtime::Start() has completed by the time this returns
+    return res;
+}
+
+static gpointer resolve_sym(const char *name) {
+    gpointer p = (gpointer) dlsym(RTLD_DEFAULT, name);
+    if (p == NULL) p = GSIZE_TO_POINTER(gum_module_find_export_by_name(NULL, name));
+    return p;
+}
+
+static int art_vm_exists(GetCreatedJavaVMs_t getvms) {
+    if (getvms == NULL) return 0;
+    JavaVM *vms[1];
+    jsize n = 0;
+    return (getvms(vms, 1, &n) == JNI_OK && n > 0) ? 1 : 0;
+}
+
+static void wait_for_art_started(void) {
+    GetCreatedJavaVMs_t getvms = (GetCreatedJavaVMs_t) resolve_sym("JNI_GetCreatedJavaVMs");
+    gpointer createvm = resolve_sym("JNI_CreateJavaVM");
+
+    // ART already up (VM created/inherited before we got here): let it settle
+    // briefly (Start() completes shortly after the VM becomes discoverable) and
+    // go — there is no JNI_CreateJavaVM call left to hook.
+    if (art_vm_exists(getvms)) {
+        LOGI("ART VM already present; settling before JS layer.");
+        usleep(250 * 1000);
+        return;
+    }
+
+    if (createvm != NULL) {
+        GumInterceptor *itc = gum_interceptor_obtain();
+        gum_interceptor_begin_transaction(itc);
+        gum_interceptor_replace(itc, createvm,
+                                GSIZE_TO_POINTER(hook_JNI_CreateJavaVM),
+                                (gpointer *) &orig_JNI_CreateJavaVM, NULL);
+        gum_interceptor_end_transaction(itc);
+    } else {
+        LOGE("JNI_CreateJavaVM not found; falling back to timed wait for ART.");
+    }
+
+    // Wait for the hook to fire (ART started). Fallback: if a VM appears without
+    // our hook catching it (we installed too late), settle and proceed.
+    for (int i = 0; i < 30000; i++) { // up to ~30s
+        if (g_art_started) {
+            LOGI("ART started (JNI_CreateJavaVM returned) after %d ms.", i);
+            usleep(20 * 1000); // let Start() finish its tail work
+            return;
+        }
+        if ((i % 5) == 0 && art_vm_exists(getvms)) {
+            LOGI("ART VM appeared without hook; settling before JS layer.");
+            usleep(250 * 1000);
+            return;
+        }
+        usleep(1000);
+    }
+    LOGE("Timed out waiting for ART to start; proceeding anyway.");
+}
+
 void apply_gumjs_hooks() {
+    // Gate: never probe the Java VM before ART's runtime has started, or ART
+    // aborts the process with `Check failed: runtime->IsStarted()`.
+    wait_for_art_started();
+
     GMainContext *context = g_main_context_new();
     g_main_context_push_thread_default(context);
     main_loop = g_main_loop_new(context, FALSE);

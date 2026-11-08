@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Physical-device support: Java/JS layer no longer aborts on fast devices.**
+  `wrap`+`LD_PRELOAD` re-execs a fresh `app_process`, which re-creates ART from
+  scratch; the agent raced it and the frida-java-bridge probed the VM before
+  `Runtime::Start()` finished, aborting the whole process with
+  `Check failed: runtime->IsStarted()`. The slow x86_64 emulator usually won the
+  race; a fast arm64 phone (Pixel 7) lost it every time. The JS layer now gates
+  on ART actually being started — it hooks `JNI_CreateJavaVM` (whose return marks
+  `Runtime::Start()` completing) and waits for it, with a settle-and-proceed
+  fallback when a VM is already present — before touching the bridge.
+- **`configure_adb_properties` no longer aborts on a protected `setprop`.** Real
+  devices reject many property writes that the permissive emulator allowed;
+  these are now best-effort (run via `su`, warn-and-continue) instead of killing
+  the whole run. `_exec` gained a `fatal=False` mode.
+- Target-ABI detection is no longer skipped by `--skip-adb` (which is only meant
+  to skip `setprop`); skipping it previously built with the wrong devkit arch
+  and failed to link on a non-host-ABI device.
+
 ### Added
+- **`--force-permissive`.** Sets SELinux permissive (`setenforce 0`) before
+  applying the profile so the device accepts protected `setprop` writes that
+  enforcing policy rejects. For dedicated analysis devices; optional (the
+  native/JS spoof layers work without it).
 - **ABI-aware builds.** Coyote now detects the *target app's* `primaryCpuAbi`
   (via `dumpsys package`) and compiles `libcoyote.so` for the ABI the app's
   process actually runs as, instead of always building for the device's primary

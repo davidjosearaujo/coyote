@@ -228,8 +228,11 @@ class Coyote:
         print(f"    [+] Profile OK ({len(warnings)} warning(s)).")
         return True
 
-    def _exec(self, cmd: list, desc: str = "") -> str:
-        """Executes shell commands or prints them if dry_run is set."""
+    def _exec(self, cmd: list, desc: str = "", fatal: bool = True) -> str:
+        """Executes shell commands or prints them if dry_run is set. With
+        fatal=False a non-zero exit warns and continues instead of aborting the
+        whole run (used for best-effort steps like per-property setprop, which
+        real devices restrict)."""
         cmd_str = " ".join(cmd)
         if self.dry_run:
             print(f"  [DRY-RUN] {cmd_str}")
@@ -237,10 +240,23 @@ class Coyote:
 
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
-            print(f"[!] Command failed ({desc}):\n{res.stderr.strip()}")
-            if not self.dry_run:
+            level = "!" if fatal else "warn"
+            print(f"[{level}] Command failed ({desc}):\n{res.stderr.strip()}")
+            if fatal:
                 sys.exit(1)
         return res.stdout.strip()
+
+    def force_selinux_permissive(self):
+        """Set SELinux to permissive (setenforce 0) so the device accepts the
+        profile's protected setprop writes. Intended for dedicated malware-
+        analysis devices where a relaxed policy is acceptable; left permissive
+        for the session (reset manually, or `su 0 setenforce 1`)."""
+        cur = self._exec(["adb", "shell", "su 0 getenforce"], fatal=False).strip()
+        if cur.lower() == "permissive":
+            print("[+] SELinux already permissive.")
+            return
+        print("[!] Forcing SELinux permissive (setenforce 0) for property spoofing.")
+        self._exec(["adb", "shell", "su 0 setenforce 0"], desc="setenforce 0", fatal=False)
 
     def configure_adb_properties(self):
         """Sets standard ADB system properties defined in the profile."""
@@ -254,9 +270,13 @@ class Coyote:
                 continue
 
             print(f"    - setprop {prop} -> {val}")
+            # Use su (Coyote already requires root) so settable props succeed on
+            # real devices, and don't abort on the ones the device protects —
+            # the native memory hooks + JS layer are the primary spoof.
             self._exec(
-                ["adb", "shell", "setprop", prop, f"'{val}'"],
+                ["adb", "shell", f"su 0 setprop {prop} '{val}'"],
                 desc=f"setprop {prop}",
+                fatal=False,
             )
 
     def _sanitize_macro_key(self, prop_key: str) -> str:
@@ -1047,6 +1067,14 @@ def parse_args():
         help="Fetch latest Frida-GumJS DevKit for specified architecture (auto-detects via ADB if omitted).",
     )
     parser.add_argument(
+        "--force-permissive",
+        action="store_true",
+        help="Set SELinux to permissive (setenforce 0) before applying the "
+        "profile, so the device accepts protected setprop writes that enforcing "
+        "policy rejects. For dedicated analysis devices; left permissive for the "
+        "session. The native/JS spoof layers work without it, so it is optional.",
+    )
+    parser.add_argument(
         "--nb-shim",
         action="store_true",
         help="EXPERIMENTAL: instrument a native-bridge-translated app (e.g. an "
@@ -1101,6 +1129,9 @@ def main():
         if not args.profile:
             return
 
+    if args.force_permissive and not args.dry_run:
+        orchestrator.force_selinux_permissive()
+
     if not args.skip_adb and args.profile:
         orchestrator.configure_adb_properties()
 
@@ -1109,11 +1140,12 @@ def main():
         orchestrator.generate_c_header()
 
         # Decide which ABI to build for and whether the target only runs under
-        # native-bridge translation. Skip when we can't query the device (dry
-        # run / no ADB / no target) — then the build falls back to device ABI.
+        # native-bridge translation. Needs a live device query (dumpsys/getprop),
+        # so skip only in dry-run or when there's no target — then the build
+        # falls back to the device ABI. (--skip-adb only skips setprop, not this.)
         target_abi = None
         nb_shim_guest_abi = None
-        if args.target and not args.dry_run and not args.skip_adb:
+        if args.target and not args.dry_run:
             info = resolve_target_abi(args.target)
             target_abi = info["build_abi"]
             if info["app_abi"]:
