@@ -1520,15 +1520,22 @@ function onJavaReady(Java) {
         },
     };
 
-    // Detection-critical: an evasive app reads these synchronously while deciding
-    // whether it's in a sandbox/emulator and whether to run at all, so they must be
-    // in place before the first activity's onCreate. Move a name between these two
-    // lists to trade up-front cost against how early that spoof takes effect.
-    var CRITICAL = ['build', 'getprop', 'debug_settings', 'telephony', 'ram', 'display', 'locale_tz', 'sensors', 'package_manager', 'flag_secure'];
+    // Device-identity spoofs: an evasive app reads these synchronously while
+    // deciding whether it's in a sandbox/analysis device and whether to run at
+    // all, so they must be live before the first activity's onCreate. The full
+    // install is only tens of ms, so everything that answers a device-identity
+    // probe goes here — deferring it would let the app see the real device first.
+    var CRITICAL = ['build', 'getprop', 'debug_settings', 'telephony', 'ram',
+        'display', 'locale_tz', 'sensors', 'package_manager', 'flag_secure',
+        'network_vpn', 'proxy', 'battery', 'time', 'keyguard', 'usb',
+        'install_referrer', 'accounts', 'wifi', 'location'];
 
-    // Everything else: only matters once the app is actually running (TLS, UA,
-    // battery, location, ...). Order is roughly soonest-needed first.
-    var DEFERRED = ['ssl', 'user_agent', 'network_vpn', 'proxy', 'battery', 'time', 'keyguard', 'usb', 'install_referrer', 'accounts', 'wifi', 'location'];
+    // Network-time behaviors only: these take effect on the app's first HTTP /
+    // TLS traffic, not at startup, and `ssl` is the heaviest block, so they stay
+    // off the launch critical path. Drained one-per-main-thread-tick once the UI
+    // is up. (The staging mechanism also lets you defer any block here if a
+    // specific app ever deadlocks installing it synchronously.)
+    var DEFERRED = ['ssl', 'user_agent'];
 
     installStaged(Java, BLOCKS, CRITICAL, DEFERRED);
 }

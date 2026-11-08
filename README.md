@@ -206,25 +206,24 @@ Coyote solves this **in-process**, without `frida-server`'s spawn gating:
 1. As soon as the Java VM is usable, it arms **one** hook on
    `android.app.Instrumentation.callActivityOnCreate`, the framework method that
    runs, on the main thread, immediately before every activity's `onCreate`.
-2. When that fires for the first activity, Coyote installs the
-   **detection-critical** hook families (`build`, `getprop`, `debug_settings`,
-   `telephony`, `ram`, `display`, `locale_tz`, `sensors`, `package_manager`)
-   **from the main thread**, before `onCreate` executes. Because the
-   instrumentation happens on the main thread itself, there is no cross-thread
-   ART suspension and no deadlock.
+2. When that fires for the first activity, Coyote installs every
+   **device-identity** hook family (Build, props, telephony, RAM, display,
+   locale, sensors, package manager, FLAG_SECURE, battery, network/VPN, proxy,
+   time, keyguard, USB, install referrer, accounts, Wi-Fi, location) **from the
+   main thread**, before `onCreate` executes. Because the instrumentation
+   happens on the main thread itself, there is no cross-thread ART suspension and
+   no deadlock, and the whole install takes only tens of milliseconds.
 3. `onCreate` then reads already-spoofed values for everything an app checks to
    decide whether it's in a sandbox.
-4. The remaining hook families (TLS pinning, user-agent, battery, location, …)
-   are **staged**: drained one family per main-thread tick once the splash is
-   up. Each Java method replacement forces an ART deoptimization that suspends
-   every thread, so installing all ~70 at once inside `callActivityOnCreate`
-   hung real apps on the splash; spreading the non-critical ones across later
-   main-loop messages keeps them off the launch critical path. The `CRITICAL`
-   and `DEFERRED` lists at the top of `onJavaReady` in `agent.js` are the tuning
-   knobs.
+4. Only the **network-time** families (`ssl` TLS-pinning bypass and `user_agent`)
+   are **staged**: they take effect on the app's first TLS/HTTP traffic rather
+   than at startup, so they are drained one per main-thread tick once the UI is
+   up, off the launch critical path. The `CRITICAL` and `DEFERRED` lists at the
+   top of `onJavaReady` in `agent.js` are the tuning knobs — move a block to
+   `DEFERRED` only if a specific app deadlocks installing it synchronously.
 
-The net effect is spawn-gating-quality timing (every detection-critical hook
-live before the app's first checks) with zero added device footprint.
+The net effect is spawn-gating-quality timing (every device-identity spoof live
+before the app's first checks) with zero added device footprint.
 
 ### The build pipeline
 
