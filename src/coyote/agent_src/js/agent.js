@@ -1524,11 +1524,11 @@ function onJavaReady(Java) {
     // whether it's in a sandbox/emulator and whether to run at all, so they must be
     // in place before the first activity's onCreate. Move a name between these two
     // lists to trade up-front cost against how early that spoof takes effect.
-    var CRITICAL = ['build', 'getprop', 'debug_settings', 'telephony', 'ram', 'display', 'locale_tz', 'sensors', 'package_manager'];
+    var CRITICAL = ['build', 'getprop', 'debug_settings', 'telephony', 'ram', 'display', 'locale_tz', 'sensors', 'package_manager', 'flag_secure'];
 
     // Everything else: only matters once the app is actually running (TLS, UA,
     // battery, location, ...). Order is roughly soonest-needed first.
-    var DEFERRED = ['ssl', 'user_agent', 'network_vpn', 'proxy', 'battery', 'time', 'keyguard', 'flag_secure', 'usb', 'install_referrer', 'accounts', 'wifi', 'location'];
+    var DEFERRED = ['ssl', 'user_agent', 'network_vpn', 'proxy', 'battery', 'time', 'keyguard', 'usb', 'install_referrer', 'accounts', 'wifi', 'location'];
 
     installStaged(Java, BLOCKS, CRITICAL, DEFERRED);
 }
