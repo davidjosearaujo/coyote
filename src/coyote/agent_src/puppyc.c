@@ -9,6 +9,9 @@
 #include <spawn.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
+#include <sys/prctl.h>
+#include <dirent.h>
 
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
@@ -687,8 +690,162 @@ static int create_filtered_fd(const char *path, const char *const *drop,
     return fd;
 }
 
+// ---------------------------------------------------------------------------
+// Anti-Frida fingerprinting. The embedded frida-gum/GumJS runtime spawns worker
+// threads with tell-tale names (`gum-js-loop`, GLib's `gmain`/`gdbus`, …) that a
+// Frida-aware app finds by reading /proc/<pid>/task/*/comm. We rename them to
+// innocuous names at the source (hooking the thread-naming calls) and sweep any
+// already-created ones, and we zero out TracerPid and hide libcoyote from the
+// per-task maps. See TODO.md (Tier 1).
+// ---------------------------------------------------------------------------
+static int name_is_instrumentation(const char *n) {
+    if (n == NULL) return 0;
+    static const char *const tells[] = {"gum", "gmain", "gdbus", "frida",
+                                         "linjector", "js-loop", "pool-frida", NULL};
+    for (int i = 0; tells[i] != NULL; i++) {
+        if (strstr(n, tells[i]) != NULL) return 1;
+    }
+    return 0;
+}
+
+// Plausible, common Android/JVM worker-thread names used to replace the ones
+// above; distinct so renamed threads don't all collide on one suspicious name.
+static const char *benign_thread_name(void) {
+    static const char *const names[] = {
+        "pool-1-thread-1", "pool-2-thread-1", "queued-work-looper",
+        "Profile Saver", "Jit thread pool", "binder:worker",
+    };
+    static volatile int idx = 0;
+    int i = __sync_fetch_and_add(&idx, 1);
+    return names[i % (int)(sizeof(names) / sizeof(names[0]))];
+}
+
+typedef int (*SetNameFunc)(pthread_t, const char *);
+typedef int (*PrctlFunc)(int, unsigned long, unsigned long, unsigned long, unsigned long);
+static SetNameFunc orig_pthread_setname_np = NULL;
+static PrctlFunc orig_prctl = NULL;
+
+static int hook_pthread_setname_np(pthread_t t, const char *name) {
+    if (name_is_instrumentation(name)) {
+        return orig_pthread_setname_np(t, benign_thread_name());
+    }
+    return orig_pthread_setname_np(t, name);
+}
+
+static int hook_prctl(int option, unsigned long a2, unsigned long a3,
+                      unsigned long a4, unsigned long a5) {
+    if (option == PR_SET_NAME && name_is_instrumentation((const char *)a2)) {
+        return orig_prctl(option, (unsigned long)benign_thread_name(), a3, a4, a5);
+    }
+    return orig_prctl(option, a2, a3, a4, a5);
+}
+
+// Rename already-running instrumentation threads (those created during
+// gum_init_embedded, before the hooks above were installed) by writing to their
+// comm file. Called once from apply_native_gum_hooks.
+static void rename_instrumentation_threads(void) {
+    DIR *d = opendir("/proc/self/task");
+    if (d == NULL) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        char p[128];
+        snprintf(p, sizeof(p), "/proc/self/task/%s/comm", e->d_name);
+        int rfd = orig_open ? orig_open(p, O_RDONLY, 0) : open(p, O_RDONLY);
+        if (rfd < 0) continue;
+        char nm[64] = {0};
+        ssize_t n = read(rfd, nm, sizeof(nm) - 1);
+        close(rfd);
+        if (n <= 0) continue;
+        if (nm[n - 1] == '\n') nm[n - 1] = '\0';
+        if (!name_is_instrumentation(nm)) continue;
+        int wfd = orig_open ? orig_open(p, O_WRONLY, 0) : open(p, O_WRONLY);
+        if (wfd < 0) continue;
+        const char *b = benign_thread_name();
+        (void)!write(wfd, b, strlen(b));
+        close(wfd);
+    }
+    closedir(d);
+}
+
+// Serve a copy of /proc/<pid>/status with TracerPid forced to 0 (a non-zero
+// TracerPid is a classic "I'm being traced" tell).
+static int create_status_fd(const char *path) {
+    int rfd = orig_open ? orig_open(path, O_RDONLY, 0) : open(path, O_RDONLY);
+    if (rfd < 0) return -1;
+    size_t cap = 65536;
+    char *raw = (char *)malloc(cap);
+    char *out = (char *)malloc(cap);
+    if (raw == NULL || out == NULL) { free(raw); free(out); close(rfd); return -1; }
+    size_t total = 0;
+    ssize_t n;
+    while (total < cap - 1 && (n = read(rfd, raw + total, cap - 1 - total)) > 0) {
+        total += (size_t)n;
+    }
+    close(rfd);
+    raw[total] = '\0';
+
+    size_t olen = 0;
+    char *saveptr = NULL;
+    for (char *line = strtok_r(raw, "\n", &saveptr); line != NULL; line = strtok_r(NULL, "\n", &saveptr)) {
+        const char *emit = line;
+        if (strncmp(line, "TracerPid:", 10) == 0) emit = "TracerPid:\t0";
+        size_t len = strlen(emit);
+        if (olen + len + 1 < cap) {
+            memcpy(out + olen, emit, len);
+            olen += len;
+            out[olen++] = '\n';
+        }
+    }
+    int fd = create_memfd_with_data("status", out, olen);
+    free(raw);
+    free(out);
+    return fd;
+}
+
+// True for /proc/.../comm, /proc/.../status, /proc/.../maps (self or any pid,
+// incl. per-task), so the checks below catch the dynamic task paths too.
+static int proc_basename_is(const char *path, const char *base) {
+    if (strncmp(path, "/proc/", 6) != 0) return 0;
+    const char *slash = strrchr(path, '/');
+    return slash != NULL && strcmp(slash + 1, base) == 0;
+}
+
 static int get_intercepted_fd(const char *path) {
     if (path == NULL) return -1;
+
+    // Hide gum/GLib worker-thread names from a /proc/.../comm read (a renamed
+    // thread normally covers this, but back-stop any the rename missed).
+    if (proc_basename_is(path, "comm")) {
+        int rfd = orig_open ? orig_open(path, O_RDONLY, 0) : open(path, O_RDONLY);
+        if (rfd >= 0) {
+            char nm[64] = {0};
+            ssize_t n = read(rfd, nm, sizeof(nm) - 1);
+            close(rfd);
+            if (n > 0) {
+                char tmp[64];
+                memcpy(tmp, nm, (size_t)n);
+                tmp[n] = '\0';
+                if (tmp[n - 1] == '\n') tmp[n - 1] = '\0';
+                if (name_is_instrumentation(tmp)) {
+                    char buf[64];
+                    int len = snprintf(buf, sizeof(buf), "%s\n", benign_thread_name());
+                    LOGI("PuppyC scrubbed instrumentation thread name from %s", path);
+                    return create_memfd_with_data("comm", buf, (size_t)len);
+                }
+            }
+        }
+        return -1; // real thread name is fine
+    }
+
+    // TracerPid -> 0 for any /proc/<pid>/status (or per-task status).
+    if (proc_basename_is(path, "status")) {
+        int fd = create_status_fd(path);
+        if (fd >= 0) {
+            RLOG("status TracerPid scrubbed %s", path);
+            return fd;
+        }
+    }
 
     if (strcmp(path, "/proc/mounts") == 0 ||
         strcmp(path, "/proc/self/mounts") == 0 ||
@@ -705,7 +862,7 @@ static int get_intercepted_fd(const char *path) {
     // Hide the injected library from a /proc/self/maps scan (anti-tamper checks
     // enumerate mapped libraries looking for an injected .so). The embedded
     // GumJS runtime is linked into libcoyote.so, so dropping its lines hides it.
-    if (strcmp(path, "/proc/self/maps") == 0 || strcmp(path, "/proc/self/task/maps") == 0) {
+    if (proc_basename_is(path, "maps")) {
         static const char *const drop[] = {"libcoyote", NULL};
         int fd = create_filtered_fd(path, drop, "maps", 4 * 1024 * 1024);
         if (fd >= 0) {
@@ -946,6 +1103,13 @@ void apply_native_gum_hooks() {
     // Anti-debug: neutralize ptrace(PTRACE_TRACEME)-based detection.
     gpointer t_ptrace = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "ptrace"));
     if (t_ptrace) gum_interceptor_replace(interceptor, t_ptrace, GSIZE_TO_POINTER(hook_ptrace), (gpointer *)&orig_ptrace, NULL);
+
+    // Anti-Frida: rename the embedded runtime's worker threads (gum-js-loop,
+    // gmain, …) to innocuous names so /proc/.../comm scans don't reveal them.
+    gpointer t_setname = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "pthread_setname_np"));
+    if (t_setname) gum_interceptor_replace(interceptor, t_setname, GSIZE_TO_POINTER(hook_pthread_setname_np), (gpointer *)&orig_pthread_setname_np, NULL);
+    gpointer t_prctl = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "prctl"));
+    if (t_prctl) gum_interceptor_replace(interceptor, t_prctl, GSIZE_TO_POINTER(hook_prctl), (gpointer *)&orig_prctl, NULL);
     #endif
 
     #if defined(SPECS_WIDTH) || defined(SPECS_HEIGHT)
@@ -1017,5 +1181,11 @@ void apply_native_gum_hooks() {
     #endif
 
     gum_interceptor_end_transaction(interceptor);
+
+    // Rename any instrumentation threads that were already running before the
+    // thread-naming hooks above were installed (e.g. GLib threads spun up inside
+    // gum_init_embedded). Future ones are caught by the hooks.
+    rename_instrumentation_threads();
+
     LOGI("Native Gum hooks applied.");
 }
