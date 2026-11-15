@@ -4,11 +4,22 @@ import json
 import tarfile
 import os
 import re
+import secrets
+import string
 import subprocess
 import platform
 import sys
 import urllib.request
 from pathlib import Path
+
+
+def random_so_name() -> str:
+    """A plausible, randomized basename for the injected library, so there is no
+    fixed `libcoyote.so` signature on disk / in /proc for a self-scan to match.
+    The native layer is told the exact name at build time (-DCOYOTE_SO_NAME) and
+    hides it from maps / stat / readdir."""
+    stem = "".join(secrets.choice(string.ascii_lowercase) for _ in range(secrets.choice(range(6, 10))))
+    return f"lib{stem}.so"
 
 from .paths import AGENT_SRC, BUILD_DIR, DEVKIT_DIR
 
@@ -148,6 +159,7 @@ class Coyote:
         self.recon = recon
         self.api_level = api_level
         self.package_name = package_name
+        self.so_name = random_so_name()
         self.ndk_path = Path(ndk_path) if ndk_path else None
         
         self.profile = self._load_profile(profile_path) if profile_path else {}
@@ -488,6 +500,10 @@ class Coyote:
             *(["-DCOYOTE_JS_ALL_PROCESSES"] if self.js_all_processes else []),
             # Recon mode: log intercepted probes regardless of debug/release.
             *(["-DCOYOTE_RECON"] if self.recon else []),
+            # Randomized on-device library name, so the native hiding (maps,
+            # stat, readdir) knows exactly what to scrub and there is no fixed
+            # "libcoyote.so" artifact to detect.
+            f'-DCOYOTE_SO_NAME="{self.so_name}"',
             f"-I{AGENT_SRC}",
             f"-I{BUILD_DIR}",
             f"-I{DEVKIT_DIR}",
@@ -526,9 +542,9 @@ class Coyote:
         NDK_TRANSLATION_GUEST_LD_PRELOAD — the one env channel the translator
         forwards into the guest. See docs: native-bridge injection."""
 
-        temp_so = "/data/local/tmp/libcoyote.so"
+        temp_so = f"/data/local/tmp/{self.so_name}"
         app_dir = f"/data/data/{self.package_name}"
-        target_so = f"{app_dir}/libcoyote.so"
+        target_so = f"{app_dir}/{self.so_name}"
 
         self._exec(["adb", "push", str(so_path), temp_so], desc="ADB Push to Staging")
 

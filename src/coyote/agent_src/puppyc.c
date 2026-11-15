@@ -40,6 +40,13 @@
 #define MFD_CLOEXEC 0x0001U
 #endif
 
+// The deployed library's basename. The build randomizes it (-DCOYOTE_SO_NAME)
+// so there is no fixed "libcoyote.so" signature on disk / in /proc; the native
+// hiding (maps, stat/access, readdir) keys off this exact name.
+#ifndef COYOTE_SO_NAME
+#define COYOTE_SO_NAME "libcoyote.so"
+#endif
+
 #define LOG_TAG "[PuppyC]"
 #ifdef COYOTE_DEBUG
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -298,6 +305,14 @@ static int is_hidden_path(const char *path) {
         "/data/adb/ksu", "/dev/.magisk", "/cache/.disable_magisk",
         "/init.magisk.rc", "/system/etc/init/magisk",
         "magisk", "busybox", "superuser", "frida", "xposed", "/re.frida",
+        // The native-bridge shim (experimental path) lives in the app data dir;
+        // safe to hide from stat/access since nothing in-process loads it.
+        // NOTE: do NOT hide the injected library (COYOTE_SO_NAME) here — the
+        // dynamic linker/ART legitimately stat()s the mapped .so, and returning
+        // ENOENT for it breaks Java-bridge hook installation. Its on-disk
+        // signature is handled by randomizing the name; its memory footprint by
+        // the /proc/.../maps filter below.
+        "coyote_nb.sh",
         NULL
     };
     for (int i = 0; hidden[i] != NULL; i++) {
@@ -620,6 +635,7 @@ static int hook_fstatat(int dirfd, const char *path, void *buf, int flags) {
     return orig_fstatat(dirfd, path, buf, flags);
 }
 
+
 static int create_memfd_with_data(const char *name, const char *data, size_t size) {
     int fd = (int) syscall(__NR_memfd_create, name, MFD_CLOEXEC);
     if (fd < 0) {
@@ -863,10 +879,10 @@ static int get_intercepted_fd(const char *path) {
     // enumerate mapped libraries looking for an injected .so). The embedded
     // GumJS runtime is linked into libcoyote.so, so dropping its lines hides it.
     if (proc_basename_is(path, "maps")) {
-        static const char *const drop[] = {"libcoyote", NULL};
+        static const char *const drop[] = {COYOTE_SO_NAME, NULL};
         int fd = create_filtered_fd(path, drop, "maps", 4 * 1024 * 1024);
         if (fd >= 0) {
-            LOGI("PuppyC filtered libcoyote from %s", path);
+            LOGI("PuppyC filtered agent lib from %s", path);
             RLOG("filter maps %s", path);
             return fd;
         }

@@ -18,8 +18,17 @@ gap.
 - [x] Spoof `/proc/<pid>/status` `TracerPid:` to `0` (anti-debug / anti-trace).
 - [x] Hook the per-task maps path `/proc/.../maps` (was only `/proc/self/maps`
       and `/proc/self/task/maps`).
-- [ ] Scrub other Frida tells: `frida`/`gum`/`gadget` strings and named pipes
-      (`pipe:[…]` / `linjector`), `/proc/self/fd` entries pointing at them.
+- [x] Remove the fixed on-disk signature: the injected library name is now
+      randomized per run (`-DCOYOTE_SO_NAME`, e.g. `libnixifsfj.so`) instead of
+      `libcoyote.so`, and the native maps filter / log key off that name.
+      - Note: hiding the `.so` from `stat()`/`access()` and from `readdir()` was
+        tried and reverted — hiding a *mapped* library from `stat` makes the
+        linker/ART get `ENOENT` and breaks Java-bridge hook installation (gate
+        never fires), and `readdir` is far too hot. Name randomization +
+        in-process `/proc/.../maps` filtering cover the real vectors safely.
+- [ ] Lower priority: scrub `frida`/`gum`/`gadget` strings in mapped memory and
+      `/proc/self/fd` entries. (Named-pipe / `linjector` tells are frida-*server*
+      specific; Coyote embeds GumJS, so there's no control socket to hide.)
 - [x] Verify on the Pixel 7: `/proc/<pid>/task/*/comm` shows no frida-shaped
       names (all look like normal Android threads); no correctness regression
       (Border Patrol unchanged vs without Tier 1).
