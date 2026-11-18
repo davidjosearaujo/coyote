@@ -635,6 +635,63 @@ static int hook_fstatat(int dirfd, const char *path, void *buf, int flags) {
     return orig_fstatat(dirfd, path, buf, flags);
 }
 
+// --- /proc/<pid>/fd/* symlink scrubbing --------------------------------------
+// An app that enumerates /proc/self/fd and readlink()s each entry can spot an
+// open fd that points at the injected agent .so or at a frida/gum-named memfd
+// (e.g. "/memfd:frida-<...> (deleted)"). We rewrite only those link targets to a
+// benign path; every other readlink is passed through untouched.
+
+// Path/mapping substrings that mark a frida/gum artifact. Shared by the
+// /proc/.../maps filter and the /proc/.../fd/* symlink scrub so the two stay in
+// sync. (Bare "frida" already covers "/re.frida*".)
+#define FRIDA_PATH_TELLS "frida", "gadget", "linjector", "gum-js"
+
+typedef ssize_t (*ReadlinkFunc)(const char *, char *, size_t);
+typedef ssize_t (*ReadlinkatFunc)(int, const char *, char *, size_t);
+static ReadlinkFunc orig_readlink = NULL;
+static ReadlinkatFunc orig_readlinkat = NULL;
+
+static int link_target_is_tell(const char *t) {
+    if (t == NULL) return 0;
+    if (strstr(t, COYOTE_SO_NAME) != NULL) return 1;
+    static const char *const tells[] = {FRIDA_PATH_TELLS, NULL};
+    for (int i = 0; tells[i] != NULL; i++) {
+        if (strstr(t, tells[i]) != NULL) return 1;
+    }
+    return 0;
+}
+
+// Rewrite buf (as returned by a readlink of an fd symlink) to a benign target
+// when it carries an instrumentation tell. readlink does not NUL-terminate, so
+// we copy out the returned bytes before inspecting. Returns the (possibly new)
+// byte count to hand back to the caller.
+static ssize_t scrub_fd_link(const char *path, char *buf, size_t bufsiz, ssize_t r) {
+    if (r <= 0 || path == NULL) return r;
+    // Only fd symlinks: /proc/<pid|self>/fd/<n> (incl. per-task /task/<t>/fd/<n>).
+    if (strncmp(path, "/proc/", 6) != 0 || strstr(path, "/fd/") == NULL) return r;
+
+    char tmp[PATH_MAX];
+    size_t n = (size_t)r < sizeof(tmp) - 1 ? (size_t)r : sizeof(tmp) - 1;
+    memcpy(tmp, buf, n);
+    tmp[n] = '\0';
+    if (!link_target_is_tell(tmp)) return r;
+
+    const char *fake = "/dev/null";
+    size_t fl = strlen(fake);
+    if (fl > bufsiz) fl = bufsiz;
+    memcpy(buf, fake, fl);
+    RLOG("readlink scrubbed fd link %s", path);
+    return (ssize_t)fl;
+}
+
+static ssize_t hook_readlink(const char *path, char *buf, size_t bufsiz) {
+    return scrub_fd_link(path, buf, bufsiz, orig_readlink(path, buf, bufsiz));
+}
+
+static ssize_t hook_readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
+    return scrub_fd_link(path, buf, bufsiz, orig_readlinkat(dirfd, path, buf, bufsiz));
+}
+
 
 static int create_memfd_with_data(const char *name, const char *data, size_t size) {
     int fd = (int) syscall(__NR_memfd_create, name, MFD_CLOEXEC);
@@ -879,7 +936,11 @@ static int get_intercepted_fd(const char *path) {
     // enumerate mapped libraries looking for an injected .so). The embedded
     // GumJS runtime is linked into libcoyote.so, so dropping its lines hides it.
     if (proc_basename_is(path, "maps")) {
-        static const char *const drop[] = {COYOTE_SO_NAME, NULL};
+        // Drop the agent lib plus any mapping whose path/name still carries a
+        // frida/gum/gadget tell (e.g. a `/memfd:frida-*` region or a gum-js
+        // mapping) — a maps scan is the realistic way those strings surface in
+        // "mapped memory". Tokens are specific enough not to hit real libs.
+        static const char *const drop[] = {COYOTE_SO_NAME, FRIDA_PATH_TELLS, NULL};
         int fd = create_filtered_fd(path, drop, "maps", 4 * 1024 * 1024);
         if (fd >= 0) {
             LOGI("PuppyC filtered agent lib from %s", path);
@@ -1173,6 +1234,13 @@ void apply_native_gum_hooks() {
     gpointer target_fstatat = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "fstatat"));
     if (!target_fstatat) target_fstatat = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "newfstatat"));
     if (target_fstatat) gum_interceptor_replace(interceptor, target_fstatat, GSIZE_TO_POINTER(hook_fstatat), (gpointer *)&orig_fstatat, NULL);
+
+    // Scrub /proc/<pid>/fd/* symlinks that point at the agent lib or a
+    // frida/gum-named memfd (Tier 1 fingerprint hiding).
+    gpointer target_readlink   = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "readlink"));
+    gpointer target_readlinkat = GSIZE_TO_POINTER(dlsym(RTLD_DEFAULT, "readlinkat"));
+    if (target_readlink)   gum_interceptor_replace(interceptor, target_readlink,   GSIZE_TO_POINTER(hook_readlink),   (gpointer *)&orig_readlink,   NULL);
+    if (target_readlinkat) gum_interceptor_replace(interceptor, target_readlinkat, GSIZE_TO_POINTER(hook_readlinkat), (gpointer *)&orig_readlinkat, NULL);
     #endif
 
     #if defined(DEVICE_GL_VENDOR) || defined(DEVICE_GL_RENDERER) || defined(DEVICE_GL_VERSION)

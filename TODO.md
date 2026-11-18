@@ -26,9 +26,17 @@ gap.
         linker/ART get `ENOENT` and breaks Java-bridge hook installation (gate
         never fires), and `readdir` is far too hot. Name randomization +
         in-process `/proc/.../maps` filtering cover the real vectors safely.
-- [ ] Lower priority: scrub `frida`/`gum`/`gadget` strings in mapped memory and
-      `/proc/self/fd` entries. (Named-pipe / `linjector` tells are frida-*server*
-      specific; Coyote embeds GumJS, so there's no control socket to hide.)
+- [x] Lower priority: scrub `frida`/`gum`/`gadget` strings in mapped memory and
+      `/proc/self/fd` entries. The `/proc/.../maps` filter now also drops any
+      `frida`/`gadget`/`linjector`/`gum-js` mapping (a maps scan is how those
+      strings surface in "mapped memory"), and `readlink`/`readlinkat` are hooked
+      to rewrite `/proc/<pid>/fd/*` symlinks that point at the agent lib or a
+      frida/gum-named memfd to `/dev/null`. Deliberately *not* done: rewriting the
+      literal bytes in live `/proc/self/mem` / heap — it would corrupt the running
+      GumJS runtime, and (per the original note) frida-*server* socket tells don't
+      apply to Coyote's embedded GumJS. Not yet verified on a physical device.
+      (Named-pipe / `linjector` tells are frida-*server* specific; Coyote embeds
+      GumJS, so there's no control socket to hide.)
 - [x] Verify on the Pixel 7: `/proc/<pid>/task/*/comm` shows no frida-shaped
       names (all look like normal Android threads); no correctness regression
       (Border Patrol unchanged vs without Tier 1).
