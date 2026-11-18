@@ -152,11 +152,14 @@ class Coyote:
         debug: bool = False,
         js_all_processes: bool = False,
         recon: bool = False,
+        force_permissive: bool = False,
     ):
         self.dry_run = dry_run
         self.debug = debug
         self.js_all_processes = js_all_processes
         self.recon = recon
+        self.force_permissive = force_permissive
+        self.last_returncode = 0
         self.api_level = api_level
         self.package_name = package_name
         self.so_name = random_so_name()
@@ -248,9 +251,11 @@ class Coyote:
         cmd_str = " ".join(cmd)
         if self.dry_run:
             print(f"  [DRY-RUN] {cmd_str}")
+            self.last_returncode = 0
             return ""
 
         res = subprocess.run(cmd, capture_output=True, text=True)
+        self.last_returncode = res.returncode
         if res.returncode != 0:
             level = "!" if fatal else "warn"
             print(f"[{level}] Command failed ({desc}):\n{res.stderr.strip()}")
@@ -276,6 +281,7 @@ class Coyote:
             f"\n[+] Applying ADB properties for: {self.profile.get('device_profile', {}).get('marketing_name', 'Custom Profile')}"
         )
         sys_props = self.profile.get("system_prop", {})
+        rejected = 0
         for prop, val in sys_props.items():
             if prop.startswith("ro."):
                 print(f"    - [SKIP] {prop} (Read-only property; handled by memory hook)")
@@ -289,6 +295,20 @@ class Coyote:
                 ["adb", "shell", f"su 0 setprop {prop} '{val}'"],
                 desc=f"setprop {prop}",
                 fatal=False,
+            )
+            if self.last_returncode != 0:
+                rejected += 1
+
+        # Physical devices under enforcing SELinux reject protected setprop
+        # writes. The native/JS layers still spoof these, but hint at the flag
+        # that lets the writes themselves land (quieter, and covers any path
+        # that reads the real property directly).
+        if rejected and not self.force_permissive:
+            print(
+                f"    [hint] {rejected} setprop write(s) were rejected (typical on a "
+                "physical device under enforcing SELinux).\n"
+                "           Re-run with --force-permissive to allow them, or ignore "
+                "this — the native/JS spoof layers cover these properties regardless."
             )
 
     def _sanitize_macro_key(self, prop_key: str) -> str:
@@ -568,8 +588,15 @@ class Coyote:
             wrap_cmd = f"setprop wrap.{self.package_name} 'env LD_PRELOAD={target_so}'"
             self._exec(["adb", "shell", wrap_cmd], desc=f"Set wrap hook for {self.package_name}")
 
-        self._exec(["adb", "shell", f"am force-stop {self.package_name}"])
-        self._exec(["adb", "shell", f"monkey -p {self.package_name} -c android.intent.category.LAUNCHER 1"])
+        # Best-effort: a transient failure to stop/relaunch the app shouldn't
+        # abort the run after the agent is already staged. The wrap property is
+        # set, so the next manual launch is instrumented regardless.
+        self._exec(["adb", "shell", f"am force-stop {self.package_name}"], fatal=False)
+        self._exec(
+            ["adb", "shell", f"monkey -p {self.package_name} -c android.intent.category.LAUNCHER 1"],
+            desc=f"launch {self.package_name}",
+            fatal=False,
+        )
 
     def _set_native_bridge_wrap(self, app_dir: str, target_so: str, guest_abi: str):
         """Experimental: inject into a native-bridge-translated app. Installs a
@@ -619,9 +646,12 @@ class Coyote:
         """Removes wrap property, stops target package, and clears app state."""
         print(f"\n[*] Resetting target package configuration: {self.package_name}")
         
-        self._exec(["adb", "shell", f"am force-stop {self.package_name}"])
-        self._exec(["adb", "shell", f"setprop wrap.{self.package_name} ''"])
-        self._exec(["adb", "shell", f"pm clear {self.package_name}"])
+        # Best-effort cleanup: clearing the wrap property is what actually
+        # un-instruments the app; don't abort if stop/clear hiccups.
+        self._exec(["adb", "shell", f"am force-stop {self.package_name}"], fatal=False)
+        self._exec(["adb", "shell", f"setprop wrap.{self.package_name} ''"],
+                   desc=f"clear wrap.{self.package_name}", fatal=False)
+        self._exec(["adb", "shell", f"pm clear {self.package_name}"], fatal=False)
         
         print(f"[+] wrap.{self.package_name} removed and process terminated.")
 
@@ -1138,6 +1168,7 @@ def main():
         debug=args.debug,
         js_all_processes=args.js_all_processes,
         recon=args.recon,
+        force_permissive=args.force_permissive,
     )
 
     if args.reset_target:

@@ -222,6 +222,13 @@ Coyote solves this **in-process**, without `frida-server`'s spawn gating:
    top of `onJavaReady` in `agent.js` are the tuning knobs — move a block to
    `DEFERRED` only if a specific app deadlocks installing it synchronously.
 
+> **Note:** the staging mechanism is now near-vestigial. With the whole
+> device-identity surface installed synchronously before `onCreate`, only `ssl`
+> and `user_agent` remain deferred, and those are naturally network-time anyway.
+> Staging survives mainly as a safety valve: if a future hook deadlocks when
+> installed synchronously on a particular app, moving it to `DEFERRED` is the
+> escape hatch, without it the list would be empty.
+
 The net effect is spawn-gating-quality timing (every device-identity spoof live
 before the app's first checks) with zero added device footprint.
 

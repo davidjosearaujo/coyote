@@ -47,24 +47,32 @@ gap.
 
 ## Tier 2 — Robustness & regression safety
 
-- [ ] `coyote selftest` (or pytest): build the agent, install Border Patrol, run
-      under Coyote, dump the UI, assert "All 314 checks passed". Catches timing
-      regressions (e.g. the FLAG_SECURE-deferred one) automatically.
-- [ ] Quiet the `wrap` `SIGSYS`/`SECCOMP` crash: install a `SIGSYS` handler that
-      emulates the blocked `setgid`/`setuid` (return success) during
-      idmap/zygote-time init, so the transient resource-init process doesn't die
-      every launch. (Backtrace: `setgid` → `ExecuteBinary` → `createIdmap` →
-      `createImmutableFrameworkIdmapsInZygote`.)
+- [x] pytest regression test (`test/test_border_patrol.py`): builds the agent,
+      installs Border Patrol, runs it under Coyote, dumps the UI, and asserts the
+      "✓ All N system checks passed" summary. Skips cleanly when there is no
+      device / NDK / frida-tools. Catches timing regressions (e.g. the
+      FLAG_SECURE-deferred one) automatically. Run with `pytest test/`.
+      (Chose pytest over a `coyote selftest` subcommand.)
+- [x] Quiet the `wrap` `SIGSYS`/`SECCOMP` crash: `coyote.c` installs a `SIGSYS`
+      handler in the library constructor that emulates the blocked
+      `setgid`/`setuid`/`setres*`/`setgroups` (writes 0 into the syscall-return
+      register and resumes) during idmap/zygote-time init, so the transient
+      resource-init process no longer dies every launch. Other trapped syscalls
+      fall through to the previous disposition. (Backtrace: `setgid` →
+      `ExecuteBinary` → `createIdmap` → `createImmutableFrameworkIdmapsInZygote`.)
+      Not yet verified on a physical device — needs a device + NDK run.
 
 ## Tier 3 — UX / polish
 
-- [ ] When a `setprop` is rejected on a real device, print a one-line hint to use
-      `--force-permissive`; optionally auto-distinguish emulator vs physical.
-- [ ] Make a couple more best-effort ADB call sites non-fatal (`_exec(fatal=False)`),
-      like `setprop` now is.
-- [ ] Doc note: the staging mechanism is now near-vestigial (only `ssl` /
-      `user_agent` deferred) — it is primarily a safety valve for apps that
-      deadlock installing a specific hook synchronously.
+- [x] When a `setprop` is rejected on a real device, print a one-line hint to use
+      `--force-permissive` (shown once, with the count of rejected writes, and
+      only when `--force-permissive` wasn't already passed).
+- [x] Make a couple more best-effort ADB call sites non-fatal (`_exec(fatal=False)`),
+      like `setprop` now is: the `am force-stop` / `monkey` launch in
+      `launch_target_app` and the stop/clear steps in `reset_target_app`.
+- [x] Doc note: the staging mechanism is now near-vestigial (only `ssl` /
+      `user_agent` deferred) — documented in README as a safety valve for apps
+      that deadlock installing a specific hook synchronously.
 
 ## Known limitations (documented, not necessarily actionable)
 

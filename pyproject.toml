@@ -30,6 +30,9 @@ dependencies = [
     "frida-tools>=14.11.0",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
 [project.scripts]
 coyote = "coyote.cli:main"
 coyote-profiles = "coyote.coyote_profiles:main"
@@ -54,3 +57,8 @@ coyote = [
     "profiles/*.json",
     "profiles/*.md",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py"]
+addopts = "-ra"
