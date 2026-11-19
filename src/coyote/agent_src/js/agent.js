@@ -27,6 +27,17 @@ function getRealisticJitter(baseValue, variancePercent) {
     return Math.floor(baseValue + offset);
 }
 
+// Random fixed-length string over an explicit alphabet. One helper for every
+// generated identifier (hex Android IDs, numeric telephony IDs, package-name
+// hashes); each caller passes the alphabet it needs. Uniform per character.
+function randomString(len, alphabet) {
+    let out = '';
+    for (let i = 0; i < len; i++) {
+        out += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
+    }
+    return out;
+}
+
 // Run one hook family, isolating its failure so a single bad block can never
 // abort the rest of the install.
 function installBlock(label, fn) {
@@ -174,13 +185,7 @@ function onJavaReady(Java) {
     // BLOCK 10: Development & Debug Settings Bypass
     // ============================================
     try {
-        const genHex = function(len) {
-            let hex = '';
-            for (let i = 0; i < len; i++) {
-                hex += Math.floor(Math.random() * 16).toString(16);
-            }
-            return hex;
-        };
+        const genHex = function(len) { return randomString(len, '0123456789abcdef'); };
 
         const fakeId = genHex(16);
         const settingsMap = {
@@ -294,13 +299,7 @@ function onJavaReady(Java) {
         try {
             const TelephonyManager = Java.use('android.telephony.TelephonyManager');
 
-            const randomStr = function(len) {
-                let out = '';
-                for (let i = 0; i < len; i++) {
-                    out += Math.floor(Math.random() * 10).toString();
-                }
-                return out;
-            };
+            const randomStr = function(len) { return randomString(len, '0123456789'); };
 
             const telMap = {};
 
@@ -675,12 +674,7 @@ function onJavaReady(Java) {
         };
 
         function generateRandomHash(length) {
-            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-            let result = '';
-            for (let i = 0; i < length; i++) {
-                result += chars.charAt(Math.floor(Math.random() * chars.length));
-            }
-            return result;
+            return randomString(length, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_');
         }
 
         function create_app_resolve_info(packageName, mainActivity) {
@@ -1635,10 +1629,12 @@ function waitForJava() {
 function installGate(Java) {
     let hooksInstalled = false;
 
-    const runOnce = function () {
+    // Single install, run at most once no matter which path (eager or fallback)
+    // reaches it first.
+    const runOnce = function (via) {
         if (hooksInstalled) return;
         hooksInstalled = true;
-        console.log('[+] JSAgent: gate fired on main thread; installing hooks before onCreate');
+        console.log('[+] JSAgent: installing hooks (' + (via || 'install') + ')');
         try {
             onJavaReady(Java);
         } catch (e) {
@@ -1646,32 +1642,34 @@ function installGate(Java) {
         }
     };
 
-    // Arm the gate with a single attempt. Do NOT retry: if performNow faults
-    // here, it's because this device's ART can't yet build the Instrumentation
-    // class model / deoptimize callActivityOnCreate from our background thread
-    // mid-bootstrap — retrying just lets a later attempt reach the all-thread
-    // suspend and deadlock the splash. Fall back to waitForApplication, which
-    // only reads currentApplication until the app is bound and then installs the
-    // hooks on the idle main thread (no mid-bootstrap deopt).
+    // PRIMARY: install the moment Java is available, before the app's main thread
+    // reaches its first Activity.onCreate and reads device identity. The old
+    // design instead armed a hook on Instrumentation.callActivityOnCreate and
+    // installed only when it fired ("right before onCreate"). But arming is the
+    // first use of frida-java-bridge — a few hundred ms of class-model + deopt
+    // warmup — and on a fast device/app (observed on a physical Pixel 7 /
+    // Android 13) the app entered onCreate *before* arming finished, so the hook
+    // never fired and NO Java hook ever installed: every Java-level vector leaked
+    // the real device value. Installing here is as early as possible and runs
+    // with fewer live app threads than at onCreate, so the historical
+    // all-thread-suspend deadlock risk the gate was avoiding is no worse
+    // (verified on the heavy cocos game Top War: Displayed +1.16s, no ANR).
     try {
-        Java.performNow(function () {
-            const Instrumentation = Java.use('android.app.Instrumentation');
-            const overloads = Instrumentation.callActivityOnCreate.overloads;
-            overloads.forEach(function (ov) {
-                ov.implementation = function () {
-                    runOnce();
-                    return ov.apply(this, arguments);
-                };
-            });
-            console.log('[+] JSAgent: gate armed on Instrumentation.callActivityOnCreate (' + overloads.length + ' overload(s))');
-        });
+        Java.performNow(function () { runOnce('eager'); });
     } catch (e) {
-        console.error('[!] JSAgent: failed to arm gate (' + e.toString() + '); falling back to waitForApplication');
-        waitForApplication(Java);
+        console.error('[!] JSAgent: eager install faulted (' + e.toString() + '); falling back to waitForApplication');
     }
+    if (hooksInstalled) return;
+
+    // FALLBACK: the eager install faulted because this ROM's ART cannot yet
+    // deopt from our background thread. Retry on the main-thread timeline — poll
+    // until the Application is bound, then install at that point (still before the
+    // first onCreate, and past the fragile bootstrap window, so no mid-bootstrap
+    // deopt). Routed through runOnce so it can never double-install.
+    waitForApplication(Java, runOnce);
 }
 
-function waitForApplication(Java) {
+function waitForApplication(Java, install) {
     let tries = 0;
 
     const interval = setInterval(function () {
@@ -1697,7 +1695,7 @@ function waitForApplication(Java) {
             clearInterval(interval);
             console.log('[+] JSAgent: Application bound at try ' + tries + '; installing hooks');
             Java.perform(function () {
-                onJavaReady(Java);
+                install('app-bound');
             });
             return;
         }

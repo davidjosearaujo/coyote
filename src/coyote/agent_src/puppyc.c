@@ -182,6 +182,44 @@ static void free_preloaded_envp(char **new_envp, char *const orig_envp[]) {
     free(new_envp);
 }
 
+// Paths whose mere existence reveals root/Magisk/instrumentation. Root detection
+// overwhelmingly works by probing these with File.exists()/access()/stat(), so
+// the file-op hooks below report ENOENT for them. The su binary is matched by
+// full known paths (not a bare "su" substring) to avoid false positives; the
+// distinctive tokens are safe as substrings.
+//
+// Defined unconditionally (not under any profile-feature #ifdef): it is used by
+// the file-op hooks in the SPECS/CPU block below, which a profile can enable
+// without `system_prop_overrides`. Previously this lived inside the
+// SYSTEM_PROP_OVERRIDES_COUNT guard, so any profile lacking that section failed
+// to build (undeclared is_hidden_path).
+static int is_hidden_path(const char *path) {
+    if (!path) return 0;
+    static const char *hidden[] = {
+        "/system/xbin/su", "/system/bin/su", "/sbin/su", "/su/bin/su",
+        "/vendor/bin/su", "/system/sbin/su", "/data/local/bin/su",
+        "/data/local/xbin/su", "/data/local/su", "/magisk/.core/bin/su",
+        "/system/app/Superuser", "/system/app/SuperSU",
+        "/sbin/.magisk", "/data/adb/magisk", "/data/adb/modules",
+        "/data/adb/ksu", "/dev/.magisk", "/cache/.disable_magisk",
+        "/init.magisk.rc", "/system/etc/init/magisk",
+        "magisk", "busybox", "superuser", "frida", "xposed", "/re.frida",
+        // The native-bridge shim (experimental path) lives in the app data dir;
+        // safe to hide from stat/access since nothing in-process loads it.
+        // NOTE: do NOT hide the injected library (COYOTE_SO_NAME) here — the
+        // dynamic linker/ART legitimately stat()s the mapped .so, and returning
+        // ENOENT for it breaks Java-bridge hook installation. Its on-disk
+        // signature is handled by randomizing the name; its memory footprint by
+        // the /proc/.../maps filter below.
+        "coyote_nb.sh",
+        NULL
+    };
+    for (int i = 0; hidden[i] != NULL; i++) {
+        if (strstr(path, hidden[i]) != NULL) return 1;
+    }
+    return 0;
+}
+
 #ifdef SYSTEM_PROP_OVERRIDES_COUNT
 static int prop_override_cmp(const void *key, const void *elem) {
     return strcmp((const char *)key, ((const prop_override_t *)elem)->key);
@@ -286,38 +324,6 @@ static int is_root_check_cmd(const char *path, char *const argv[]) {
         }
     }
     
-    return 0;
-}
-
-// Paths whose mere existence reveals root/Magisk/instrumentation. Root detection
-// overwhelmingly works by probing these with File.exists()/access()/stat(), so
-// the file-op hooks below report ENOENT for them. The su binary is matched by
-// full known paths (not a bare "su" substring) to avoid false positives; the
-// distinctive tokens are safe as substrings.
-static int is_hidden_path(const char *path) {
-    if (!path) return 0;
-    static const char *hidden[] = {
-        "/system/xbin/su", "/system/bin/su", "/sbin/su", "/su/bin/su",
-        "/vendor/bin/su", "/system/sbin/su", "/data/local/bin/su",
-        "/data/local/xbin/su", "/data/local/su", "/magisk/.core/bin/su",
-        "/system/app/Superuser", "/system/app/SuperSU",
-        "/sbin/.magisk", "/data/adb/magisk", "/data/adb/modules",
-        "/data/adb/ksu", "/dev/.magisk", "/cache/.disable_magisk",
-        "/init.magisk.rc", "/system/etc/init/magisk",
-        "magisk", "busybox", "superuser", "frida", "xposed", "/re.frida",
-        // The native-bridge shim (experimental path) lives in the app data dir;
-        // safe to hide from stat/access since nothing in-process loads it.
-        // NOTE: do NOT hide the injected library (COYOTE_SO_NAME) here — the
-        // dynamic linker/ART legitimately stat()s the mapped .so, and returning
-        // ENOENT for it breaks Java-bridge hook installation. Its on-disk
-        // signature is handled by randomizing the name; its memory footprint by
-        // the /proc/.../maps filter below.
-        "coyote_nb.sh",
-        NULL
-    };
-    for (int i = 0; hidden[i] != NULL; i++) {
-        if (strstr(path, hidden[i]) != NULL) return 1;
-    }
     return 0;
 }
 
