@@ -197,22 +197,30 @@ run the managed layer in every process instead.
 ### In-process spawn-gating
 
 The hard problem: Java-layer hooks can only be installed once ART is up, but
-detection often runs in the very first `Activity.onCreate`. A background thread
-racing the app's startup loses that race (and instrumenting ART mid-bootstrap
-from another thread deadlocks).
+detection often runs in the very first `Activity.onCreate`. The agent has to get
+every device-identity hook in place before the app's main thread reads those
+values — while instrumenting ART too early, mid-bootstrap, can deadlock.
 
 Coyote solves this **in-process**, without `frida-server`'s spawn gating:
 
-1. As soon as the Java VM is usable, it arms **one** hook on
-   `android.app.Instrumentation.callActivityOnCreate`, the framework method that
-   runs, on the main thread, immediately before every activity's `onCreate`.
-2. When that fires for the first activity, Coyote installs every
-   **device-identity** hook family (Build, props, telephony, RAM, display,
-   locale, sensors, package manager, FLAG_SECURE, battery, network/VPN, proxy,
-   time, keyguard, USB, install referrer, accounts, Wi-Fi, location) **from the
-   main thread**, before `onCreate` executes. Because the instrumentation
-   happens on the main thread itself, there is no cross-thread ART suspension and
-   no deadlock, and the whole install takes only tens of milliseconds.
+1. A background thread waits until the Java VM is actually **started** — it gates
+   on `JNI_CreateJavaVM` completing (not a bare `Java.available` probe), so it
+   never touches the bridge before ART is ready.
+2. The instant the VM is usable, Coyote installs every **device-identity** hook
+   family (Build, props, telephony, RAM, display, locale, sensors, package
+   manager, FLAG_SECURE, battery, network/VPN, proxy, time, keyguard, USB,
+   install referrer, accounts, Wi-Fi, location) **eagerly** — as early as
+   possible, before the main thread has progressed into its first `onCreate`.
+   This is deliberately *not* gated on a lifecycle callback: an earlier design
+   armed a hook on `Instrumentation.callActivityOnCreate` and installed only when
+   it fired, but on a fast device/app the app reached `onCreate` before that hook
+   — the first (~300 ms) use of the Java bridge — finished arming, so it never
+   fired and nothing installed. Installing eagerly runs with few live app threads
+   and a settled VM, so the historical mid-bootstrap deadlock does not occur
+   (verified on heavy real apps); the whole install takes only tens of
+   milliseconds. If the eager install ever faults on a ROM whose ART can't yet
+   deopt from the agent's thread, Coyote falls back to installing at
+   Application-bound (still before `onCreate`).
 3. `onCreate` then reads already-spoofed values for everything an app checks to
    decide whether it's in a sandbox.
 4. Only the **network-time** families (`ssl` TLS-pinning bypass and `user_agent`)
@@ -355,6 +363,8 @@ This builds a `libcoyote.so` tailored to `<profile.json>`, injects it into
 | `--capture OUT.json` | Capture a **complete** profile from a connected **real** device via ADB, device facts read directly, non-readable sections (`bypass`, `attribution`, synthetic `identity` fields) auto-generated to plausible values, write it to `OUT.json`, then exit. It prints which fields were synthesized; review before use. |
 | `--skip-adb` | Build the library but don't push writable `setprop`s to the device. |
 | `--skip-deploy` | Compile only; don't push or launch (implies `--skip-adb`). |
+| `--force-permissive` | Set SELinux permissive (`setenforce 0`) before applying the profile, so the device accepts protected `setprop` writes that enforcing policy rejects. For dedicated analysis devices; the native/JS spoof layers work without it. |
+| `--nb-shim` | **Experimental.** Instrument a native-bridge-translated app (e.g. an arm64-only app on an x86_64 emulator) by re-execing the guest `app_process` and preloading the agent via the translator's guest-env channel. Requires `--force-permissive`. See the native-bridge limitation below. |
 
 ### Common workflows
 
@@ -436,14 +446,15 @@ adb logcat -s "[Coyote]" "[PuppyC]" "[PuppyJS]"
 
 Release builds (the default) are **silent**, they emit no log lines and omit the
 agent's log/tag strings from the binary. Use `--debug` when you need to observe
-the agent: you'll see the native hooks apply, then `gate armed …`, `gate fired
-…`, and `All hook blocks installed` before the app's UI appears. In a debug run
+the agent: you'll see the native hooks apply, then `installing hooks (eager)`,
+`… critical hook block(s) installed …`, and `all deferred hook blocks installed`
+before the app's UI appears. In a debug run
 you can also confirm the process model: the **main** process prints the full
 `JSAgent` hook log, while **auxiliary** processes print `Auxiliary process;
 skipping JS layer.` and nothing more.
 
-You should see the native hooks apply, then `gate armed …`, `gate fired …`, and
-`All hook blocks installed` before the app's UI appears.
+You should see the native hooks apply, then `installing hooks (eager)` and
+`all deferred hook blocks installed` before the app's UI appears.
 
 ---
 
@@ -662,11 +673,14 @@ profiles cover a large, practical set (100+ keys) you can use as a baseline.
 - **Permission / SELinux errors during deploy**, the device must be rooted; the
   copy step uses `su 0`. Verify `adb shell su 0 id` works.
 - **App still detects the emulator**, build with `--debug` and check `logcat`
-  for the hook logs (release builds are silent). If you see `gate armed` but never
-  `gate fired`, the app may not go through a standard activity launch; if a
-  specific value is wrong, confirm the matching profile key (and run `--dry-run`
-  to verify it made it into `config.h`). If the detection runs in a sub-process,
-  rebuild with `--js-all-processes`.
+  for the hook logs (release builds are silent). If you never see
+  `installing hooks (…)`, the Java VM/bridge didn't come up in that process (or
+  detection runs in a sub-process — rebuild with `--js-all-processes`). If the
+  hooks install but a *specific* early-read value still leaks on a fast physical
+  device (display/RAM/telephony read in the very first moment of `onCreate`), see
+  the native-bridge / early-read notes below — the Java layer can't beat those
+  reads on fast hardware. If a specific value is just wrong, confirm the matching
+  profile key (and run `--dry-run` to verify it made it into `config.h`).
 - **Multiple `[Coyote] Coyote loaded` lines with different PIDs**, expected. The
   `wrap` property applies to every process Zygote forks for the package; each one
   loads the library and applies the native hooks. By default only the main
@@ -713,6 +727,22 @@ coyote/
 - **Framework-version sensitivity.** Managed hooks target specific Android
   classes/methods; very new or heavily customized ROMs may move or rename some,
   in which case that hook logs an error and is skipped (others continue).
+- **Native-bridge translation.** An app that runs only under binary translation
+  (e.g. an arm64-only app on an x86_64 emulator) can't be instrumented: the
+  `--nb-shim` path gets the agent into the translated guest, but
+  `gum_init_embedded()` segfaults inside ndk_translation before any hook applies.
+  This is a frida-under-translation limitation below Coyote's level — use a
+  matching-ABI target (an arm64 image or device). Coyote detects the plain case
+  and stops with a clear message by default.
+- **Earliest-read vectors on a fast physical device.** A few families an app
+  reads in the very first moment of `Activity.onCreate` — display metrics, total
+  RAM (`ActivityManager.getMemoryInfo().totalMem`), SIM/telephony — can still
+  leak the real value on fast hardware, because the Java bridge's first-use
+  warmup (~300 ms) lands the hooks just after those reads. Everything read even
+  slightly later is spoofed. On a slower target (emulator) the agent wins the
+  race. Closing the gap would need native-layer spoofing of those specific
+  vectors (they flow through binder/ART caches, not `/proc`) or an early
+  main-thread barrier — neither is implemented.
 - **Not an anti-anti-Frida bypass per se.** Coyote's goal is environment
   spoofing. It avoids a `frida-server` footprint, but a determined app can still
   look for in-process instrumentation; hardening against that is out of scope.
