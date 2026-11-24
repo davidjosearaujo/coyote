@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coyote"
-version = "2.2.0"
+version = "2.3.0"
 description = "In-process Android device-spoofing agent for malware analysis, with no frida-server footprint."
 readme = "README.md"
 requires-python = ">=3.10"

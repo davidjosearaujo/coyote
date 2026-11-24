@@ -7,7 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-11-24
+
 ### Fixed
+- **Java hooks could silently fail to install on a fast device (root cause of
+  "flaky" per-vector spoofing).** The agent armed a gate on
+  `Instrumentation.callActivityOnCreate` and installed the whole Java hook set
+  only when that gate fired. Arming is the first use of frida-java-bridge
+  (~300 ms of class-model + deopt warmup), and on a fast device/app (physical
+  Pixel 7 / Android 13) the app entered its first `onCreate` before arming
+  finished, so the gate never fired and **no** Java hook installed — every
+  Java-level vector (Wi-Fi, display, RAM, telephony, …) leaked the real device
+  value. Surfaced as intermittent Wi-Fi spoofing but affected every Java hook.
+  The agent now installs eagerly the moment the VM is available
+  (`Java.available`), the earliest possible point and with fewer live app
+  threads than at `onCreate`, so the deadlock risk the gate was avoiding is no
+  worse (verified deadlock-free on the heavy cocos game Top War). The lone
+  fallback, for a ROM that cannot yet deopt from the agent's thread, is
+  `waitForApplication` (install at Application-bound). The `callActivityOnCreate`
+  gate, and the catch-up/watchdog that tried to patch its race, are removed.
+- **Build failed for any profile without a `system_prop_overrides` section.**
+  `is_hidden_path()` in `puppyc.c` was scoped inside the
+  `#ifdef SYSTEM_PROP_OVERRIDES_COUNT` block but is called by the (independent)
+  SPECS/CPU file-op hooks, so a profile lacking that section — including the
+  shipped `pixel7_us_tmobile.json` — failed to compile with
+  `undeclared function 'is_hidden_path'`. Moved it out of the guard so it is
+  always compiled.
 - **Physical-device support: Java/JS layer no longer aborts on fast devices.**
   `wrap`+`LD_PRELOAD` re-execs a fresh `app_process`, which re-creates ART from
   scratch; the agent raced it and the frida-java-bridge probed the VM before
@@ -82,6 +107,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deferred and drain one-per-main-thread-tick via `Java.scheduleOnMainThread`
   once the UI is up. The staging mechanism remains so any block can be moved to
   `DEFERRED` if a specific app ever deadlocks installing it synchronously.
+- Internal cleanup (behaviour-preserving): the three per-identifier random-string
+  generators (`genHex`/`randomStr`/`generateRandomHash`) are consolidated into a
+  single `randomString(len, alphabet)` helper, and `installGate` is simplified to
+  the eager-install + `waitForApplication` fallback (the gate/catch-up/watchdog
+  machinery is gone).
 
 ## [2.2.0] - 2026-10-23
 
